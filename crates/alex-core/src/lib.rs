@@ -1,4 +1,5 @@
 pub mod amp_usage;
+pub mod exec;
 pub mod grok_billing;
 pub mod openrouter_catalog;
 pub mod quota;

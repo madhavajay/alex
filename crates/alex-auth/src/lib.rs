@@ -861,7 +861,7 @@ impl Vault {
         let tombstone_path = tombstone_dir.join(format!("{id}.json"));
         let temporary = tombstone_path.with_extension("json.tmp");
         std::fs::write(&temporary, serde_json::to_vec_pretty(&tombstone)?)?;
-        std::fs::rename(&temporary, &tombstone_path)?;
+        alex_core::exec::atomic_replace(&temporary, &tombstone_path)?;
         self.accounts.write().await.remove(id);
         let path = self.dir.join(format!("{id}.json"));
         if path.exists() {
@@ -1553,7 +1553,7 @@ pub(crate) fn atomic_write_private(path: &Path, data: &[u8]) -> Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary_path, path)?;
+        alex_core::exec::atomic_replace(&temporary_path, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1582,7 +1582,7 @@ fn write_routing_policies(dir: &Path, policies: &[(Provider, AccountPolicy)]) ->
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&temp, &path)?;
+    alex_core::exec::atomic_replace(&temp, &path)?;
     Ok(())
 }
 

@@ -3,14 +3,13 @@ param(
     [string]$Version,
     [string]$Repository = "madhavajay/alex",
     [string]$InstallDirectory = "$env:LOCALAPPDATA\Alex\bin",
+    [string]$LocalArchive,
     [switch]$NoService,
     [switch]$NoPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-
-throw "Windows support is not included in the Alex 0.1.29 stable release. Use the macOS or Linux installer."
 
 function Write-Step([string]$Message) {
     Write-Host "◆ $Message" -ForegroundColor Cyan
@@ -20,19 +19,31 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw "Alex V1 requires 64-bit Windows."
 }
 
-$headers = @{ "User-Agent" = "alex-windows-installer" }
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    Write-Step "finding the latest stable Alex release"
-    $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
-    $Version = [string]$release.tag_name
+$machineArch = $env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($machineArch)) {
+    $machineArch = $env:PROCESSOR_ARCHITECTURE
 }
-$Version = $Version.Trim().TrimStart("v")
-if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
-    throw "Invalid Alex version '$Version'."
+switch ($machineArch) {
+    "AMD64" { $assetArch = "x86_64" }
+    "ARM64" { $assetArch = "arm64" }
+    default { throw "Unsupported Windows architecture '$machineArch'. Alex supports x86-64 and ARM64." }
+}
+
+$headers = @{ "User-Agent" = "alex-windows-installer" }
+if ([string]::IsNullOrWhiteSpace($LocalArchive)) {
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        Write-Step "finding the latest stable Alex release"
+        $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
+        $Version = [string]$release.tag_name
+    }
+    $Version = $Version.Trim().TrimStart("v")
+    if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+        throw "Invalid Alex version '$Version'."
+    }
 }
 
 $tag = "v$Version"
-$asset = "alex-cli-$Version-windows-x86_64.zip"
+$asset = "alex-cli-$Version-windows-$assetArch.zip"
 $baseUrl = "https://github.com/$Repository/releases/download/$tag"
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("alex-install-" + [Guid]::NewGuid())
 $archive = Join-Path $temporary $asset
@@ -41,9 +52,16 @@ $expanded = Join-Path $temporary "expanded"
 
 try {
     New-Item -ItemType Directory -Path $temporary, $expanded -Force | Out-Null
-    Write-Step "downloading Alex $Version for Windows x86-64"
-    Invoke-WebRequest -Headers $headers -Uri "$baseUrl/$asset" -OutFile $archive
-    Invoke-WebRequest -Headers $headers -Uri "$baseUrl/$asset.sha256" -OutFile $checksum
+    if ([string]::IsNullOrWhiteSpace($LocalArchive)) {
+        Write-Step "downloading Alex $Version for Windows $assetArch"
+        Invoke-WebRequest -Headers $headers -Uri "$baseUrl/$asset" -OutFile $archive
+        Invoke-WebRequest -Headers $headers -Uri "$baseUrl/$asset.sha256" -OutFile $checksum
+    } else {
+        $localPath = (Resolve-Path $LocalArchive).Path
+        Write-Step "installing Alex from local archive $localPath"
+        Copy-Item -LiteralPath $localPath -Destination $archive -Force
+        Copy-Item -LiteralPath "$localPath.sha256" -Destination $checksum -Force
+    }
 
     $expected = ((Get-Content -Raw $checksum).Trim() -split '\s+')[0].ToLowerInvariant()
     $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
@@ -59,7 +77,16 @@ try {
 
     $existing = Join-Path $InstallDirectory "alex.exe"
     if ((Test-Path $existing) -and -not $NoService) {
-        & $existing service uninstall 2>$null | Out-Null
+        # A failed/absent old service must not block reinstall; native stderr
+        # under EAP=Stop becomes terminating unless isolated.
+        try {
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & $existing service uninstall 2>&1 | Out-Null
+        } catch {
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
     }
 
     Write-Step "installing Alex to $InstallDirectory"

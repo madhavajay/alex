@@ -491,7 +491,8 @@ async fn install_version(install_root: &Path, version: &str) -> Result<InstallRe
     let spec = format!("{NPM_PACKAGE}@{version}");
     let mut failures = Vec::new();
     for manager in managers {
-        let mut command = Command::new(&manager.bin);
+        // npm/pnpm are .cmd shims on Windows; wrap them for CreateProcess.
+        let mut command = Command::from(alex_core::exec::command_for(&manager.bin));
         command.args(package_manager_args(manager.kind, &prefix, &spec));
         let output = match command.stdin(Stdio::null()).output().await {
             Ok(output) => output,
@@ -641,6 +642,28 @@ pub fn resolve_dario_node_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
             &home.join(".asdf/installs/nodejs"),
             "node",
         ));
+        #[cfg(windows)]
+        {
+            // nvm-windows, Volta, and Scoop keep per-user installs under
+            // these roots; system installs are covered below.
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                candidates.extend(newest_versioned_bins(
+                    &PathBuf::from(appdata).join("nvm"),
+                    "node.exe",
+                ));
+            }
+            candidates.push(home.join("AppData\\Local\\Volta\\bin\\node.exe"));
+            candidates.push(home.join("scoop\\apps\\nodejs\\current\\node.exe"));
+            candidates.push(home.join("scoop\\apps\\nodejs-lts\\current\\node.exe"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        for program_files_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(program_files) = std::env::var_os(program_files_var) {
+                candidates.push(PathBuf::from(program_files).join("nodejs\\node.exe"));
+            }
+        }
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/node"),
@@ -678,7 +701,7 @@ fn usable_node(path: &Path) -> bool {
 /// manager layouts differ, so descend a small bounded tree and use the
 /// nearest version-looking ancestor as the sort key.
 fn newest_versioned_bins(root: &Path, binary: &str) -> Vec<PathBuf> {
-    fn visit(dir: &Path, binary: &str, depth: usize, out: &mut Vec<PathBuf>) {
+    fn visit(dir: &Path, names: &[std::ffi::OsString], depth: usize, out: &mut Vec<PathBuf>) {
         if depth > 5 {
             return;
         }
@@ -688,8 +711,8 @@ fn newest_versioned_bins(root: &Path, binary: &str) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                visit(&path, binary, depth + 1, out);
-            } else if entry.file_name() == binary
+                visit(&path, names, depth + 1, out);
+            } else if names.iter().any(|name| entry.file_name() == *name)
                 && path
                     .parent()
                     .is_some_and(|p| p.file_name().is_some_and(|n| n == "bin"))
@@ -698,8 +721,15 @@ fn newest_versioned_bins(root: &Path, binary: &str) -> Vec<PathBuf> {
             }
         }
     }
+    // Accept every platform spelling (node, node.exe, claude.cmd, …) so
+    // Windows version-manager layouts are discoverable too.
+    let names: Vec<std::ffi::OsString> =
+        crate::harness_connect::executable_candidates(Path::new(""), binary)
+            .iter()
+            .filter_map(|candidate| candidate.file_name().map(|n| n.to_os_string()))
+            .collect();
     let mut out = Vec::new();
-    visit(root, binary, 0, &mut out);
+    visit(root, &names, 0, &mut out);
     out.sort_by(|a, b| node_path_version(b).cmp(&node_path_version(a)));
     out
 }
@@ -732,7 +762,9 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         // TCC-protected folders makes macOS prompt on every dario update
         // check — the recurring "access files on a network volume" dialog.
         .filter(|dir| crate::harness_connect::probe_safe_dir(dir))
-        .map(|dir| dir.join(name))
+        // On Windows executables carry PATHEXT extensions (node.exe,
+        // npm.cmd), so a bare-name probe would never match there.
+        .flat_map(|dir| crate::harness_connect::executable_candidates(&dir, name))
         .find(|candidate| candidate.is_file())
 }
 

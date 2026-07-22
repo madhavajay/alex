@@ -7,8 +7,18 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $Installer = Join-Path $RepoRoot "install-release.ps1"
 $Smoke = Join-Path $PSScriptRoot "smoke-installed.ps1"
+$MachineArch = $env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($MachineArch)) {
+    $MachineArch = $env:PROCESSOR_ARCHITECTURE
+}
+$PlatformArch = switch ($MachineArch) {
+    "AMD64" { "x86_64" }
+    "ARM64" { "arm64" }
+    default { "x86_64" }
+}
+$PlatformCheck = "windows-11-$PlatformArch"
 $ExpectedChecks = @(
-    "windows-11-x86_64",
+    $PlatformCheck,
     "release-installer-sha256",
     "packaged-alex-binary",
     "task-scheduler-action-and-health",
@@ -37,7 +47,7 @@ foreach ($path in @($Installer, $Smoke, $PSCommandPath)) {
 $Plan = (& $Smoke -Version "0.0.0" -PlanOnly | Out-String) | ConvertFrom-Json
 if ($Plan.schema_version -ne 1 -or
     $Plan.kind -ne "alex-windows-installed-smoke-plan" -or
-    $Plan.platform -ne "windows-11-x86_64") {
+    $Plan.platform -ne $PlatformCheck) {
     throw "Smoke plan identity or schema changed unexpectedly."
 }
 if ([bool]$Plan.external_provider_network -or [bool]$Plan.provider_secrets) {
@@ -56,7 +66,7 @@ foreach ($check in $ExpectedChecks) {
 $InstallerText = Get-Content -LiteralPath $Installer -Raw
 foreach ($contract in @(
     "Get-FileHash -Algorithm SHA256",
-    'alex-cli-$Version-windows-x86_64.zip',
+    'alex-cli-$Version-windows-$assetArch.zip',
     "service install"
 )) {
     if (-not $InstallerText.Contains($contract)) {
