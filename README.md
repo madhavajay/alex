@@ -1,7 +1,7 @@
 # Alex — a local LLM proxy for AI subscriptions and coding harnesses
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/header-v2.jpg" alt="Alex connects supported terminal harnesses to supported LLM providers through one local proxy" width="100%">
+  <img src="images/header.jpg" alt="Alex connects supported terminal harnesses to supported LLM providers through one local proxy" width="100%">
 </p>
 
 <p align="center">
