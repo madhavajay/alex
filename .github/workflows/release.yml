@@ -148,40 +148,6 @@ jobs:
           overwrite: true
           retention-days: 14
 
-  windows-asset:
-    name: Build Windows CLI artifact
-    needs: [meta, rust-test]
-    runs-on: namespace-profile-windows-medium
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build and package CLI from tagged source
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ needs.meta.outputs.version }}"
-          ./scripts/stamp-version.sh "$version"
-          cargo build --release -p alex --bins
-          mkdir -p dist/package
-          cp target/release/alex.exe dist/package/
-          asset="alex-cli-${version}-windows-x86_64.zip"
-          (cd dist/package && 7z a "../$asset" alex.exe)
-          sha256sum "dist/$asset" > "dist/$asset.sha256"
-      - name: Upload Windows workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: stable-windows
-          path: |
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 14
-
   macos-cli-asset:
     name: Build signed macOS CLI artifacts
     needs: [meta, rust-test, swift-test]
@@ -206,9 +172,8 @@ jobs:
           intel_root="$RUNNER_TEMP/alex-cli-x86_64"
           rm -rf "$arm_root" "$intel_root"
           mkdir -p "$arm_root" "$intel_root"
-          cp target/release/alex target/release/alex "$arm_root/"
-          cp target/x86_64-apple-darwin/release/alex \
-            target/x86_64-apple-darwin/release/alex "$intel_root/"
+          cp target/release/alex "$arm_root/"
+          cp target/x86_64-apple-darwin/release/alex "$intel_root/"
 
       - name: Require CLI signing and notarization secrets
         env:
@@ -247,16 +212,11 @@ jobs:
           set -euo pipefail
           for bin in \
             "$RUNNER_TEMP/alex-cli-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-x86_64/alex" \
             "$RUNNER_TEMP/alex-cli-x86_64/alex"
           do
-            case "$(basename "$bin")" in
-              alex) identifier="com.madhavajay.alex.cli" ;;
-              alex) identifier="com.madhavajay.alex.daemon" ;;
-            esac
             codesign --force --options runtime --timestamp \
-              --identifier "$identifier" --sign "$CODESIGN_IDENTITY" "$bin"
+              --identifier "com.madhavajay.alex.cli" \
+              --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
 
@@ -314,7 +274,6 @@ jobs:
             x86_64) native_root="$verify_root/intel" ;;
             *) echo "unsupported macOS runner architecture" >&2; exit 1 ;;
           esac
-          "$native_root/alex" --version
           "$native_root/alex" --version
 
       - name: Clean up CLI signing keychain
@@ -462,7 +421,7 @@ jobs:
             "$stage/"
           cp scripts/lib/install-common.sh "$stage/"
           chmod +x "$stage/install.sh" "$stage/mock-openai.py" \
-            "$stage/smoke-installed.sh" "$stage/bin/alex" "$stage/bin/alex"
+            "$stage/smoke-installed.sh" "$stage/bin/alex"
 
       - name: Smoke installed app, routing, trace persistence, and launchd restart
         env:
@@ -509,68 +468,9 @@ jobs:
           overwrite: true
           retention-days: 30
 
-  windows-approval:
-    name: Approve and smoke packaged Windows CLI
-    needs: [meta, windows-asset]
-    runs-on: namespace-profile-windows-medium
-    timeout-minutes: 20
-    environment:
-      name: stable-windows-release
-    steps:
-      - name: Download packaged Windows CLI
-        uses: actions/download-artifact@v4
-        with:
-          name: stable-windows
-          path: dist/windows
-
-      - name: Verify approved Windows package
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
-          RELEASE_SHA: ${{ needs.meta.outputs.sha }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $asset = "alex-cli-$env:RELEASE_VERSION-windows-x86_64.zip"
-          $assetPath = Join-Path 'dist/windows' $asset
-          $expected = ((Get-Content "$assetPath.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
-          $actual = (Get-FileHash $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "SHA-256 mismatch for $asset" }
-          $extract = 'dist/windows/extracted'
-          Expand-Archive -Path $assetPath -DestinationPath $extract -Force
-          $alex = Get-ChildItem $extract -Filter alex.exe -Recurse | Select-Object -First 1
-          $alias = Get-ChildItem $extract -Filter alex.exe -Recurse | Select-Object -First 1
-          if (-not $alex -or -not $alias) { throw 'Windows archive is missing a CLI binary' }
-          $alexVersion = (& $alex.FullName --version | Out-String).Trim()
-          $aliasVersion = (& $alias.FullName --version | Out-String).Trim()
-          if ($alexVersion -ne "alex $env:RELEASE_VERSION" -or $aliasVersion -ne $alexVersion) {
-            throw "unexpected packaged versions: $alexVersion / $aliasVersion"
-          }
-          & $alex.FullName --help | Out-Null
-          @{
-            schema_version = 1
-            passed = $true
-            platform = 'windows-x86_64'
-            protected_environment = 'stable-windows-release'
-            version = $env:RELEASE_VERSION
-            commit = $env:RELEASE_SHA
-            asset = $asset
-            sha256 = $actual
-            checks = @('protected-approval', 'checksum', 'both-binaries', 'help')
-          } | ConvertTo-Json -Depth 4 | Set-Content dist/windows-smoke.json
-
-      - name: Upload Windows approval evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stable-windows-smoke-evidence
-          path: dist/windows-smoke.json
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 30
-
   release-gates:
     name: Verify packaged smoke evidence
-    needs: [meta, linux-packaged-smoke, macos-packaged-smoke, windows-approval]
+    needs: [meta, linux-packaged-smoke, macos-packaged-smoke]
     runs-on: namespace-profile-linux-medium
     steps:
       - name: Download all packaged-smoke evidence
@@ -589,7 +489,7 @@ jobs:
           python3 - "$RELEASE_SHA" "$RELEASE_VERSION" <<'PY'
           import json, pathlib, sys
           root = pathlib.Path("dist/evidence")
-          expected = {"linux-smoke.json", "macos-smoke.json", "windows-smoke.json"}
+          expected = {"linux-smoke.json", "macos-smoke.json"}
           present = {path.name for path in root.glob("*.json")}
           if present != expected:
               raise SystemExit(f"incomplete packaged smoke evidence: {sorted(present)}")
@@ -625,16 +525,6 @@ jobs:
           ):
               raise SystemExit("macOS installed-package evidence is incomplete")
 
-          windows = records["windows-smoke.json"]
-          if not (
-              windows.get("platform") == "windows-x86_64"
-              and windows.get("version") == sys.argv[2]
-              and windows.get("protected_environment") == "stable-windows-release"
-              and "protected-approval" in windows.get("checks", [])
-              and "checksum" in windows.get("checks", [])
-          ):
-              raise SystemExit("Windows protected-approval evidence is incomplete")
-
           pathlib.Path("dist/release-gates.json").write_text(
               json.dumps({"schema_version": 1, "passed": True,
                           "commit": sys.argv[1], "version": sys.argv[2],
@@ -657,7 +547,6 @@ jobs:
       - release-gates
       - linux-gnu-asset
       - linux-musl-asset
-      - windows-asset
       - macos-cli-asset
       - stable-dmg
     runs-on: namespace-profile-linux-medium
@@ -675,10 +564,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: stable-linux-musl
-          path: dist/release-assets
-      - uses: actions/download-artifact@v4
-        with:
-          name: stable-windows
           path: dist/release-assets
       - uses: actions/download-artifact@v4
         with:
@@ -746,10 +631,22 @@ jobs:
               echo "Release is already public; refusing to mutate it before verification."
             fi
           else
+            notes_file="$RUNNER_TEMP/alex-$RELEASE_VERSION-release-notes.md"
+            awk -v version="$RELEASE_VERSION" '
+              BEGIN { header = "## [" version "]" }
+              $0 == header || index($0, header " - ") == 1 { found = 1; next }
+              found && index($0, "## [") == 1 { exit }
+              found { print }
+              END { if (!found) exit 2 }
+            ' CHANGELOG.md > "$notes_file"
+            if ! grep -q '[^[:space:]]' "$notes_file"; then
+              echo "CHANGELOG.md has no release notes for $RELEASE_VERSION" >&2
+              exit 1
+            fi
             gh release create "$RELEASE_TAG" \
               --draft --latest=false --verify-tag \
               --title "Alex $RELEASE_TAG" \
-              --notes "Stable release $RELEASE_VERSION. Assets remain draft until every package and manifest entry is verified."
+              --notes-file "$notes_file"
           fi
 
           if [[ "$already_published" == "false" ]]; then
@@ -772,8 +669,6 @@ jobs:
           for name in \
             "alex-cli-${version}-linux-x86_64.tar.gz" \
             "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
-            "alex-cli-${version}-windows-x86_64.zip" \
-            "alex-cli-${version}-windows-x86_64.zip.sha256" \
             "alex-cli-${version}-macos-aarch64.tar.gz" \
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \
@@ -864,8 +759,6 @@ jobs:
           for name in \
             "alex-cli-${version}-linux-x86_64.tar.gz" \
             "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
-            "alex-cli-${version}-windows-x86_64.zip" \
-            "alex-cli-${version}-windows-x86_64.zip.sha256" \
             "alex-cli-${version}-macos-aarch64.tar.gz" \
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \

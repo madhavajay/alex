@@ -14,7 +14,6 @@ PATTERNS = [
     ("cli", "x86_64-unknown-linux-gnu", "alex-cli-*-linux-x86_64.tar.gz"),
     ("cli", "x86_64-unknown-linux-musl", "alex-x86_64-unknown-linux-musl"),
     ("cli", "aarch64-unknown-linux-musl", "alex-aarch64-unknown-linux-musl"),
-    ("cli", "x86_64-pc-windows-msvc", "alex-cli-*-windows-x86_64.zip"),
     ("app", "darwin-universal", "Alex-*.dmg"),
 ]
 
@@ -25,7 +24,6 @@ PLATFORM_ORDER = (
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
-    "x86_64-pc-windows-msvc",
     "darwin-universal",
 )
 

@@ -7,7 +7,46 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-07-22
+
+First stable release of the 0.1.29 line. It includes all changes from the
+0.1.29 betas plus the V1 activation, reliability, and supported-platform work
+below.
+
+### Added
+- **Programmable middleware with an explainable Fable-to-Sol fallback.** Typed,
+  regex-first rules can match harness, model, provider, status, response
+  headers, and body content; reroutes are session-scoped, persisted, visible in
+  traces, and manageable from the CLI, web UI, and macOS rule editor. The
+  built-in preset moves an explicit Fable refusal to high-effort GPT-5.6 Sol.
+- **LAR-backed trace storage and lazy browsing.** Crash-recoverable archives,
+  resumable migration from existing gzip bodies, bounded body reads, cursor
+  pagination, lazy transcript turns, sanitized export/replay fixtures, and a
+  reproducible 55,000-trace/9.4-GB scale gate keep large trace collections
+  usable.
+- **First-class CLIProxyAPI integration in both directions.** Alex can route
+  through an existing CLIProxyAPI instance, and CLIProxyAPI can route into
+  Alex with scoped credentials, capability negotiation, correlation headers,
+  streaming/tool-call preservation, and loop rejection. Web and macOS
+  onboarding can probe and configure the upstream path.
+- **Shared activation path.** `alex doctor`, the local web UI, Linux user
+  services, and deterministic packaged smoke tests cover onboarding, health,
+  middleware, routing, traces, restart, upgrade, and rollback.
+- **Public interactive walkthroughs.** Three static, source-checked demos cover
+  cross-harness routing, Fable-to-Sol failover, and asking a second model. The
+  site supports keyboard/mobile use, reduced motion, no-JavaScript fallbacks,
+  and privacy-safe conversion events.
+- **Cross-harness session resume.** Captured Pi, Claude, and Codex sessions can
+  be forked into another supported harness while retaining trace lineage.
+
 ### Changed
+- **The product and runtime are now Alex.** User-facing copy, binaries, service
+  identifiers, configuration, installers, package metadata, and the macOS app
+  use the Alex name; fresh installs have no legacy compatibility layer.
+- **Onboarding is resumable and reversible.** Users can move between harness,
+  provider, imported credentials, existing accounts, and new-account flows
+  without stale selections or test state; detected credentials require an
+  explicit confirmation before import.
 - The default Fable fallback now intercepts any structured Anthropic SSE
   refusal, routes to high-effort GPT-5.6 Sol, and keeps the replacement route
   for the stable session for 24 hours.
@@ -15,6 +54,16 @@ predate this file — see the git history and GitHub releases.
   instead of presenting a synthetic Test button.
 
 ### Fixed
+- Release packages now exercise the installed Linux service and macOS app/CLI
+  before publication, and the stable workflow builds one complete
+  checksum-verified manifest before crates, GitHub Release, Sparkle, or
+  Homebrew promotion.
+- Reset and first-run flows safely rediscover credentials, recreate private
+  configuration paths, and return provider-less installs to onboarding.
+- Codex login and account routing preserve existing identities and clearly
+  distinguish imported, existing, and newly authenticated accounts.
+- Linux and macOS service upgrades replace the active daemon without leaving a
+  duplicate process, and packaged rollback preserves state and trace history.
 - Editing the built-in middleware rule now always updates its existing ID
   rather than occasionally creating a second custom rule from a stale sheet
   state.

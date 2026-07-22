@@ -10,7 +10,7 @@ $Smoke = Join-Path $PSScriptRoot "smoke-installed.ps1"
 $ExpectedChecks = @(
     "windows-11-x86_64",
     "release-installer-sha256",
-    "both-packaged-binaries",
+    "packaged-alex-binary",
     "task-scheduler-action-and-health",
     "web-ui-and-loopback-bootstrap",
     "loopback-exo-route",

@@ -28,7 +28,7 @@ jobs:
         run: |
           cargo run --release --locked -p alex-lar-scale -- fixture-fable-sol \
             --vector crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json \
-            --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json \
+            --failure crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json \
             --output "$RUNNER_TEMP/fable-to-sol.lar" \
             --report "$RUNNER_TEMP/fable-to-sol-result.json"
       - uses: actions/upload-artifact@v4
@@ -187,7 +187,6 @@ jobs:
           tar -C target/release -czf "$assets/$candidate_asset" alex
           shasum -a 256 "$assets/$candidate_asset" > "$assets/$candidate_asset.sha256"
           [[ "$(target/release/alex --version)" == "alex $candidate_version" ]]
-          [[ "$(target/release/alex --version)" == "alex $candidate_version" ]]
 
           git archive "$BASE_SHA" | tar -x -C "$base_source"
           (
@@ -198,14 +197,11 @@ jobs:
           base_asset="alex-cli-${base_version}-linux-x86_64.tar.gz"
           tar -C "$base_target/release" -czf "$assets/$base_asset" alex
           shasum -a 256 "$assets/$base_asset" > "$assets/$base_asset.sha256"
-          for binary in alex; do
-            reported="$("$base_target/release/$binary" --version)"
-            [[ "$reported" == "alex $base_version" \
-              || "$reported" == "alex $base_version" ]] || {
-              echo "legacy base $binary reported unexpected version: $reported" >&2
-              exit 1
-            }
-          done
+          reported="$("$base_target/release/alex" --version)"
+          [[ "$reported" == "alex $base_version" ]] || {
+            echo "base alex reported unexpected version: $reported" >&2
+            exit 1
+          }
 
           {
             echo "base_version=$base_version"
@@ -252,7 +248,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [namespace-profile-linux-medium, namespace-profile-mac-medium, namespace-profile-windows-medium]
+        os: [namespace-profile-linux-medium, namespace-profile-mac-medium]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -263,11 +259,6 @@ jobs:
         run: cargo test -p alex-proxy deterministic_platform_smoke -- --nocapture
       - name: Platform browser-launch contract
         run: cargo test -p alex browser_launch_commands_are_platform_specific -- --nocapture
-      - name: Parse Windows packaging scripts and verify smoke contracts
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ./packaging/ci-windows/test-smoke-installed.ps1
       - name: Platform path and service lifecycle contract
         run: cargo test -p alex platform_path_and_service_lifecycle_contracts -- --nocapture
       - run: cargo test --workspace
@@ -330,7 +321,7 @@ jobs:
           rm -rf "$stage" "$output"
           mkdir -p "$stage/bin" "$output"
           ditto macos/dist/Alex.app "$stage/Alex.app"
-          cp target/release/alex target/release/alex "$stage/bin/"
+          cp target/release/alex "$stage/bin/"
           cp \
             packaging/ci-macos/install.sh \
             packaging/ci-macos/mock-openai.py \
@@ -342,7 +333,6 @@ jobs:
             "$stage/install.sh" \
             "$stage/mock-openai.py" \
             "$stage/smoke-installed.sh" \
-            "$stage/bin/alex" \
             "$stage/bin/alex"
 
           {

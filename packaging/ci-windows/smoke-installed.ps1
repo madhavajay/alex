@@ -23,7 +23,7 @@ $ExpectedResponse = "installed route ok"
 $PlanChecks = @(
     "windows-11-x86_64",
     "release-installer-sha256",
-    "both-packaged-binaries",
+    "packaged-alex-binary",
     "task-scheduler-action-and-health",
     "web-ui-and-loopback-bootstrap",
     "loopback-exo-route",
@@ -303,7 +303,6 @@ if ([string]::IsNullOrWhiteSpace($SmokeRoot)) {
 $SmokeRoot = [IO.Path]::GetFullPath($SmokeRoot)
 $StateDirectory = Join-Path $env:USERPROFILE ".alex"
 $AlexBin = Join-Path $InstallDirectory "alex.exe"
-$LegacyBin = Join-Path $InstallDirectory "alex.exe"
 $ReadyFile = Join-Path $SmokeRoot "mock.port"
 $MockLog = Join-Path $SmokeRoot "mock.ndjson"
 $OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -331,7 +330,6 @@ $Result = [ordered]@{
         version = $Version
         repository = $Repository
         checksum_verified_by_installer = $false
-        alex = $false
         alex = $false
     }
     service = [ordered]@{
@@ -437,19 +435,13 @@ try {
         -InstallDirectory $InstallDirectory
     Assert-Condition (Test-Path -LiteralPath $AlexBin -PathType Leaf) `
         "Installer did not install alex.exe."
-    Assert-Condition (Test-Path -LiteralPath $LegacyBin -PathType Leaf) `
-        "Installer did not install alex.exe."
     $AlexVersion = (& $AlexBin --version | Out-String).Trim()
-    $LegacyVersion = (& $LegacyBin --version | Out-String).Trim()
     Assert-Condition ($AlexVersion -eq "alex $Version") `
         "Unexpected alex.exe version '$AlexVersion'."
-    Assert-Condition ($LegacyVersion -eq $AlexVersion) `
-        "Compatibility executable reports '$LegacyVersion', expected '$AlexVersion'."
     $Result.package.checksum_verified_by_installer = $true
     $Result.package.alex = $true
-    $Result.package.alex = $true
     $Checks["release-installer-sha256"] = $true
-    $Checks["both-packaged-binaries"] = $true
+    $Checks["packaged-alex-binary"] = $true
 
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     Assert-Condition ($task.State.ToString() -eq "Running") `

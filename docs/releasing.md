@@ -7,14 +7,6 @@ operator entry point, not a reduced or unsigned release mode.
 
 ## Required repository configuration
 
-Configure the GitHub environment `stable-windows-release` with required
-reviewers before cutting a stable tag. The protected `windows-approval` job
-downloads the source-built Windows archive, verifies its checksum and both
-binaries, and uploads machine-readable evidence only after an operator approves
-that environment. Environment protection is repository state and cannot be
-enforced by workflow YAML alone; a repository administrator must verify it in
-Settings → Environments.
-
 The workflow also requires the crates.io token, Apple signing/notarization
 credentials, Sparkle private key, and Homebrew tap deployment key used by the
 existing release workflows. Missing credentials fail the stable run rather than
@@ -28,14 +20,14 @@ not fall back to a host-only daemon smoke when those capabilities are absent.
 ## Publication order
 
 1. Validate the tag and run Rust and Swift tests.
-2. Build Linux GNU, Linux musl, Windows, signed macOS CLI, and signed/notarized
+2. Build Linux GNU, Linux musl, signed macOS CLI, and signed/notarized
    DMG workflow artifacts directly from the tagged source. Nothing is published.
 3. Run the installed Linux package under the pinned privileged systemd
-   container, the installed app/CLI macOS smoke, and the protected Windows
-   approval smoke. Preserve their JSON evidence as workflow artifacts.
+   container and the installed app/CLI macOS smoke. Preserve their JSON
+   evidence as workflow artifacts.
 4. Generate one `manifest.json` from all packaged assets. Verification requires
-   both macOS CLI architectures, GNU Linux, both musl Linux architectures,
-   Windows, and the DMG, and checks every size and SHA-256.
+   both macOS CLI architectures, GNU Linux, both musl Linux architectures, and
+   the DMG, and checks every size and SHA-256.
 5. Create or resume a draft GitHub release and upload the complete asset bundle.
    Re-download and verify the draft before proceeding.
 6. Publish crates in dependency order. Existing crate versions are skipped, so
@@ -73,7 +65,7 @@ delta, but A is not a previously published signed build. Before promoting a
 stable release, an operator must still repeat the upgrade and rollback using the
 actual previous stable package and the signed candidate on every supported
 platform. Do not treat the synthetic Linux gate as evidence for macOS appcast,
-Homebrew, or Windows package rollback.
+Homebrew rollback.
 
 ## Resuming a failed release
 
@@ -83,6 +75,5 @@ publishing skips versions already visible on crates.io, Homebrew commits are
 no-ops when unchanged, and promotion accepts an already-public release only
 after the complete asset verification passes.
 
-Never delete and recreate a tag to resume. If the Windows environment is not
-protected by required reviewers, or an existing public release is missing an
-asset, stop and repair that repository state before continuing.
+Never delete and recreate a tag to resume. If an existing public release is
+missing an asset, stop and repair that repository state before continuing.

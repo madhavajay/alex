@@ -8,8 +8,8 @@
   <a href="https://crates.io/crates/alex"><img src="https://img.shields.io/crates/v/alex.svg" alt="crates.io"></a>
   <a href="https://github.com/madhavajay/alex/actions/workflows/ci.yml"><img src="https://github.com/madhavajay/alex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/Linux-V1_beta_target-FCC624?logo=linux&amp;logoColor=black" alt="Linux V1 beta target"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/Windows-V1_beta_target-0078D4?logo=windows11&amp;logoColor=white" alt="Windows V1 beta target"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&amp;logoColor=black" alt="Linux supported"></a>
+  <img src="https://img.shields.io/badge/Windows-coming%20soon-0078D4?logo=windows11&amp;logoColor=white" alt="Windows coming soon">
 </p>
 
 <h2 align="center">Your tokens, your traces, your choice!</h2>
@@ -26,13 +26,7 @@ Install the macOS app or Linux daemon with one command:
 curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh
 ```
 
-On Windows 11, use PowerShell to install the CLI and per-user Task Scheduler
-service, then open the shared web UI:
-
-```powershell
-irm https://raw.githubusercontent.com/madhavajay/alex/main/install-release.ps1 | iex
-alex web
-```
+Windows support is coming soon and is not included in the stable release.
 
 ## Your Tokens, Your Traces, Your Choice!
 
@@ -143,7 +137,7 @@ Requests, responses, token usage, latency, cost, sessions, subagents, requested 
 Local and inspectable by default.
 The daemon listens on 127.0.0.1, stores traces in local SQLite, and keeps provider credentials on your machine.
 
-Open the shared local status, onboarding, and Trace Browser preview on macOS, Linux, or Windows:
+Open the shared local status, onboarding, and Trace Browser preview on macOS or Linux:
 
 ```bash
 alex web
@@ -435,7 +429,7 @@ Any harness pointed at Alex can set these per request:
 
 ## Platforms and alternative installation
 
-The V1 beta targets macOS, Ubuntu Linux x86-64, and Windows 11 x86-64 for the core CLI, user service, onboarding, routing, middleware, and Trace Browser path. The native menu-bar app and native notifications remain macOS-only; Linux and Windows use the shared web UI. All three Rust platform jobs are required CI gates, and the release checklist tracks the remaining release-candidate and clean-machine smoke tests.
+The stable release supports macOS and Ubuntu Linux x86-64 for the core CLI, user service, onboarding, routing, middleware, and Trace Browser path. The native menu-bar app and native notifications remain macOS-only; Linux uses the shared web UI. Windows support is being developed separately and is not a release target yet.
 
 Alternative installation methods:
 

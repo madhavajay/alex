@@ -132,7 +132,6 @@ install_linux() {
     service_was_active=1
   fi
   install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
-  install -m 0755 "$tmp/alex" "$INSTALL_DIR/alex"
 
   if [ "$NO_SERVICE" = "1" ]; then
     say "Alex is installed; skipped user service registration (ALEX_NO_SERVICE=1)."

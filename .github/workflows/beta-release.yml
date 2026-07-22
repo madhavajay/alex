@@ -155,33 +155,6 @@ jobs:
             dist/alex-aarch64-unknown-linux-musl \
             dist/checksums.txt --clobber
 
-  windows-asset:
-    needs: [meta, create-prerelease]
-    runs-on: namespace-profile-windows-medium
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.meta.outputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build and package CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ needs.meta.outputs.version }}"
-          ./scripts/stamp-version.sh "$version"
-          cargo build --release -p alex --bins
-          mkdir -p dist
-          asset="alex-cli-${version}-windows-x86_64.zip"
-          7z a "dist/$asset" ./target/release/alex.exe
-          sha256sum "dist/$asset" > "dist/$asset.sha256"
-      - name: Upload to prerelease
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ needs.meta.outputs.tag }}" dist/* --clobber
-
   macos-cli-asset:
     needs: [meta, create-prerelease, swift-test]
     runs-on: namespace-profile-mac-medium
@@ -255,9 +228,8 @@ jobs:
           intel_root="$RUNNER_TEMP/alex-cli-release-x86_64"
           rm -rf "$arm_root" "$intel_root"
           mkdir -p "$arm_root" "$intel_root"
-          cp target/release/alex target/release/alex "$arm_root/"
-          cp target/x86_64-apple-darwin/release/alex \
-            target/x86_64-apple-darwin/release/alex "$intel_root/"
+          cp target/release/alex "$arm_root/"
+          cp target/x86_64-apple-darwin/release/alex "$intel_root/"
 
       - name: Sign CLI binaries
         if: steps.cli_signing.outputs.available == 'true'
@@ -267,17 +239,12 @@ jobs:
           set -euo pipefail
           for bin in \
             "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
             "$RUNNER_TEMP/alex-cli-release-x86_64/alex"
           do
             codesign --remove-signature "$bin" 2>/dev/null || true
-            case "$(basename "$bin")" in
-              alex) identifier="com.madhavajay.alex.cli" ;;
-              alex) identifier="com.madhavajay.alex.daemon" ;;
-            esac
             codesign --force --options runtime --timestamp \
-              --identifier "$identifier" --sign "$CODESIGN_IDENTITY" "$bin"
+              --identifier "com.madhavajay.alex.cli" \
+              --sign "$CODESIGN_IDENTITY" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
           done
 
@@ -294,12 +261,8 @@ jobs:
           notary_result="$RUNNER_TEMP/alex-cli-notary-result.json"
           rm -rf "$notary_root" "$notary_zip" "$notary_result"
           mkdir -p "$notary_root/aarch64" "$notary_root/x86_64"
-          cp "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-aarch64/alex" \
-            "$notary_root/aarch64/"
-          cp "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
-            "$RUNNER_TEMP/alex-cli-release-x86_64/alex" \
-            "$notary_root/x86_64/"
+          cp "$RUNNER_TEMP/alex-cli-release-aarch64/alex" "$notary_root/aarch64/"
+          cp "$RUNNER_TEMP/alex-cli-release-x86_64/alex" "$notary_root/x86_64/"
           ditto -c -k --sequesterRsrc "$notary_root" "$notary_zip"
           xcrun notarytool submit "$notary_zip" \
             --apple-id "$APPLE_ID" \
@@ -335,8 +298,6 @@ jobs:
           tar -xzf "dist/$intel_asset" -C "$verify_root/x86_64"
           for bin in \
             "$verify_root/aarch64/alex" \
-            "$verify_root/aarch64/alex" \
-            "$verify_root/x86_64/alex" \
             "$verify_root/x86_64/alex"
           do
             codesign --verify --strict --verbose=2 "$bin"
@@ -380,23 +341,18 @@ jobs:
             --dir "$root" --pattern "$asset" --pattern "$asset.sha256"
           sed 's#dist/##' "$root/$asset.sha256" | (cd "$root" && shasum -a 256 -c -)
           tar -xzf "$root/$asset" -C "$root/extracted"
-          for bin in "$root/extracted/alex" "$root/extracted/alex"; do
-            codesign --verify --strict --verbose=2 "$bin"
-            details="$(codesign --display --verbose=4 "$bin" 2>&1)"
-            grep -q '^Authority=Developer ID Application:' <<< "$details"
-            grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<< "$details"
-            grep -Eq '^CodeDirectory .*flags=.*runtime' <<< "$details"
-            case "$(basename "$bin")" in
-              alex) expected_identifier="com.madhavajay.alex.cli" ;;
-              alex) expected_identifier="com.madhavajay.alex.daemon" ;;
-            esac
-            grep -Fxq "Identifier=$expected_identifier" <<< "$details"
-            "$bin" --version
-          done
+          bin="$root/extracted/alex"
+          codesign --verify --strict --verbose=2 "$bin"
+          details="$(codesign --display --verbose=4 "$bin" 2>&1)"
+          grep -q '^Authority=Developer ID Application:' <<< "$details"
+          grep -Eq '^TeamIdentifier=[A-Z0-9]{10}$' <<< "$details"
+          grep -Eq '^CodeDirectory .*flags=.*runtime' <<< "$details"
+          grep -Fxq 'Identifier=com.madhavajay.alex.cli' <<< "$details"
+          "$bin" --version
 
   manifest:
-    needs: [meta, linux-asset, linux-musl-asset, windows-asset, macos-cli-asset, macos-cli-verify]
-    if: ${{ !cancelled() && needs.linux-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.windows-asset.result == 'success' && needs.macos-cli-asset.result == 'success' && needs.macos-cli-verify.result == 'success' }}
+    needs: [meta, linux-asset, linux-musl-asset, macos-cli-asset, macos-cli-verify]
+    if: ${{ !cancelled() && needs.linux-asset.result == 'success' && needs.linux-musl-asset.result == 'success' && needs.macos-cli-asset.result == 'success' && needs.macos-cli-verify.result == 'success' }}
     runs-on: namespace-profile-linux-medium
     steps:
       - uses: actions/checkout@v4

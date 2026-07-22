@@ -12,7 +12,7 @@ Each local beta checkpoint follows the same order:
 
 1. Merge one coherent feature batch into `v1/integration`.
 2. Run focused tests, then the full Rust and Swift suites.
-3. Require Linux, Windows, macOS, site, bundle, and secret-scanning CI gates.
+3. Require Linux, macOS, site, bundle, and secret-scanning CI gates.
 4. Stamp the next `0.1.29-beta.N` version in an isolated build tree.
 5. Build and install the CLI, daemon, and macOS app locally.
 6. Publish a short manual test card containing only behavior that automation
@@ -62,11 +62,8 @@ a tag or changes the source worktree.
 - [x] The web UI covers onboarding, provider health, middleware, and traces.
 - [x] Deterministic proxy tests cover streaming, tool calls, middleware,
   persistence, and restart recovery.
-- [x] Windows Task Scheduler service support is implemented and is a required
-  CI gate.
+- Windows support is deferred and is not part of the `0.1.29` release gate.
 - [x] Linux Rust/service/web CI is green on the release candidate (PR run
-  `29800336043`).
-- [x] Windows Rust/service/web CI is green on the release candidate (PR run
   `29800336043`).
 - [x] macOS Rust, Swift, and app-bundle CI are green on the release candidate
   (PR run `29800336043`).
@@ -80,8 +77,6 @@ a tag or changes the source worktree.
   `64044200-49f9-48c4-b118-e95e018631f3`, replaces daemon PID `206` with
   `290`, reads the same trace/body after restart, and removes the isolated
   service/container (PR run `29798681461`).
-- [ ] Run the equivalent packaged smoke manually on Windows 11 x86-64 using
-  the offline-provider procedure in `docs/windows-packaged-smoke.md`.
 
 ## Fable to Sol middleware preset
 
@@ -141,7 +136,7 @@ a tag or changes the source worktree.
   permissions instead of blocking onboarding (Rust/Swift first-run regression
   tests plus the clean Ubuntu package install in PR run `29800336043`).
 - [ ] Build, install, and record the final `0.1.29-beta.N` candidate.
-- [ ] Complete the full clean-user launch story on every supported platform.
+- [ ] Complete the full clean-user launch story on macOS and Ubuntu Linux.
 - [x] Gate Linux pull requests with local release-format A → B → A packages,
   managed-service replacement, and state/trace preservation evidence (PR run
   `29800336043`: PIDs `212` → `317` → `420`; base trace
@@ -149,7 +144,7 @@ a tag or changes the source worktree.
   `08b53fbc-be72-44a4-9c4f-d7fff62a5af0` survived rollback).
 - [ ] Stamp `0.1.29`, generate signed/notarized release assets, publish stable
   update metadata, and verify upgrade/rollback using the actual previous stable
-  and signed candidate packages on every supported platform.
+  and signed candidate packages on macOS and Ubuntu Linux.
 
 ## Current checkpoint
 

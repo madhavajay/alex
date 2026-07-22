@@ -1,6 +1,6 @@
 # Shared web UI
 
-The daemon serves Alex's first shared macOS, Linux, and Windows product surface. Start the daemon when needed and open it with:
+The daemon serves Alex's shared macOS and Linux product surface. Start the daemon when needed and open it with:
 
 ```bash
 alex web
@@ -14,14 +14,7 @@ alex web --no-open
 
 `alex web` starts a background daemon if the configured local daemon is not already healthy. The URL always uses loopback even when Alex also listens on a LAN or VPN interface. The page obtains its administrative credential from the loopback-only `/connect` bootstrap endpoint; it does not put the credential in a URL, HTML asset, or browser storage.
 
-On Windows 11, install the signed release and its per-user Task Scheduler service from PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/madhavajay/alex/main/install-release.ps1 | iex
-alex web
-```
-
-The installer verifies the release archive's SHA-256 checksum, installs under `%LOCALAPPDATA%\Alex\bin`, adds that directory to the user `PATH`, and runs `alex service install`. Use `alex service restart` and `alex service uninstall` for the same lifecycle exposed on macOS and Linux.
+Windows support is not included in the stable release yet.
 
 This preview includes:
 
@@ -36,7 +29,10 @@ This preview includes:
 - bounded, cursor-paginated session turns (20 at a time), with request/response
   bodies and tool data loaded only when one turn is expanded.
 
-The menu-bar app and native notifications remain macOS-only. Linux uses the systemd user service; Windows uses a per-user Task Scheduler entry. Both are managed with `alex service install`, `alex service restart`, and `alex service uninstall`. Linux, Windows, and macOS Rust jobs are required CI gates; the release checklist separately records clean-machine install, restart, routing, and trace-inspection smoke results.
+The menu-bar app and native notifications remain macOS-only. Linux uses the
+systemd user service, managed with `alex service install`, `alex service
+restart`, and `alex service uninstall`. Windows support is being developed
+separately and is not a stable-release gate.
 
 ## HTTP surface
 
@@ -59,10 +55,9 @@ The Middleware view reads `GET /admin/middleware` and `GET /admin/fixtures`. Tog
 
 CI runs the cross-platform `deterministic_platform_smoke` test with local TCP listeners and mock OpenAI-compatible OpenAI/Exo routes. It checks daemon health, the shared UI, a basic request, a streamed and reassembled tool call, an OpenAI-to-Exo middleware reroute with recorded decisions/provenance, bounded trace listing, and persistence of traces, streamed bodies, and the rule after the daemon/store is reopened. No provider credential or public network is involved.
 
-The same macOS, Linux, and Windows matrix also runs browser-launch,
-background-daemon, and platform service-lifecycle contracts. These prove URLs,
-executable paths containing spaces, daemon arguments, and Windows Task
-Scheduler state stay OS-native and shell-free. A failure on any supported Rust
-platform blocks the release candidate.
+The macOS and Linux matrix also runs browser-launch, background-daemon, and
+platform service-lifecycle contracts. These prove URLs, executable paths
+containing spaces, and daemon arguments stay OS-native and shell-free. A
+failure on either supported Rust platform blocks the release candidate.
 
 Provider OAuth itself remains a short manual/live smoke because public CI cannot safely hold subscription credentials.

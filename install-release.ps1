@@ -10,6 +10,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+throw "Windows support is not included in the Alex 0.1.29 stable release. Use the macOS or Linux installer."
+
 function Write-Step([string]$Message) {
     Write-Host "◆ $Message" -ForegroundColor Cyan
 }
