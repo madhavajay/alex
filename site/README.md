@@ -1,8 +1,6 @@
 # Alex public site
 
-This directory is a dependency-free static GitHub Pages site. Its first
-walkthrough is generated from the same deterministic Fable-to-Sol middleware
-fixture used by the proxy tests.
+The public site is a dependency-free static build deployed to GitHub Pages.
 
 ```sh
 cd site
@@ -11,29 +9,9 @@ npm test
 npm run build
 ```
 
-The output is written to `site/dist/`. The build manifest contains SHA-256
-hashes of every published file, so two builds of one commit can be compared
-byte for byte.
+The current landing page is built from `src/` and published at the site root.
+The previous interactive concept is preserved as a static snapshot in `old/`
+and published at `/old/`.
 
-## Analytics contract
-
-`src/analytics-schema.js` is the complete event and property allowlist. The
-browser discards undeclared properties and respects Global Privacy Control and
-Do Not Track. Events are sent to Plausible's cookie-free event endpoint and
-also emitted as `alex:analytics` DOM events for deterministic tests and local
-inspection.
-
-Only page identity, demo/provider identifiers, UI surfaces, step counts, and
-campaign attribution are accepted. Prompts, traces, credentials, request
-bodies, response bodies, full referrers, and arbitrary URLs cannot enter an
-event payload.
-
-## Pages deployment
-
-`.github/workflows/pages.yml` builds and tests on every relevant pull request.
-On `main`, it deploys the exact build artifact to the existing `gh-pages`
-branch. The deploy shares the `gh-pages-deploy` concurrency group with the
-release appcast workflow and explicitly preserves `appcast.xml` and
-`appcast-beta.xml`. After the push, `scripts/verify-live.mjs` waits for Pages
-to serve every file with the SHA-256 recorded in the build manifest. The live
-check includes allowlisted campaign parameters in its requests.
+The Pages workflow deploys `site/dist/` to `gh-pages` while preserving the
+stable and beta Sparkle appcasts already hosted on that branch.

@@ -5,6 +5,12 @@
 </p>
 
 <p align="center">
+  <a href="https://madhavajay.github.io/alex/">
+    <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/demo.jpg" alt="Alex live demo page with Cove replay player" width="100%">
+  </a>
+</p>
+
+<p align="center">
   <a href="https://crates.io/crates/alex"><img src="https://img.shields.io/crates/v/alex.svg" alt="crates.io"></a>
   <a href="https://github.com/madhavajay/alex/actions/workflows/ci.yml"><img src="https://github.com/madhavajay/alex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported"></a>
@@ -80,6 +86,33 @@ Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multi
 <br clear="right">
 
 ![Alex Trace Browser showing model requests, tool calls, token usage, and latency](https://raw.githubusercontent.com/madhavajay/alex/main/images/trace-browser.png)
+
+## Problems Alex fixes
+
+**Problem:** Fable 5 guardrails kill your session.  
+**Solution:** Alex can transparently **switch** to GPT-5.6 Sol, or **fork** the session into another harness or model.
+
+`pi` · `claude` · `codex` · `grok`
+
+**Problem:** Your subscription logs out mid-run.  
+**Solution:** Alex pings you on Telegram to re-auth from your phone and can reroute traffic until it reconnects.
+
+`anthropic` · `openai` · `gemini` · `grok`
+
+**Problem:** You cannot use your Anthropic subscription from other harnesses.  
+**Solution:** Alex routes through Dario so requests match Anthropic's expected wire format.
+
+`pi` · `codex` · `claude` · `opencode`
+
+**Problem:** You hit five-hour or weekly limits and start juggling accounts.  
+**Solution:** Alex bonds multiple subscriptions and fails over automatically.
+
+`account-1` · `account-2` · `account-3`
+
+**Problem:** You cannot see what agents and subagents are really doing.  
+**Solution:** Alex shows every message, tool call, response, and subagent as one readable chat thread.
+
+`claude` · `codex` · `pi` · `amp` · `cursor`
 
 ### Harness tracing support
 

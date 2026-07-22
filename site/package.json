@@ -1,13 +1,9 @@
 {
   "name": "alex-public-site",
+  "version": "2.0.0",
   "private": true,
-  "version": "1.0.0",
-  "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test scripts/site.test.mjs"
-  },
-  "engines": {
-    "node": ">=22"
   }
 }

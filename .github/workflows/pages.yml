@@ -5,14 +5,10 @@ on:
     branches: [main]
     paths:
       - "site/**"
-      - "crates/alex-middleware/src/builtins.rs"
-      - "crates/alex-proxy/tests/fixtures/middleware/**"
       - ".github/workflows/pages.yml"
   pull_request:
     paths:
       - "site/**"
-      - "crates/alex-middleware/src/builtins.rs"
-      - "crates/alex-proxy/tests/fixtures/middleware/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -30,13 +26,13 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: site/package-lock.json
-      - name: Install the locked toolchain
+      - name: Install locked dependencies
         working-directory: site
         run: npm ci --ignore-scripts
-      - name: Verify fixture, analytics, accessibility, and reproducibility
+      - name: Test public site
         working-directory: site
         run: npm test
-      - name: Build static site
+      - name: Build public site
         working-directory: site
         run: npm run build
       - uses: actions/upload-artifact@v4
@@ -57,13 +53,6 @@ jobs:
       group: gh-pages-deploy
       cancel-in-progress: false
     steps:
-      - name: Check out the deployment verifier
-        uses: actions/checkout@v4
-        with:
-          path: source
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - name: Check out the existing Pages branch
         uses: actions/checkout@v4
         with:
@@ -85,8 +74,6 @@ jobs:
             --exclude='appcast.xml' \
             --exclude='appcast-beta.xml' \
             ../built/ ./
-          test -f appcast.xml || echo "stable appcast is not present yet"
-          test -f appcast-beta.xml || echo "beta appcast is not present yet"
           git add -A
           if git diff --cached --quiet; then
             echo "Pages already matches this build"
@@ -96,7 +83,3 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git commit -m "site: deploy ${SOURCE_SHA}"
           git push origin HEAD:gh-pages
-      - name: Verify the live Pages artifact
-        env:
-          SITE_URL: https://madhavajay.github.io/alex/?utm_source=github&utm_campaign=v1-deploy
-        run: node source/site/scripts/verify-live.mjs "$SITE_URL" built/build-manifest.json 240

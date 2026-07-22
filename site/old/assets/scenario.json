@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "id": "fable-to-sol-overload",
+  "title": "Fable 5 is full. The session keeps moving.",
+  "description": "A failed Anthropic Fable attempt is replaced by an OpenAI Sol attempt before client commitment.",
+  "source": {
+    "vector": "crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json",
+    "failure_fixture": "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json",
+    "rule_builtin": "crates/alex-middleware/src/builtins.rs",
+    "sha256": {
+      "vector": "7f192ab201e2315dcb1a87fdcd371206f2f12af3d149016a07b4990660b77eda",
+      "failure_fixture": "982990ef2c01cb38297933bbaf26b97305f4decd12984aee5acf08338812b573",
+      "rule": "baeb2f9712e7cee4bcae3f8af59a63d747f8421f9003a7e697ea3b9e3024e000",
+      "rule_builtin": "3d1d0859ae3f9e5b87aa739ad18137c183f9a2a6e07200ca05a8875ae21ae95a"
+    }
+  },
+  "steps": [
+    {
+      "id": "request",
+      "label": "Request enters Alex",
+      "detail": "claude asks for claude-fable-5",
+      "kind": "request"
+    },
+    {
+      "id": "fable-attempt",
+      "label": "Alex routes to Fable 5",
+      "detail": "anthropic receives the first attempt",
+      "kind": "route"
+    },
+    {
+      "id": "capacity-signal",
+      "label": "Fable returns a verified capacity signal",
+      "detail": "HTTP 529 · overloaded_error",
+      "kind": "signal"
+    },
+    {
+      "id": "rule-match",
+      "label": "The middleware rule matches",
+      "detail": "Fable failed with a selected overload or availability error",
+      "kind": "decision"
+    },
+    {
+      "id": "sol-attempt",
+      "label": "Alex retries with Sol 5.6",
+      "detail": "openai serves gpt-5.6-sol",
+      "kind": "route"
+    },
+    {
+      "id": "trace",
+      "label": "The session is pinned and the trace explains why",
+      "detail": "24 hour pin · next turn skips Anthropic",
+      "kind": "success"
+    }
+  ],
+  "request": {
+    "harness": "claude",
+    "session_id": "fixture-session-fable-sol",
+    "client_format": "anthropic_messages",
+    "model": "claude-fable-5"
+  },
+  "expected_decision": {
+    "decision": "reroute",
+    "target": {
+      "kind": "exact",
+      "model": "gpt-5.6-sol",
+      "providers": {
+        "only": [
+          "openai"
+        ]
+      }
+    },
+    "scope": {
+      "scope": "session",
+      "ttl_seconds": 86400
+    }
+  },
+  "expected_attempts": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "status": 529
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "status": 200
+    }
+  ],
+  "next_turn": {
+    "model": "claude-fable-5",
+    "expected_provider": "openai",
+    "expected_model": "gpt-5.6-sol",
+    "anthropic_attempts": 0
+  },
+  "failure": {
+    "name": "anthropic-fable-unavailable-529",
+    "provider": "anthropic",
+    "status": 529,
+    "error_kind": "overloaded_error"
+  },
+  "rule": {
+    "id": "example.fable-overload-to-sol",
+    "name": "Move overloaded Fable chats to Sol",
+    "description": "Reroute selected failed Anthropic Fable requests to OpenAI Sol.",
+    "enabled": true,
+    "priority": 100,
+    "hook": "attempt_result",
+    "capabilities": [
+      "attempt.read_error_body",
+      "route.override",
+      "session.pin",
+      "response.prepend_text"
+    ],
+    "when": {
+      "harness_names": [
+        "claude",
+        "codex",
+        "pi"
+      ],
+      "models": [
+        "claude-fable-5",
+        "fable-*"
+      ],
+      "providers": [
+        "anthropic"
+      ],
+      "status": [
+        429,
+        "500-599"
+      ],
+      "error_classes": [
+        "capacity",
+        "server"
+      ],
+      "body_contains_any": [
+        "model is currently overloaded",
+        "subscription is unavailable"
+      ]
+    },
+    "then": {
+      "reroute": {
+        "model": "gpt-5.6-sol",
+        "providers": [
+          "openai"
+        ],
+        "provider_mode": "only",
+        "scope": "session",
+        "ttl_seconds": 86400,
+        "notice": "We moved this chat from Fable 5 to GPT 5.6 Sol.",
+        "reason": "Fable failed with a selected overload or availability error",
+        "max_attempts": 3,
+        "required_capabilities": {
+          "portable_history": true
+        }
+      }
+    }
+  }
+}
