@@ -1,17 +1,17 @@
 {
   "schema_version": 1,
-  "id": "fable-to-sol-refusal",
-  "title": "Fable 5 refuses. The session keeps moving.",
-  "description": "An Anthropic Fable refusal is replaced by OpenAI Sol and pinned for the stable session.",
+  "id": "fable-to-sol-overload",
+  "title": "Fable 5 is full. The session keeps moving.",
+  "description": "A failed Anthropic Fable attempt is replaced by an OpenAI Sol attempt before client commitment.",
   "source": {
     "vector": "crates/alex-proxy/tests/fixtures/middleware/fable-to-sol-vector.json",
-    "failure_fixture": "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-refusal-200.json",
+    "failure_fixture": "crates/alex-proxy/tests/fixtures/middleware/anthropic-fable-unavailable-529.json",
     "rule_builtin": "crates/alex-middleware/src/builtins.rs",
     "sha256": {
-      "vector": "e3089b381073e0dae6e6cefe43a2db571c0d6807724e402058257e16ee16600b",
-      "failure_fixture": "d37a0e26f70396a9da4060c8008ba1c9daea3b0984914e5ca27b983fff63163f",
-      "rule": "788b8f5a970e811bc04e117f898bac04139e169788b2f7c4194f150bbc1e8a60",
-      "rule_builtin": "04dda877aaf8712d1a3d3d491186599b793cf0e899f117b9c52adcb6c89e0b4b"
+      "vector": "7f192ab201e2315dcb1a87fdcd371206f2f12af3d149016a07b4990660b77eda",
+      "failure_fixture": "982990ef2c01cb38297933bbaf26b97305f4decd12984aee5acf08338812b573",
+      "rule": "baeb2f9712e7cee4bcae3f8af59a63d747f8421f9003a7e697ea3b9e3024e000",
+      "rule_builtin": "3d1d0859ae3f9e5b87aa739ad18137c183f9a2a6e07200ca05a8875ae21ae95a"
     }
   },
   "steps": [
@@ -29,14 +29,14 @@
     },
     {
       "id": "capacity-signal",
-      "label": "Fable returns a refusal signal",
-      "detail": "HTTP 200 · refusal · bio",
+      "label": "Fable returns a verified capacity signal",
+      "detail": "HTTP 529 · overloaded_error",
       "kind": "signal"
     },
     {
       "id": "rule-match",
       "label": "The middleware rule matches",
-      "detail": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+      "detail": "Fable failed with a selected overload or availability error",
       "kind": "decision"
     },
     {
@@ -47,8 +47,8 @@
     },
     {
       "id": "trace",
-      "label": "The trace explains the session fallback",
-      "detail": "Later requests in this session stay on Sol for 24 hours",
+      "label": "The session is pinned and the trace explains why",
+      "detail": "24 hour pin · next turn skips Anthropic",
       "kind": "success"
     }
   ],
@@ -78,8 +78,7 @@
     {
       "provider": "anthropic",
       "model": "claude-fable-5",
-      "status": 200,
-      "error_kind": "upstream_refusal"
+      "status": 529
     },
     {
       "provider": "openai",
@@ -91,36 +90,52 @@
     "model": "claude-fable-5",
     "expected_provider": "openai",
     "expected_model": "gpt-5.6-sol",
-    "openai_attempts": 2
+    "anthropic_attempts": 0
   },
   "failure": {
-    "name": "anthropic-fable-refusal-200",
+    "name": "anthropic-fable-unavailable-529",
     "provider": "anthropic",
-    "status": 200,
-    "error_kind": "upstream_refusal"
+    "status": 529,
+    "error_kind": "overloaded_error"
   },
   "rule": {
-    "id": "alex.fable-5-to-gpt-5.6-sol",
-    "name": "Fable 5 → GPT-5.6 Sol",
-    "description": "When Anthropic Fable 5 refuses a request, switch the session to high-effort GPT-5.6 Sol.",
+    "id": "example.fable-overload-to-sol",
+    "name": "Move overloaded Fable chats to Sol",
+    "description": "Reroute selected failed Anthropic Fable requests to OpenAI Sol.",
     "enabled": true,
     "priority": 100,
     "hook": "attempt_result",
     "capabilities": [
+      "attempt.read_error_body",
       "route.override",
-      "session.pin"
+      "session.pin",
+      "response.prepend_text"
     ],
     "when": {
+      "harness_names": [
+        "claude",
+        "codex",
+        "pi"
+      ],
       "models": [
-        "claude-fable-5"
+        "claude-fable-5",
+        "fable-*"
       ],
       "providers": [
         "anthropic"
       ],
-      "error_kinds": [
-        "upstream_refusal"
+      "status": [
+        429,
+        "500-599"
       ],
-      "stable_session": true
+      "error_classes": [
+        "capacity",
+        "server"
+      ],
+      "body_contains_any": [
+        "model is currently overloaded",
+        "subscription is unavailable"
+      ]
     },
     "then": {
       "reroute": {
@@ -131,8 +146,8 @@
         "provider_mode": "only",
         "scope": "session",
         "ttl_seconds": 86400,
-        "effort": "high",
-        "reason": "Fable 5 refused the request; switching this session to GPT-5.6 Sol",
+        "notice": "We moved this chat from Fable 5 to GPT 5.6 Sol.",
+        "reason": "Fable failed with a selected overload or availability error",
         "max_attempts": 3,
         "required_capabilities": {
           "portable_history": true
