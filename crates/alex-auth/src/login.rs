@@ -2259,6 +2259,52 @@ mod tests {
     }
 
     #[test]
+    fn authorize_urls_preserve_pkce_state_and_provider_specific_parameters() {
+        let challenge = "challenge-with_-symbols";
+        let state = "state with spaces & symbols";
+        let redirect = "http://localhost:43123/oauth2callback";
+        let cases = [
+            (
+                "anthropic",
+                anthropic_authorize_url(challenge, state),
+                ANTHROPIC_CLIENT_ID,
+                ANTHROPIC_REDIRECT_URI,
+                ANTHROPIC_SCOPES,
+            ),
+            (
+                "openai",
+                openai_authorize_url(challenge, state),
+                OPENAI_CLIENT_ID,
+                OPENAI_REDIRECT_URI,
+                OPENAI_SCOPES,
+            ),
+            (
+                "gemini",
+                gemini_authorize_url(challenge, state, redirect),
+                crate::GEMINI_CLIENT_ID,
+                redirect,
+                GEMINI_SCOPES,
+            ),
+        ];
+
+        for (name, raw_url, client_id, expected_redirect, scope) in cases {
+            let url = reqwest::Url::parse(&raw_url).unwrap();
+            let pairs = url.query_pairs().collect::<Vec<_>>();
+            let params = pairs
+                .iter()
+                .map(|(key, value)| (key.as_ref(), value.as_ref()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(params["client_id"], client_id, "{name}");
+            assert_eq!(params["redirect_uri"], expected_redirect, "{name}");
+            assert_eq!(params["scope"], scope, "{name}");
+            assert_eq!(params["code_challenge"], challenge, "{name}");
+            assert_eq!(params["code_challenge_method"], "S256", "{name}");
+            assert_eq!(params["state"], state, "{name}");
+            assert_eq!(pairs.len(), params.len(), "{name}");
+        }
+    }
+
+    #[test]
     fn authorization_input_parsing() {
         assert_eq!(
             parse_authorization_input("abc#xyz"),
@@ -2294,6 +2340,48 @@ mod tests {
         let empty = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({})).unwrap());
         assert_eq!(chatgpt_account_id(&format!("h.{empty}.s")), None);
+    }
+
+    #[test]
+    fn jwt_account_id_claim_requires_the_openai_auth_namespace_and_string_value() {
+        let cases = [
+            (
+                "valid",
+                json!({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-456"}}),
+                Some("acct-456"),
+            ),
+            (
+                "top level claim",
+                json!({"chatgpt_account_id": "acct-top"}),
+                None,
+            ),
+            (
+                "wrong namespace",
+                json!({"https://api.openai.com/profile": {"chatgpt_account_id": "acct-profile"}}),
+                None,
+            ),
+            (
+                "non-string claim",
+                json!({"https://api.openai.com/auth": {"chatgpt_account_id": 123}}),
+                None,
+            ),
+            (
+                "missing claim",
+                json!({"https://api.openai.com/auth": {}}),
+                None,
+            ),
+        ];
+
+        for (name, payload, expected) in cases {
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap());
+            let token = format!("header.{encoded}.signature");
+            assert_eq!(chatgpt_account_id(&token).as_deref(), expected, "{name}");
+        }
+
+        for malformed in ["", "header", "header.***.signature", "header.e30"] {
+            assert_eq!(chatgpt_account_id(malformed), None, "{malformed}");
+        }
     }
 
     #[test]
@@ -2395,6 +2483,26 @@ mod tests {
             kimi_verification_url(&bare),
             "https://www.kimi.com/code/authorize_device?user_code=ABCD-EFGH"
         );
+    }
+
+    #[test]
+    fn kimi_device_endpoint_builders_normalize_oauth_hosts() {
+        let cases = [
+            ("https://auth.kimi.com", "https://auth.kimi.com"),
+            ("https://auth.kimi.com/", "https://auth.kimi.com"),
+            ("http://127.0.0.1:8080///", "http://127.0.0.1:8080"),
+        ];
+
+        for (host, normalized) in cases {
+            assert_eq!(
+                kimi_device_authorization_url_at(host),
+                format!("{normalized}/api/oauth/device_authorization")
+            );
+            assert_eq!(
+                kimi_token_url_at(host),
+                format!("{normalized}/api/oauth/token")
+            );
+        }
     }
 
     #[test]

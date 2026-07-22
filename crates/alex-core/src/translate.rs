@@ -1929,6 +1929,34 @@ pub fn normalize_codex_request(req: &mut Value) {
 mod tests {
     use super::*;
 
+    fn fixture(raw: &str) -> Value {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn first_user_text(req: &Value) -> Option<String> {
+        req["messages"]
+            .as_array()?
+            .iter()
+            .find(|message| message["role"] == "user")
+            .map(|message| txt(&message["content"]))
+    }
+
+    fn recorded_anthropic_response(value: &Value) -> Value {
+        value.clone()
+    }
+
+    fn recorded_chat_response(value: &Value) -> Value {
+        openai_chat_response_to_anthropic(value, "grok-4.5-build")
+    }
+
+    fn recorded_responses_response(value: &Value) -> Value {
+        responses_final_to_anthropic(value, "gpt-5.5")
+    }
+
+    fn recorded_gemini_response(value: &Value) -> Value {
+        gemini_response_to_anthropic(value, "gpt-5.5")
+    }
+
     fn gemini_req() -> Value {
         json!({
             "model": "gpt-5.5",
@@ -1956,6 +1984,247 @@ mod tests {
                 "stopSequences": ["END"]
             }
         })
+    }
+
+    #[test]
+    fn recorded_request_fixtures_normalize_text_system_tools_and_choice() {
+        let cases: Vec<(&str, Value, fn(&Value) -> Value, &str, Option<&str>, &str, Option<&str>)> = vec![
+            (
+                "anthropic",
+                fixture(include_str!("../../alex-proxy/tests/fixtures/toolcalls/anthropic_request.json")),
+                Value::clone,
+                "Answer this question in your own words: Who are you? Write your answer to /app/whoami.txt.",
+                None,
+                "Bash",
+                None,
+            ),
+            (
+                "openai chat",
+                fixture(include_str!("../../alex-proxy/tests/fixtures/toolcalls/openai_chat_request.json")),
+                openai_chat_to_anthropic,
+                "Write a short self-description to /app/whoami.txt.",
+                Some("You are an interactive CLI tool that helps users with software engineering tasks."),
+                "write",
+                Some("auto"),
+            ),
+            (
+                "openai responses",
+                fixture(include_str!("../../alex-proxy/tests/fixtures/toolcalls/openai_responses_request.json")),
+                openai_responses_to_anthropic,
+                "Answer this question in your own words: Who are you? Write your answer to /app/whoami.txt.",
+                Some("You are a coding agent running in a terminal."),
+                "exec_command",
+                None,
+            ),
+            (
+                "gemini",
+                fixture(include_str!("../../alex-proxy/tests/fixtures/toolcalls/gemini_request.json")),
+                gemini_to_anthropic,
+                "Answer this question in your own words: Who are you? Write your answer to /app/whoami.txt.",
+                None,
+                "update_topic",
+                Some("auto"),
+            ),
+        ];
+
+        for (name, request, normalize, user, system, tool, choice) in cases {
+            let pivot = normalize(&request);
+            assert_eq!(first_user_text(&pivot).as_deref(), Some(user), "{name}");
+            assert_eq!(pivot["system"].as_str(), system, "{name}");
+            assert_eq!(pivot["tools"][0]["name"], tool, "{name}");
+            if let Some(choice) = choice {
+                assert_eq!(pivot["tool_choice"]["type"], choice, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_pivot_round_trips_supported_request_contracts() {
+        let pivot = json!({
+            "model": "model-under-test",
+            "system": "Follow the tool contract.",
+            "messages": [
+                {"role": "user", "content": "look up weather"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "call_preserved", "name": "weather", "input": {"city": "Brisbane"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_preserved", "content": [{"type": "text", "text": "sunny"}]}
+                ]}
+            ],
+            "tools": [{
+                "name": "weather",
+                "description": "Read the forecast",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }],
+            "tool_choice": {"type": "auto"},
+            "max_tokens": 777,
+            "temperature": 0.25,
+            "top_p": 0.8,
+            "stop_sequences": ["END", "STOP"],
+            "stream": true
+        });
+
+        let chat = openai_chat_to_anthropic(&anthropic_to_openai_chat(&pivot));
+        assert_eq!(chat["model"], pivot["model"]);
+        assert_eq!(chat["system"], pivot["system"]);
+        assert_eq!(chat["tools"], pivot["tools"]);
+        assert_eq!(chat["tool_choice"], pivot["tool_choice"]);
+        assert_eq!(chat["max_tokens"], 777);
+        assert_eq!(chat["temperature"], 0.25);
+        assert_eq!(chat["top_p"], 0.8);
+        assert_eq!(chat["stop_sequences"], json!(["END", "STOP"]));
+        assert_eq!(chat["stream"], true);
+        assert_eq!(chat["messages"][1]["content"][1]["id"], "call_preserved");
+        assert_eq!(
+            chat["messages"][2]["content"][0]["tool_use_id"],
+            "call_preserved"
+        );
+
+        let responses = openai_responses_to_anthropic(&anthropic_to_openai_responses(&pivot));
+        assert_eq!(responses["model"], pivot["model"]);
+        assert_eq!(responses["system"], pivot["system"]);
+        assert_eq!(responses["tools"], pivot["tools"]);
+        assert_eq!(responses["max_tokens"], 777);
+        assert_eq!(responses["stream"], true);
+        assert_eq!(
+            responses["messages"][2]["content"][0]["id"],
+            "call_preserved"
+        );
+        assert_eq!(
+            responses["messages"][3]["content"][0]["tool_use_id"],
+            "call_preserved"
+        );
+
+        let gemini = gemini_to_anthropic(&anthropic_to_gemini_request(&pivot));
+        assert_eq!(gemini["system"], pivot["system"]);
+        assert_eq!(gemini["tools"], pivot["tools"]);
+        assert_eq!(gemini["max_tokens"], 777);
+        assert_eq!(gemini["temperature"], 0.25);
+        assert_eq!(gemini["top_p"], 0.8);
+        assert_eq!(gemini["stop_sequences"], json!(["END", "STOP"]));
+        let gemini_call_id = gemini["messages"][1]["content"][1]["id"].clone();
+        assert_eq!(
+            gemini["messages"][2]["content"][0]["tool_use_id"],
+            gemini_call_id
+        );
+    }
+
+    #[test]
+    fn recorded_toolcall_responses_translate_across_all_four_dialects() {
+        let cases: Vec<(
+            &str,
+            Value,
+            fn(&Value) -> Value,
+            &str,
+            &str,
+            Value,
+            Option<&str>,
+        )> = vec![
+            (
+                "anthropic",
+                fixture(include_str!(
+                    "../../alex-proxy/tests/fixtures/toolcalls/anthropic_response.json"
+                )),
+                recorded_anthropic_response,
+                "The Write tool isn't available here, so I'll use a shell heredoc instead.",
+                "Bash",
+                json!({"command": "cat > /app/whoami.txt <<'EOF'\nI am Claude, an AI coding assistant.\nEOF", "description": "Write whoami answer to file"}),
+                Some("toolu_013yTmLYz8da1p56sBPGpQJR"),
+            ),
+            (
+                "openai chat",
+                fixture(include_str!(
+                    "../../alex-proxy/tests/fixtures/toolcalls/openai_chat_response.json"
+                )),
+                recorded_chat_response,
+                "I'll write a short self-description to `/app/whoami.txt`.",
+                "write",
+                json!({"content": "I am Grok, an AI assistant built by xAI.\n", "file_path": "/app/whoami.txt"}),
+                Some("call-5b4680af-a422-4045-87d2-1f47354ddec1-0"),
+            ),
+            (
+                "openai responses",
+                fixture(include_str!(
+                    "../../alex-proxy/tests/fixtures/toolcalls/openai_responses_response.json"
+                )),
+                recorded_responses_response,
+                "I'll write a short identity answer directly to the requested file.",
+                "exec_command",
+                json!({"cmd": "printf 'I am Codex, an AI coding assistant.\n' > /app/whoami.txt"}),
+                Some("call_mN0a3ODkfOp3OVa9dpAYUuOE"),
+            ),
+            (
+                "gemini",
+                fixture(include_str!(
+                    "../../alex-proxy/tests/fixtures/toolcalls/gemini_response.json"
+                )),
+                recorded_gemini_response,
+                "I'll create the requested text file directly, then verify it exists.",
+                "update_topic",
+                json!({"strategic_intent": "Create the requested non-empty identity file.", "title": "Writing identity answer"}),
+                None,
+            ),
+        ];
+
+        for (name, source, to_pivot, text, tool_name, arguments, pivot_id) in cases {
+            let pivot = to_pivot(&source);
+            assert_eq!(
+                assistant_reply_text("anthropic", &pivot.to_string()).as_deref(),
+                Some(text),
+                "{name}"
+            );
+            let pivot_call = &assistant_tool_calls("anthropic", &pivot.to_string())[0];
+            let normalized_id = pivot_call["id"].as_str().unwrap();
+            if let Some(pivot_id) = pivot_id {
+                assert_eq!(normalized_id, pivot_id, "{name}");
+            }
+            assert_eq!(pivot_call["name"], tool_name, "{name}");
+            assert_eq!(
+                serde_json::from_str::<Value>(pivot_call["arguments"].as_str().unwrap()).unwrap(),
+                arguments,
+                "{name}"
+            );
+
+            let chat = anthropic_response_to_openai_chat(&pivot, "translated-model");
+            assert_eq!(
+                assistant_reply_text("openai-chat", &chat.to_string()).as_deref(),
+                Some(text),
+                "{name}"
+            );
+            assert_eq!(
+                assistant_tool_calls("openai-chat", &chat.to_string())[0]["id"],
+                normalized_id,
+                "{name}"
+            );
+
+            let responses = anthropic_response_to_openai_responses(&pivot, "translated-model");
+            assert_eq!(
+                assistant_reply_text("openai-responses", &responses.to_string()).as_deref(),
+                Some(text),
+                "{name}"
+            );
+            assert_eq!(
+                assistant_tool_calls("openai-responses", &responses.to_string())[0]["id"],
+                normalized_id,
+                "{name}"
+            );
+
+            let gemini = anthropic_response_to_gemini(&pivot, "translated-model");
+            assert_eq!(
+                assistant_reply_text("gemini", &gemini.to_string()).as_deref(),
+                Some(text),
+                "{name}"
+            );
+            let gemini_call = &assistant_tool_calls("gemini", &gemini.to_string())[0];
+            assert_eq!(gemini_call["name"], tool_name, "{name}");
+            assert_eq!(
+                serde_json::from_str::<Value>(gemini_call["arguments"].as_str().unwrap()).unwrap(),
+                arguments,
+                "{name}"
+            );
+        }
     }
 
     #[test]

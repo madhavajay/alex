@@ -743,6 +743,142 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_headers_normalize_all_supported_windows_and_credit_fields() {
+        let cases = [
+            (
+                "anthropic unified limits",
+                Provider::Anthropic,
+                serde_json::json!({
+                    "anthropic-ratelimit-unified-5h-utilization": "0.125",
+                    "anthropic-ratelimit-unified-5h-status": "allowed",
+                    "anthropic-ratelimit-unified-5h-reset": "1800000000",
+                    "anthropic-ratelimit-unified-7d-utilization": "0.75",
+                    "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+                    "anthropic-ratelimit-unified-7d-reset": "1800500000",
+                    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+                    "anthropic-ratelimit-unified-overage-status": "disabled",
+                    "anthropic-ratelimit-unified-overage-disabled-reason": "plan_limit"
+                }),
+                serde_json::json!({
+                    "windows": [
+                        {"window": "5h", "used_pct": 12.5, "status": "allowed", "resets_at_s": 1800000000_i64},
+                        {"window": "7d", "used_pct": 75.0, "status": "allowed_warning", "resets_at_s": 1800500000_i64}
+                    ],
+                    "representative_window": "seven_day",
+                    "overage": {"status": "disabled", "reason": "plan_limit"}
+                }),
+            ),
+            (
+                "codex windows and credits",
+                Provider::Openai,
+                serde_json::json!({
+                    "x-codex-plan-type": "plus",
+                    "x-codex-active-limit": "secondary",
+                    "x-codex-primary-used-percent": "25.5",
+                    "x-codex-primary-window-minutes": "300",
+                    "x-codex-primary-reset-at": "1800000000",
+                    "x-codex-secondary-used-percent": "80",
+                    "x-codex-secondary-window-minutes": "10080",
+                    "x-codex-secondary-reset-at": "1800500000",
+                    "x-codex-credits-balance": "12.34",
+                    "x-codex-credits-has-credits": "true",
+                    "x-codex-credits-unlimited": "false"
+                }),
+                serde_json::json!({
+                    "plan": "plus",
+                    "active_limit": "secondary",
+                    "windows": [
+                        {"window": "5h", "used_pct": 25.5, "resets_at_s": 1800000000_i64},
+                        {"window": "7d", "used_pct": 80.0, "resets_at_s": 1800500000_i64}
+                    ],
+                    "credits": {"balance": "12.34", "has_credits": "true", "unlimited": "false"}
+                }),
+            ),
+        ];
+
+        for (name, provider, headers, expected) in cases {
+            assert_eq!(parse_limit_headers(provider, &headers), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn usage_body_variants_normalize_cached_creation_and_reasoning_tokens() {
+        let cases = [
+            (
+                "anthropic",
+                serde_json::json!({"usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 20,
+                    "cache_creation_input_tokens": 7,
+                    "output_tokens": 30
+                }}),
+                (Some(100), Some(20), Some(7), Some(30), None),
+            ),
+            (
+                "openai chat",
+                serde_json::json!({"usage": {
+                    "prompt_tokens": 110,
+                    "prompt_tokens_details": {"cached_tokens": 21},
+                    "completion_tokens": 31,
+                    "completion_tokens_details": {"reasoning_tokens": 8}
+                }}),
+                (Some(110), Some(21), None, Some(31), Some(8)),
+            ),
+            (
+                "openai responses envelope",
+                serde_json::json!({"response": {"usage": {
+                    "input_tokens": 120,
+                    "input_tokens_details": {"cached_tokens": 22},
+                    "output_tokens": 32,
+                    "output_tokens_details": {"reasoning_tokens": 9}
+                }}}),
+                (Some(120), Some(22), None, Some(32), Some(9)),
+            ),
+            (
+                "gemini",
+                serde_json::json!({"usageMetadata": {
+                    "promptTokenCount": 130,
+                    "cachedContentTokenCount": 23,
+                    "candidatesTokenCount": 33,
+                    "thoughtsTokenCount": 10
+                }}),
+                (Some(130), Some(23), None, Some(33), Some(10)),
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            let usage = usage_from_json(&body);
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_creation_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_tokens,
+                ),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_usage_merges_partial_provider_events() {
+        let body = concat!(
+            "data: {\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":7}}\n\n",
+            "data: not-json\n\n",
+            "data: {\"response\":{\"usage\":{\"output_tokens\":30,\"output_tokens_details\":{\"reasoning_tokens\":8}}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let usage = parse_sse_usage(body);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cached_input_tokens, Some(20));
+        assert_eq!(usage.cache_creation_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(8));
+    }
+
+    #[test]
     fn routes_aliases() {
         assert_eq!(route_model("k3"), (Some(Provider::Kimi), "k3".to_string()));
         assert_eq!(
