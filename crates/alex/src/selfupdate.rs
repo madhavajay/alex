@@ -542,13 +542,16 @@ pub(crate) async fn daemon_apply_update(
         return Err(DaemonUpdateApplyError::Conflict(body));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let task_update = update.clone();
         let task_exe = exe.clone();
         tokio::spawn(async move {
             let result = async {
+                #[cfg(unix)]
                 install_unix(&task_exe, &task_update).await?;
+                #[cfg(windows)]
+                install_windows(&task_exe, &task_update).await?;
                 restart_daemon(&config, &task_exe, &task_update.latest).await
             }
             .await;
@@ -559,7 +562,7 @@ pub(crate) async fn daemon_apply_update(
         Ok(update_body(&update, true))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let mut body = update_body(&update, false);
         if let Some(obj) = body.as_object_mut() {
@@ -613,29 +616,103 @@ pub async fn run_update(
         }
     }
 
+    if !yes && !confirm(&update)? {
+        println!("cancelled");
+        return Ok(());
+    }
     #[cfg(windows)]
-    {
-        println!(
-            "self-update not yet supported on Windows — download {}",
-            update.asset.url
+    install_windows(&exe, &update).await?;
+    #[cfg(unix)]
+    install_unix(&exe, &update).await?;
+    if no_restart {
+        println!("daemon restart skipped (--no-restart)");
+    } else {
+        restart_daemon(config, &exe, &update.latest).await?;
+    }
+    Ok(())
+}
+
+/// Windows self-update: download the release zip, verify its sha256,
+/// extract alex.exe with tar (ships with Windows 10+ and reads zip), park
+/// the running image out of the way (a mapped exe cannot be deleted but CAN
+/// be renamed), and move the new binary into place.
+#[cfg(windows)]
+async fn install_windows(exe: &Path, update: &UpdateCheck) -> Result<()> {
+    let dir = exe
+        .parent()
+        .context("current executable has no parent directory")?;
+    let pid = std::process::id();
+    let archive_tmp = dir.join(format!(".alex-update.{pid}.zip"));
+    let extract_dir = dir.join(format!(".alex-update.{pid}.extract"));
+    let old_exe = dir.join(format!(".alex-update.{pid}.old.exe"));
+    let _ = std::fs::remove_file(&archive_tmp);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+
+    println!(
+        "downloading alex {} from {}",
+        update.latest, update.asset.url
+    );
+    let digest = download_to(&update.asset.url, &archive_tmp)
+        .await
+        .with_context(|| format!("writing update into {}", dir.display()))?;
+    if !digest.eq_ignore_ascii_case(&update.asset.sha256) {
+        let _ = std::fs::remove_file(&archive_tmp);
+        anyhow::bail!(
+            "download checksum mismatch: expected {}, got {}",
+            update.asset.sha256,
+            digest
         );
-        std::process::exit(1);
+    }
+    println!("verified sha256 {digest}");
+
+    std::fs::create_dir_all(&extract_dir)?;
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive_tmp)
+        .arg("-C")
+        .arg(&extract_dir)
+        .status()
+        .context("running tar to extract the update zip")?;
+    anyhow::ensure!(status.success(), "tar failed to extract the update zip");
+    let new_exe = walkdir_find_alex(&extract_dir)
+        .context("update archive did not contain alex.exe")?;
+
+    println!("replacing {}", exe.display());
+    let _ = std::fs::remove_file(&old_exe);
+    std::fs::rename(exe, &old_exe)
+        .with_context(|| format!("parking running binary {}", exe.display()))?;
+    if let Err(error) = std::fs::rename(&new_exe, exe) {
+        // Roll the old binary back so the install directory stays usable.
+        let _ = std::fs::rename(&old_exe, exe);
+        return Err(error).with_context(|| format!("replacing {}", exe.display()));
     }
 
-    #[cfg(unix)]
-    {
-        if !yes && !confirm(&update)? {
-            println!("cancelled");
-            return Ok(());
+    let _ = std::fs::remove_file(&archive_tmp);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    // The parked old exe unlinks once the last process using it exits; try
+    // now in case nothing holds it (e.g. update run from another console).
+    let _ = std::fs::remove_file(&old_exe);
+    println!("alex updated to {}", update.latest);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn walkdir_find_alex(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = walkdir_find_alex(&path) {
+                return Some(found);
+            }
+        } else if path
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("alex.exe"))
+        {
+            return Some(path);
         }
-        install_unix(&exe, &update).await?;
-        if no_restart {
-            println!("daemon restart skipped (--no-restart)");
-        } else {
-            restart_daemon(config, &exe, &update.latest).await?;
-        }
-        Ok(())
     }
+    None
 }
 
 fn print_check(update: &UpdateCheck, json_output: bool) -> Result<()> {
@@ -683,7 +760,6 @@ fn print_check(update: &UpdateCheck, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn confirm(update: &UpdateCheck) -> Result<bool> {
     print!("Update alex {} → {}? [y/N] ", update.current, update.latest);
     io::stdout().flush()?;
@@ -752,7 +828,6 @@ async fn install_unix(exe: &Path, update: &UpdateCheck) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 async fn download_to(url: &str, dest: &Path) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -856,6 +931,32 @@ async fn restart_daemon(config: &Config, exe: &Path, target_version: &str) -> Re
             // check and hard-restart fallback. The helper runs from the new
             // binary and verifies the served version there (B3).
             crate::spawn_launchd_restart_helper(exe)
+        }
+        #[cfg(windows)]
+        ServiceState::WindowsTask { running: true, .. } => {
+            println!("daemon is Task Scheduler-managed; restarting with schtasks");
+            let end = Command::new("schtasks")
+                .args(["/end", "/tn", "AlexDaemon"])
+                .status()
+                .context("running schtasks /end AlexDaemon")?;
+            if !end.success() {
+                anyhow::bail!("schtasks /end AlexDaemon failed");
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let start = Command::new("schtasks")
+                .args(["/run", "/tn", "AlexDaemon"])
+                .status()
+                .context("running schtasks /run AlexDaemon")?;
+            if !start.success() {
+                anyhow::bail!("schtasks /run AlexDaemon failed");
+            }
+            if wait_for_daemon_health(&client, &health_url, Duration::from_secs(30)).await {
+                verify_served_version(&client, &health_url, target_version).await?;
+                println!("daemon restarted; verified it is now serving {target_version}");
+            } else {
+                anyhow::bail!("Task Scheduler restarted alex but it did not become healthy in time");
+            }
+            Ok(())
         }
         ServiceState::Systemd { active: true, .. } => {
             println!("daemon is systemd-managed; restarting with systemctl");
