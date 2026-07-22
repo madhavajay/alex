@@ -239,7 +239,13 @@ mod tests {
         if let Some(path) = original {
             std::env::set_var("PATH", path);
         }
-        assert_eq!(found, Some(bin));
+        // NTFS is case-insensitive: the PATHEXT-derived candidate may differ
+        // from the on-disk spelling only by extension case.
+        let found = found.expect("probe-bin should be discovered on PATH");
+        assert_eq!(
+            found.to_string_lossy().to_lowercase(),
+            bin.to_string_lossy().to_lowercase()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -52,8 +52,8 @@ jobs:
       - name: Run Windows-relevant tests
         run: |
           cargo test --locked -p alex-core --target ${{ matrix.target }}
-          cargo test --locked -p alex --target ${{ matrix.target }} platform_path_and_service_lifecycle_contracts -- --nocapture
-          cargo test --locked -p alex --target ${{ matrix.target }} browser_launch_commands_are_platform_specific -- --nocapture
+          cargo test --locked -p alex-auth --target ${{ matrix.target }}
+          cargo test --locked -p alex --target ${{ matrix.target }}
         shell: pwsh
 
       - name: Parse Windows packaging scripts and verify smoke contracts
