@@ -148,6 +148,8 @@ pub fn platform_key() -> Result<&'static str> {
         Ok("aarch64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Ok("x86_64-pc-windows-msvc")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Ok("aarch64-pc-windows-msvc")
     } else {
         anyhow::bail!(
             "self-update is not available for this platform (os={}, arch={})",
@@ -1284,6 +1286,7 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu",
             "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
         ]
         .contains(&key));
     }

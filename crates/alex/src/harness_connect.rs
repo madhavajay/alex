@@ -27,9 +27,17 @@ const CODEX_STATE_FILE: &str = "alex-harness-state.json";
 const CODEX_BACKUP_FILE: &str = "alex-original-config.toml";
 const CODEX_OPENAI_PROFILE_FILE: &str = "openai.config.toml";
 pub(crate) const CODEX_ALEX_PROFILE_FILE: &str = "alex.config.toml";
+// Hook scripts are PowerShell on Windows (PowerShell refuses `-File` args
+// without a .ps1 extension) and POSIX shell elsewhere.
+#[cfg(windows)]
+const CODEX_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const CODEX_HOOK_FILE: &str = "alex-session-hook.sh";
 const CODEX_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
 const CODEX_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+#[cfg(windows)]
+const CODEX_TOOL_HOOK_FILE: &str = "alex-tool-hook.ps1";
+#[cfg(not(windows))]
 const CODEX_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
 const CODEX_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
 const CODEX_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
@@ -39,9 +47,15 @@ const CLAUDE_CATALOG_FILE: &str = "alex-models.json";
 const CLAUDE_KEY_FILE: &str = "alex-api-key";
 const CLAUDE_STATE_FILE: &str = "alex-harness-state.json";
 const CLAUDE_BACKUP_FILE: &str = "alex-original-settings.json";
+#[cfg(windows)]
+const CLAUDE_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const CLAUDE_HOOK_FILE: &str = "alex-session-hook.sh";
 const CLAUDE_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
 const CLAUDE_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+#[cfg(windows)]
+const CLAUDE_TOOL_HOOK_FILE: &str = "alex-tool-hook.ps1";
+#[cfg(not(windows))]
 const CLAUDE_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
 const CLAUDE_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
 const CLAUDE_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
@@ -49,6 +63,9 @@ const GROK_CONFIG_FILE: &str = "config.toml";
 const GROK_KEY_FILE: &str = "alex-api-key";
 const GROK_STATE_FILE: &str = "alex-harness-state.json";
 const GROK_BACKUP_FILE: &str = "alex-original-config.toml";
+#[cfg(windows)]
+const GROK_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const GROK_HOOK_FILE: &str = "alex-session-hook.sh";
 const GROK_HOOK_CONFIG_FILE: &str = "alex-hook-curl.conf";
 const GROK_HOOK_REGISTRATION_FILE: &str = "alex.json";
@@ -4811,12 +4828,16 @@ pub(crate) async fn ensure_installed(spec: &HarnessSpec, version: Option<&str>) 
             spec.name
         )
     })?;
-    if find_on_path(command.program).is_none() {
+    let Some(installer) = find_on_path(command.program) else {
         bail!("{} is missing and requires npm to install it; install Node.js/npm, then rerun `alex up {}`", spec.name, spec.name);
-    }
+    };
     println!("install: {} {}", command.program, command.args.join(" "));
     let status = tokio::task::spawn_blocking(move || {
-        Command::new(command.program).args(&command.args).status()
+        // command_for wraps .cmd/.bat shims (npm on Windows) in `cmd /C`;
+        // CreateProcess cannot run them directly.
+        alex_core::exec::command_for(&installer)
+            .args(&command.args)
+            .status()
     })
     .await
     .context("wait for harness installer")??;
@@ -5016,23 +5037,14 @@ pub(crate) fn resolve_harness_binary(config: &Config, spec: &HarnessSpec) -> Opt
 /// pointing at a key the preceding disconnect had already revoked.
 fn harness_home_binary(spec: &HarnessSpec) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let candidate = (spec.config_dir)(&home).join("bin").join(spec.binary);
-    is_executable_file(&candidate).then_some(candidate)
+    let bin_dir = (spec.config_dir)(&home).join("bin");
+    executable_candidates(&bin_dir, spec.binary)
+        .into_iter()
+        .find(|candidate| is_executable_file(candidate))
 }
 
 pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if !probe_safe_dir(&dir) {
-            continue;
-        }
-        for candidate in executable_candidates(&dir, bin) {
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    alex_core::exec::find_on_path_filtered(bin, probe_safe_dir)
 }
 
 /// Never probe network volumes or TCC-protected user folders for harness
@@ -5053,39 +5065,7 @@ pub(crate) fn probe_safe_dir(dir: &Path) -> bool {
     true
 }
 
-fn executable_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        let pathext =
-            std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT"));
-        let mut out = vec![dir.join(bin)];
-        for ext in pathext.to_string_lossy().split(';') {
-            out.push(dir.join(format!("{bin}{ext}")));
-        }
-        out
-    }
-    #[cfg(not(windows))]
-    {
-        vec![dir.join(bin)]
-    }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
+pub(crate) use alex_core::exec::{executable_candidates, is_executable_file};
 
 async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> VersionOutput {
     let cache_key = binary_detection_cache_key(binary);

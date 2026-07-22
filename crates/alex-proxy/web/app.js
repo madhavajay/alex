@@ -330,4 +330,12 @@ $('#trace-filters').onreset=()=>{state.traceFilters={};state.cursor=null;setTime
 $('#openrouter-form').onsubmit=saveOpenRouter;
 $('#exo-form').onsubmit=saveExo;
 $('#cliproxyapi-form').onsubmit=saveCLIProxyAPI;
+const openHashView=()=>{
+  const view=location.hash.replace('#','');
+  if(!view)return;
+  const tab=document.querySelector(`nav button[data-view="${CSS.escape(view)}"]`);
+  if(tab)tab.click();
+};
+window.addEventListener('hashchange',openHashView);
+openHashView();
 bootstrap();

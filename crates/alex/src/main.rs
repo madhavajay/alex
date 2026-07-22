@@ -28,6 +28,8 @@ mod status;
 mod telegram;
 mod tui;
 mod ui;
+#[cfg(windows)]
+mod windows_tray;
 
 #[derive(Parser)]
 #[command(
@@ -1442,10 +1444,16 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         candidates.push(PathBuf::from(path));
     }
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("claude")));
+        candidates.extend(
+            std::env::split_paths(&path)
+                .flat_map(|dir| alex_core::exec::executable_candidates(&dir, "claude")),
+        );
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/bin/claude"));
+        candidates.extend(alex_core::exec::executable_candidates(
+            &home.join(".local/bin"),
+            "claude",
+        ));
         // Claude Code is commonly installed adjacent to a version-manager
         // Node installation, not just in ~/.local/bin.
         for root in [
@@ -1457,7 +1465,19 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         ] {
             candidates.extend(dario::newest_versioned_bins_for_cli(&root, "claude"));
         }
-        candidates.push(home.join(".volta/bin/claude"));
+        candidates.extend(alex_core::exec::executable_candidates(
+            &home.join(".volta/bin"),
+            "claude",
+        ));
+        #[cfg(windows)]
+        {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                candidates.extend(alex_core::exec::executable_candidates(
+                    &PathBuf::from(appdata).join("npm"),
+                    "claude",
+                ));
+            }
+        }
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/claude"),
@@ -4012,6 +4032,8 @@ async fn main() -> Result<()> {
                     .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown());
+            #[cfg(windows)]
+            windows_tray::spawn(format!("http://127.0.0.1:{port}/ui/"));
             let serve_result = if let Some(local_listener) = local_listener {
                 let local = axum::serve(
                     local_listener,
@@ -6611,15 +6633,22 @@ async fn start_agent_trace_import(
 
 fn cursor_agent_transcript_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    let key = cwd
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .replace('/', "-");
+    let key = cursor_project_key(&cwd);
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not found"))?;
     Ok(home
         .join(".cursor/projects")
         .join(key)
         .join("agent-transcripts"))
+}
+
+/// Cursor's per-project directory key: the absolute cwd with separators
+/// flattened to dashes. Handles Windows drive letters and backslashes so
+/// `C:\Users\x\proj` becomes `C--Users-x-proj` instead of an invalid name.
+fn cursor_project_key(cwd: &std::path::Path) -> String {
+    cwd.to_string_lossy()
+        .trim_start_matches('/')
+        .replace(':', "-")
+        .replace(['/', '\\'], "-")
 }
 
 fn import_agent_transcripts(
@@ -7045,7 +7074,7 @@ fn write_gzip_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> 
         encoder.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
         let file = encoder.finish()?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path).with_context(|| {
+        alex_core::exec::atomic_replace(&tmp, path).with_context(|| {
             format!(
                 "replace compressed trace body {} with {}",
                 path.display(),
@@ -11185,6 +11214,22 @@ mod tests {
     use reqwest::{Method, StatusCode};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cursor_project_key_flattens_unix_paths() {
+        assert_eq!(
+            cursor_project_key(std::path::Path::new("/Users/x/dev/proj")),
+            "Users-x-dev-proj"
+        );
+    }
+
+    #[test]
+    fn cursor_project_key_flattens_windows_paths() {
+        assert_eq!(
+            cursor_project_key(std::path::Path::new(r"C:\Users\x\dev\proj")),
+            "C--Users-x-dev-proj"
+        );
+    }
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

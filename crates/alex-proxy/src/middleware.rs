@@ -674,7 +674,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = fs::File::create(&tmp).map_err(|error| error.to_string())?;
     file.write_all(bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&tmp, path).map_err(|error| error.to_string())?;
+    alex_core::exec::atomic_replace(&tmp, path).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         if let Ok(directory) = fs::File::open(parent) {
             let _ = directory.sync_all();

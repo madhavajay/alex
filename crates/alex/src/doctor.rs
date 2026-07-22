@@ -96,16 +96,9 @@ fn check(
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    let executable = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join(&executable))
-        .find(|candidate| candidate.is_file())
+    // PATHEXT-aware: npm-installed harness CLIs are `.cmd` shims on Windows,
+    // which a bare or `.exe`-only probe would miss.
+    alex_core::exec::find_on_path_filtered(name, |_| true)
 }
 
 fn executable_checks() -> Vec<DoctorCheck> {
@@ -612,8 +605,11 @@ pub(crate) async fn diagnose(config: &Config) -> DoctorReport {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "not found".into())
         )),
-        (needs_dario && (node.is_none() || claude.is_none()))
-            .then_some("install Node.js 18+ and Claude Code, then run `alex dario fix`"),
+        (needs_dario && (node.is_none() || claude.is_none())).then_some(if cfg!(windows) {
+            "install Node.js 18+ (most coding harnesses already ship it; otherwise `winget install OpenJS.NodeJS.LTS`) and Claude Code, then run `alex dario fix`"
+        } else {
+            "install Node.js 18+ and Claude Code, then run `alex dario fix`"
+        }),
     ));
 
     DoctorReport::from_checks(checks)

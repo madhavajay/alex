@@ -244,14 +244,10 @@ fn find_binary(harness: &WrapHarness) -> Result<PathBuf> {
 }
 
 fn which(name: &str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").context("PATH not set")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    bail!("`{name}` not found on PATH")
+    // PATHEXT-aware so npm-installed harness shims (claude.cmd, codex.cmd)
+    // resolve on Windows.
+    alex_core::exec::find_on_path_filtered(name, |_| true)
+        .ok_or_else(|| anyhow::anyhow!("`{name}` not found on PATH"))
 }
 
 #[cfg(test)]
