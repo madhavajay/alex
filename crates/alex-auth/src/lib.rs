@@ -41,6 +41,14 @@ const ANTHROPIC_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile
 const XAI_USERINFO_URL: &str = "https://auth.x.ai/oauth2/userinfo";
 const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
 
+pub fn resolve_external_url(provider_env: &str, default: &str) -> String {
+    alex_core::resolve_endpoint_url(provider_env, default)
+}
+
+pub fn resolve_external_url_override(provider_env: &str, default: &str) -> Option<String> {
+    alex_core::resolve_endpoint_override(provider_env, default)
+}
+
 // The gemini-cli OAuth client is a public "installed app" credential embedded
 // in Google's open-source CLI (not a confidential secret). Assembled from
 // fragments so repo secret-scanners don't false-positive on the literal.
@@ -275,8 +283,14 @@ pub(crate) async fn fetch_provider_email(
     access_token: &str,
 ) -> Option<String> {
     let mut request = match provider {
-        Provider::Anthropic => http.get(ANTHROPIC_PROFILE_URL),
-        Provider::Xai => http.get(XAI_USERINFO_URL),
+        Provider::Anthropic => http.get(resolve_external_url(
+            "ALEX_UPSTREAM_ANTHROPIC_URL",
+            ANTHROPIC_PROFILE_URL,
+        )),
+        Provider::Xai => http.get(resolve_external_url(
+            "ALEX_UPSTREAM_XAI_URL",
+            XAI_USERINFO_URL,
+        )),
         _ => return None,
     }
     .bearer_auth(access_token)
@@ -1313,7 +1327,7 @@ impl Vault {
     async fn refresh_anthropic(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(ANTHROPIC_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_ANTHROPIC_URL", ANTHROPIC_TOKEN_URL))
             .json(&json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -1327,7 +1341,7 @@ impl Vault {
     async fn refresh_openai(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(OPENAI_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_CODEX_URL", OPENAI_TOKEN_URL))
             .json(&json!({
                 "client_id": OPENAI_CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -1342,7 +1356,7 @@ impl Vault {
     async fn refresh_xai(&self, refresh_token: &str, client_id: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(XAI_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_XAI_URL", XAI_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1356,7 +1370,7 @@ impl Vault {
     async fn refresh_gemini(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(GOOGLE_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL", GOOGLE_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1369,12 +1383,12 @@ impl Vault {
     }
 
     /// Resolve the OAuth token endpoint, honouring a test/diagnostic override.
-    fn refresh_endpoint(&self, default: &str) -> String {
+    fn refresh_endpoint(&self, provider_env: &str, default: &str) -> String {
         self.refresh_endpoint_override
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| default.to_string())
+            .unwrap_or_else(|| resolve_external_url(provider_env, default))
     }
 
     /// Point every provider's token-refresh POST at `url` (or clear with
@@ -2246,7 +2260,7 @@ pub async fn fetch_amp_account_email(api_key: &str) -> Option<String> {
         .build()
         .ok()?;
     let response = client
-        .post(AMP_USAGE_URL)
+        .post(resolve_external_url("ALEX_UPSTREAM_AMP_URL", AMP_USAGE_URL))
         .bearer_auth(key)
         .header("accept", "application/json")
         .header("content-type", "application/json")

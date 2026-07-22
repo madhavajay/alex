@@ -3706,6 +3706,7 @@ async fn main() -> Result<()> {
                 config.upstream_stream_idle_timeout(),
                 config.substitution.clone(),
             );
+            alex_proxy::apply_upstream_env_overrides(&state);
             alex_proxy::set_notifications(&state, config.notification_settings());
             glue.set_notification_state(state.clone());
             alex_proxy::set_protection_policy(&state, config.protection.clone());

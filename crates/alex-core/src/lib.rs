@@ -3,6 +3,7 @@ pub mod grok_billing;
 pub mod openrouter_catalog;
 pub mod quota;
 pub mod resume_context;
+pub mod testing_overrides;
 pub mod translate;
 
 pub use amp_usage::{
@@ -10,14 +11,18 @@ pub use amp_usage::{
     AmpWorkspaceBalance,
 };
 pub use grok_billing::{
-    parse_grpc_web_response, validate_grpc_status_headers, window_label, GrokWebBillingError,
-    GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+    grok_credits_endpoint, parse_grpc_web_response, validate_grpc_status_headers, window_label,
+    GrokWebBillingError, GrokWebBillingSnapshot, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
 };
 pub use openrouter_catalog::parse_models_response as parse_openrouter_models_response;
 pub use quota::quota_state;
 pub use resume_context::{
     build_resume_context, build_resume_context_from_captures, request_entries, ResumeCapture,
     ResumeContext, ResumeEntry,
+};
+pub use testing_overrides::{
+    allowed_override_url, resolve_endpoint_override, resolve_endpoint_url, ALLOW_REMOTE_ENV,
+    FAKE_UPSTREAM_ENV,
 };
 
 use serde::{Deserialize, Serialize};

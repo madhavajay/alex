@@ -12,9 +12,9 @@ use crate::login::{
     codex_device_exchange_named, codex_device_poll_once, codex_device_start, codex_exchange_named,
     gemini_exchange_auto, generate_pkce, kimi_device_poll_once_at, kimi_device_start_at,
     kimi_oauth_host, kimi_upsert_from_tokens, kimi_upsert_from_tokens_auto, kimi_verification_url,
-    openai_authorize_url, poll_device_flow, validate_account_name, wait_for_openai_callback,
-    xai_device_poll_once, xai_device_start, xai_upsert_from_tokens, xai_upsert_from_tokens_auto,
-    DeviceFlowError, OPENAI_CALLBACK_ADDR, OPENAI_DEVICE_VERIFICATION_URL, OPENAI_REDIRECT_URI,
+    openai_authorize_url, openai_device_verification_url, poll_device_flow, validate_account_name,
+    wait_for_openai_callback, xai_device_poll_once, xai_device_start, xai_upsert_from_tokens,
+    xai_upsert_from_tokens_auto, DeviceFlowError, OPENAI_CALLBACK_ADDR, OPENAI_REDIRECT_URI,
 };
 use crate::{now_ms, Vault};
 
@@ -466,15 +466,16 @@ impl LoginManager {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         let start = codex_device_start(&http).await?;
+        let verification_url = openai_device_verification_url();
         let session = LoginSession {
             id: id.to_string(),
             provider: "codex".into(),
             mode: "device",
-            authorize_url: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            authorize_url: Some(verification_url.clone()),
             user_code: Some(start.user_code.clone()),
-            verification_uri: Some(OPENAI_DEVICE_VERIFICATION_URL.into()),
+            verification_uri: Some(verification_url.clone()),
             verification_uri_complete: Some(format!(
-                "{OPENAI_DEVICE_VERIFICATION_URL}?user_code={}",
+                "{verification_url}?user_code={}",
                 start.user_code
             )),
             created_ms: now_ms(),

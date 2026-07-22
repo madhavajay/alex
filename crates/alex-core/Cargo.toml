@@ -10,3 +10,4 @@ description = "Core routing, format translation, usage parsing, and pricing logi
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }

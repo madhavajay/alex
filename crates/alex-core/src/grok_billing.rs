@@ -9,6 +9,10 @@ use std::borrow::Cow;
 pub const GROK_CREDITS_ENDPOINT: &str =
     "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 
+pub fn grok_credits_endpoint() -> String {
+    crate::resolve_endpoint_url("ALEX_UPSTREAM_XAI_URL", GROK_CREDITS_ENDPOINT)
+}
+
 /// Empty gRPC-web frame body (flags=0, length=0) sent for the no-arg RPC.
 pub const GROK_CREDITS_REQUEST_BODY: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00];
 

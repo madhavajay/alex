@@ -12,9 +12,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::{
     fetch_provider_email, import_amp, import_grok, import_kimi, jwt_exp_ms, named_account_id,
-    normalize_email, now_ms, persist_account_email, save_amp_api_key, Account, Vault,
-    ANTHROPIC_CLIENT_ID, ANTHROPIC_TOKEN_URL, KIMI_CLIENT_ID, KIMI_OAUTH_HOST, OPENAI_CLIENT_ID,
-    OPENAI_TOKEN_URL, XAI_CLIENT_ID, XAI_TOKEN_URL,
+    normalize_email, now_ms, persist_account_email, resolve_external_url,
+    resolve_external_url_override, save_amp_api_key, Account, Vault, ANTHROPIC_CLIENT_ID,
+    ANTHROPIC_TOKEN_URL, KIMI_CLIENT_ID, KIMI_OAUTH_HOST, OPENAI_CLIENT_ID, OPENAI_TOKEN_URL,
+    XAI_CLIENT_ID, XAI_TOKEN_URL,
 };
 use alex_core::Provider;
 
@@ -46,6 +47,9 @@ const KIMI_DEVICE_PLATFORM: &str = "kimi_code_cli";
 
 /// Kimi's OAuth host, honoring the same env overrides as the kimi CLI.
 pub fn kimi_oauth_host() -> String {
+    if let Some(value) = resolve_external_url_override("ALEX_UPSTREAM_KIMI_URL", KIMI_OAUTH_HOST) {
+        return value;
+    }
     for var in ["KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"] {
         if let Ok(value) = std::env::var(var) {
             let value = value.trim().trim_end_matches('/');
@@ -74,6 +78,10 @@ pub fn kimi_token_url_at(oauth_host: &str) -> String {
 
 pub fn kimi_token_url() -> String {
     kimi_token_url_at(&kimi_oauth_host())
+}
+
+pub fn openai_device_verification_url() -> String {
+    resolve_external_url("ALEX_UPSTREAM_CODEX_URL", OPENAI_DEVICE_VERIFICATION_URL)
 }
 pub const GEMINI_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GEMINI_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile openid";
@@ -542,7 +550,10 @@ async fn claude_exchange_with_identity(
     }
     let state = state.unwrap_or_else(|| verifier.to_string());
     let resp = reqwest::Client::new()
-        .post(ANTHROPIC_TOKEN_URL)
+        .post(resolve_external_url(
+            "ALEX_UPSTREAM_ANTHROPIC_URL",
+            ANTHROPIC_TOKEN_URL,
+        ))
         .json(&json!({
             "grant_type": "authorization_code",
             "client_id": ANTHROPIC_CLIENT_ID,
@@ -649,7 +660,10 @@ async fn exchange_codex_tokens(
     redirect_uri: &str,
 ) -> Result<TokenResponse> {
     let resp = reqwest::Client::new()
-        .post(OPENAI_TOKEN_URL)
+        .post(resolve_external_url(
+            "ALEX_UPSTREAM_CODEX_URL",
+            OPENAI_TOKEN_URL,
+        ))
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", OPENAI_CLIENT_ID),
@@ -740,7 +754,10 @@ pub async fn codex_device_start(client: &reqwest::Client) -> Result<CodexDeviceS
     let mut last_error = None;
     for attempt in 0..2 {
         let response = match client
-            .post(OPENAI_DEVICE_USER_CODE_URL)
+            .post(resolve_external_url(
+                "ALEX_UPSTREAM_CODEX_URL",
+                OPENAI_DEVICE_USER_CODE_URL,
+            ))
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&json!({"client_id": OPENAI_CLIENT_ID}))
             .send()
@@ -829,7 +846,10 @@ pub async fn codex_device_poll_once(
     start: &CodexDeviceStart,
 ) -> CodexDevicePoll {
     let response = match client
-        .post(OPENAI_DEVICE_TOKEN_URL)
+        .post(resolve_external_url(
+            "ALEX_UPSTREAM_CODEX_URL",
+            OPENAI_DEVICE_TOKEN_URL,
+        ))
         .json(&json!({
             "device_auth_id": start.device_auth_id,
             "user_code": start.user_code,
@@ -1022,7 +1042,10 @@ async fn fetch_codex_usage(access_token: &str, account_id: Option<&str>) -> Resu
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     let mut request = client
-        .get(OPENAI_USAGE_URL)
+        .get(resolve_external_url(
+            "ALEX_UPSTREAM_CODEX_URL",
+            OPENAI_USAGE_URL,
+        ))
         .bearer_auth(access_token)
         .header("accept", "application/json")
         .header("user-agent", concat!("Alex/", env!("CARGO_PKG_VERSION")));
@@ -1224,7 +1247,10 @@ async fn gemini_exchange_with_identity(
     account_name: Option<&str>,
 ) -> Result<String> {
     let resp = reqwest::Client::new()
-        .post(crate::GOOGLE_TOKEN_URL)
+        .post(resolve_external_url(
+            "ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL",
+            crate::GOOGLE_TOKEN_URL,
+        ))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -1392,7 +1418,10 @@ pub struct XaiTokens {
 
 pub async fn xai_device_start(http: &reqwest::Client) -> Result<XaiDeviceStart> {
     let resp = http
-        .post(XAI_DEVICE_CODE_URL)
+        .post(resolve_external_url(
+            "ALEX_UPSTREAM_XAI_URL",
+            XAI_DEVICE_CODE_URL,
+        ))
         .form(&[("client_id", XAI_CLIENT_ID), ("scope", XAI_SCOPES)])
         .send()
         .await?;
@@ -1416,7 +1445,7 @@ pub fn parse_xai_device_poll(status: u16, body: &str) -> XaiDevicePoll {
 
 pub async fn xai_device_poll_once(http: &reqwest::Client, device_code: &str) -> XaiDevicePoll {
     let resp = http
-        .post(XAI_TOKEN_URL)
+        .post(resolve_external_url("ALEX_UPSTREAM_XAI_URL", XAI_TOKEN_URL))
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ("device_code", device_code),
