@@ -456,6 +456,10 @@ final class TraceBrowserModel {
         }
     }
 
+    /// Set by the window controller: opens Settings → Credentials so a
+    /// rejected key can be inspected next to its mint/revoke history.
+    var openCredentialsSettings: (@MainActor () -> Void)?
+
     func setHarnessFilter(_ harness: String) {
         queryText = OmniQuery.settingToken(in: queryText, key: "harness", value: harness)
     }
@@ -1218,7 +1222,7 @@ final class TraceBrowserModel {
                 try await client.approveAlexErrorCredential(fingerprint: fingerprint)
                 self.sessionsFingerprint = ""
                 await self.pollSessions()
-                self.showSimulationNotice("Client approved — retry its request")
+                self.showSimulationNotice("Key re-approved — the session can continue on its next request")
             } catch is CancellationError {
                 return
             } catch {
@@ -2088,11 +2092,15 @@ private struct SessionListView: View {
         let hasSessionId = !session.sessionId.isEmpty
         if session.isAlexError {
             if session.approvableCredentialFingerprint != nil {
-                Button("Approve") { model.approveRejectedClient(session) }
-                    .help("Re-enable this exact previously known client credential")
+                Button("Re-approve key") { model.approveRejectedClient(session) }
+                    .help("Re-enable this exact previously known key so the rejected session can continue")
             } else {
                 Text("Approval unavailable for unknown credentials")
             }
+            Button("Inspect in Settings → Credentials") {
+                model.openCredentialsSettings?()
+            }
+            .help("Open the Credentials pane to see this key's mint, revoke, and approval history")
             Divider()
         }
         Menu("Simulate") {
@@ -2650,6 +2658,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var model: TraceBrowserModel?
     private let store: SnapshotStore
+    /// Opens Settings → Credentials; injected by the status item controller.
+    var onOpenCredentialsSettings: (@MainActor () -> Void)?
 
     init(store: SnapshotStore) {
         self.store = store
@@ -2667,6 +2677,9 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         if window == nil {
             let model = TraceBrowserModel(
                 store: store, initialHarness: harness, initialQuery: query)
+            model.openCredentialsSettings = { [weak self] in
+                self?.onOpenCredentialsSettings?()
+            }
             self.model = model
             let host = NSHostingController(rootView: TraceBrowserView(model: model))
             let win = NSWindow(contentViewController: host)
