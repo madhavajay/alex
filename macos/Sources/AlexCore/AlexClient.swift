@@ -938,7 +938,31 @@ public struct AlexClient: Sendable {
     }
 
     public func traceTurn(id: String) async throws -> TranscriptTurn {
-        try await get("traces/\(id)/turn", as: TraceTurnResponse.self).turn
+        try await traceTurnPayload(id: id).turn
+    }
+
+    public func traceTurnPayload(id: String) async throws -> (turn: TranscriptTurn, byteCount: Int) {
+        let data = try await request("traces/\(id)/turn")
+        do {
+            let response = try await Task.detached {
+                let start = ContinuousClock.now
+                defer {
+                    let elapsed = start.duration(to: .now)
+                    BarLog.timing(
+                        .net, label: "decode /traces/\(id)/turn bytes=\(data.count)",
+                        milliseconds: Double(elapsed.components.seconds) * 1_000
+                            + Double(elapsed.components.attoseconds) / 1e15)
+                }
+                return try JSONDecoder().decode(TraceTurnResponse.self, from: data)
+            }.value
+            return (response.turn, data.count)
+        } catch {
+            let snippet = String(data: data, encoding: .utf8)
+                .map { String($0.prefix(200)) } ?? "<non-utf8>"
+            BarLog.error(
+                .net, "decode TraceTurnResponse failed for /traces/\(id)/turn: \(error) body=\(snippet)")
+            throw error
+        }
     }
 
     public func searchTraces(text: String, since: String = "24h", filters: OmniQuery = OmniQuery()) async throws -> TraceSearchResponse {

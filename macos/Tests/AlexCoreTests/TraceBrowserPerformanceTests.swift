@@ -206,6 +206,30 @@ import Testing
         #expect(cache.approximateByteCost == 0)
     }
 
+    @Test func hangBreadcrumbSnapshotAndLogRotationPolicy() {
+        TraceBrowserSignpost.resetForTesting()
+        for index in 0..<(TraceBrowserSignpost.breadcrumbLimit + 4) {
+            let interval = TraceBrowserSignpost.begin(.turnFetch, "trace_id=trace-\(index)")
+            TraceBrowserSignpost.end(interval, "bytes=\(index)")
+        }
+        let active = TraceBrowserSignpost.begin(
+            .transcriptApply, "turns=7 total_chars=70000")
+        let snapshot = TraceBrowserSignpost.snapshot()
+        #expect(snapshot.breadcrumbs.count == TraceBrowserSignpost.breadcrumbLimit)
+        #expect(snapshot.active.map(\.operation) == ["transcript apply"])
+        let line = UIHangLog.formatLine(
+            timestamp: Date(timeIntervalSince1970: 0), durationMilliseconds: 825,
+            snapshot: snapshot)
+        #expect(line.contains("duration_ms=825.0"))
+        #expect(line.contains("operation=transcript apply"))
+        #expect(line.contains("turns=7 total_chars=70000"))
+        #expect(!UIHangLog.shouldRotate(fileBytes: UIHangLog.maxFileBytes))
+        #expect(UIHangLog.shouldRotate(
+            fileBytes: UIHangLog.maxFileBytes, incomingBytes: 1))
+        #expect(UIHangLog.shouldRotate(fileBytes: 8, incomingBytes: 3, limit: 10))
+        TraceBrowserSignpost.end(active)
+    }
+
     @MainActor
     private func renderMessages(
         _ turns: [TranscriptTurn], cache: RenderedArtifactCache

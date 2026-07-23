@@ -287,6 +287,18 @@ struct TranscriptTextPane: NSViewRepresentable {
             syncFindBarVisible(findBarVisible)
             if let render = model.renderOp, render.version != lastVersion {
                 lastVersion = render.version
+                let operation: String
+                let chars: Int
+                switch render.op {
+                case let .set(doc):
+                    operation = "set"
+                    chars = doc.length
+                case let .append(doc):
+                    operation = "append"
+                    chars = doc.length
+                }
+                let interval = TraceBrowserSignpost.begin(
+                    .classicPaneUpdate, "operation=\(operation) chars=\(chars)")
                 BarLog.measure(.browser, label: "transcript apply v\(render.version)") {
                     switch render.op {
                     case let .set(doc): storage.setAttributedString(doc)
@@ -295,6 +307,7 @@ struct TranscriptTextPane: NSViewRepresentable {
                 }
                 textView.invalidateBubbleRects()
                 textView.rebuildBubbleRects()
+                TraceBrowserSignpost.end(interval, "storage_chars=\(storage.length)")
                 if model.userAtBottom, !findBarVisible { scrollToBottom() }
             }
             if lastSelectedTurn != model.inspectorTraceId {

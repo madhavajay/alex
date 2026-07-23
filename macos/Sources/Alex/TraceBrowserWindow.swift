@@ -152,8 +152,12 @@ final class TraceBrowserModel {
                 return (filtered.entries, filtered.totalCount)
             }.value
             guard !Task.isCancelled, let self else { return }
+            let interval = TraceBrowserSignpost.begin(
+                .chatPaneUpdate,
+                "entries=\(result.0.count) turns=\(turnsSnapshot.count)")
             self.transcriptEntries = self.mapFilterEntries(result.0, turns: turnsSnapshot)
             self.transcriptTotalCount = result.1
+            DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
         }
     }
 
@@ -866,12 +870,16 @@ final class TraceBrowserModel {
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
+                let interval = TraceBrowserSignpost.begin(
+                    .transcriptRenderBuild,
+                    "turns=\(slice.count) first=\(firstNumber) raw=\(rawMode)")
                 let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
                     icons: icons, rawMode: rawMode)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
+                TraceBrowserSignpost.end(interval, "chars=\(doc.text.length)")
                 return BuiltDocument(doc: doc, ms: ms)
             }.value
             let (doc, ms) = (built.doc, built.ms)
@@ -1098,23 +1106,34 @@ final class TraceBrowserModel {
         turnFetchTasks[traceId]?.cancel()
         turnFetchTasks[traceId] = Task { [weak self] in
             guard let self else { return }
+            let interval = TraceBrowserSignpost.begin(.turnFetch, "trace_id=\(traceId)")
+            var fetchEnded = false
             do {
                 let turn: TranscriptTurn
+                let byteCount: Int
                 if let traceTurnFetcher {
                     turn = try await traceTurnFetcher(traceId)
+                    byteCount = (try? JSONEncoder().encode(turn).count) ?? 0
                 } else if let client = client() {
-                    turn = try await client.traceTurn(id: traceId)
+                    let payload = try await client.traceTurnPayload(id: traceId)
+                    turn = payload.turn
+                    byteCount = payload.byteCount
                 } else {
+                    TraceBrowserSignpost.end(interval, "bytes=0 unavailable=true")
                     return
                 }
+                TraceBrowserSignpost.end(interval, "bytes=\(byteCount)")
+                fetchEnded = true
                 try Task.checkCancellation()
                 guard selectedSessionId == sessionId, turn.traceId == traceId else { return }
                 expandedTurns[traceId] = turn
                 turnFetchTasks[traceId] = nil
                 scheduleExpandedRebuild()
             } catch is CancellationError {
+                if !fetchEnded { TraceBrowserSignpost.end(interval, "cancelled=true") }
                 turnFetchTasks[traceId] = nil
             } catch {
+                if !fetchEnded { TraceBrowserSignpost.end(interval, "error=true") }
                 turnFetchTasks[traceId] = nil
                 guard selectedSessionId == sessionId else { return }
                 transcriptUnreachable = true
@@ -1174,9 +1193,15 @@ final class TraceBrowserModel {
             : allTurns.filter(parsedQuery.matches)
         defer { retargetInspector() }
         guard filtered != turns else { return }
+        let totalChars = filtered.reduce(0) {
+            $0 + ($1.user?.count ?? 0) + ($1.assistant?.count ?? 0) + ($1.error?.count ?? 0)
+        }
+        let interval = TraceBrowserSignpost.begin(
+            .transcriptApply, "turns=\(filtered.count) total_chars=\(totalChars)")
         turns = filtered
         renderState = nil
         scheduleRender()
+        DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
     }
 
     private func runSearch(_ query: OmniQuery) async {
