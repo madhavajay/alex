@@ -2344,31 +2344,43 @@ public enum TranscriptApplyPolicy {
     public static let earlierTurnPageCount = 8
 
     public static func rawCharacterCount(_ turn: TranscriptTurn) -> Int {
-        (turn.user?.count ?? 0) + (turn.assistant?.count ?? 0) + (turn.error?.count ?? 0)
-            + (turn.assistantBlocks ?? []).reduce(0) {
-                $0 + ($1.text?.count ?? 0) + ($1.arguments?.count ?? 0)
-            }
-            + (turn.toolCalls ?? []).reduce(0) { $0 + ($1.arguments?.count ?? 0) }
+        var total = (turn.user?.count ?? 0) + (turn.assistant?.count ?? 0)
+        total += turn.error?.count ?? 0
+        for block in turn.assistantBlocks ?? [] {
+            total += block.text?.count ?? 0
+            total += block.arguments?.count ?? 0
+        }
+        for call in turn.toolCalls ?? [] {
+            total += call.arguments?.count ?? 0
+        }
+        return total
     }
 
     public static func inlineCharacterCount(_ turn: TranscriptTurn) -> Int {
-        let assistantChars: Int
+        var assistantChars = 0
         if turn.assistantBlocks?.isEmpty == false {
-            assistantChars = (turn.assistantBlocks ?? []).reduce(0) {
-                $0 + ($1.text?.count ?? 0) + ($1.arguments?.count ?? 0)
+            for block in turn.assistantBlocks ?? [] {
+                assistantChars += block.text?.count ?? 0
+                assistantChars += block.arguments?.count ?? 0
             }
         } else {
-            assistantChars = (turn.assistant?.count ?? 0)
-                + (turn.toolCalls ?? []).reduce(0) { $0 + ($1.arguments?.count ?? 0) }
+            assistantChars = turn.assistant?.count ?? 0
+            for call in turn.toolCalls ?? [] {
+                assistantChars += call.arguments?.count ?? 0
+            }
         }
-        let eventChars = (turn.attempts ?? []).reduce(0) {
-            $0 + ($1.error?.message?.count ?? 0)
-                + ($1.middlewareDecisions ?? []).reduce(0) {
-                    $0 + ($1.explanation?.count ?? 0)
-                }
+        var eventChars = 0
+        for attempt in turn.attempts ?? [] {
+            eventChars += attempt.error?.message?.count ?? 0
+            for decision in attempt.middlewareDecisions ?? [] {
+                eventChars += decision.explanation?.count ?? 0
+            }
         }
-        return (turn.user?.count ?? 0) + assistantChars + (turn.error?.count ?? 0)
-            + (turn.substitutionReason?.count ?? 0) + eventChars
+        var total = (turn.user?.count ?? 0) + assistantChars
+        total += turn.error?.count ?? 0
+        total += turn.substitutionReason?.count ?? 0
+        total += eventChars
+        return total
     }
 
     public static func messageCount(_ turn: TranscriptTurn) -> Int {
