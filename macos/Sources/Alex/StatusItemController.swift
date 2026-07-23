@@ -956,12 +956,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func openTraceBrowser(
-        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil,
+        above relativeWindow: NSWindow? = nil
     ) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
         }
-        traceBrowser?.show(harness: harness, query: query, selectSessionId: selectSessionId)
+        traceBrowser?.show(
+            harness: harness, query: query, selectSessionId: selectSessionId,
+            above: relativeWindow)
     }
 
     private func openDario() {
@@ -1001,7 +1004,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     self?.openPreferences(section: .providers)
                 },
                 openTraceBrowser: { [weak self] query in
-                    self?.openTraceBrowser(query: query)
+                    guard let self else { return }
+                    self.openTraceBrowser(
+                        query: query, above: self.onboardingWindow?.orderingWindow)
                 })
         }
         onboardingShownThisLaunch = true

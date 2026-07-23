@@ -1779,6 +1779,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let openProviderSettings: @MainActor () -> Void
     private let openTraceBrowser: @MainActor (String?) -> Void
 
+    var orderingWindow: NSWindow? { window }
+
     init(
         store: SnapshotStore,
         openProviderSettings: @escaping @MainActor () -> Void,

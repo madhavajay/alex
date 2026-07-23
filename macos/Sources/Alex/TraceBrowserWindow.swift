@@ -1830,24 +1830,29 @@ struct TraceBrowserView: View {
                                 SplitStore.saveLeftWidth(width)
                             }
                         })
+                    .background(DefaultArrowCursorRegion())
                 TranscriptView(model: model)
                     .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+                    .background(DefaultArrowCursorRegion())
                 if model.detailsVisible {
                     if let route = model.inspectorToolBody {
                         ToolBodyInspectorView(route: route, model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     } else if let traceId = model.inspectorTraceId {
                         TraceInspectorView(traceId: traceId, model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     } else {
                         TraceInspectorPlaceholderView(model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     }
                 }
             }
@@ -1954,6 +1959,34 @@ struct TraceBrowserView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.orange.opacity(0.12))
+    }
+}
+
+/// SwiftUI's macOS `HSplitView` can install a resize cursor rect that extends
+/// beyond its divider after the hosted panes are resized. Giving each pane an
+/// explicit arrow cursor rect lets AppKit's more-specific controls (including
+/// links) keep their own cursors while leaving only the uncovered divider hit
+/// areas with the split view's resize cursor.
+private struct DefaultArrowCursorRegion: NSViewRepresentable {
+    func makeNSView(context: Context) -> CursorRegionView { CursorRegionView() }
+
+    func updateNSView(_ nsView: CursorRegionView, context: Context) {
+        nsView.window?.invalidateCursorRects(for: nsView)
+    }
+
+    final class CursorRegionView: NSView {
+        private static let dividerHotZoneInset: CGFloat = 4
+
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            addCursorRect(
+                bounds.insetBy(dx: Self.dividerHotZoneInset, dy: 0), cursor: .arrow)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            window?.invalidateCursorRects(for: self)
+        }
     }
 }
 
@@ -2172,7 +2205,8 @@ private struct SessionListView: View {
             secondaryColumns
         }
         .contextMenu(forSelectionType: SessionRow.ID.self) { ids in
-            let selected = model.sessions.filter { ids.contains($0.sessionId) }
+            let selected = SessionContextMenuSelection.resolve(
+                ids: ids, fallbackIds: model.multiSelection, sessions: model.sessions)
             if selected.count > 1 {
                 bulkContextMenu(selected)
             } else if let session = selected.first {
@@ -2419,19 +2453,34 @@ private struct SessionListView: View {
             Button("Save as fixture…") { model.promptSaveFixture(from: session) }
         }
         Divider()
-        Button {
-            model.copyForkCommand(session)
-        } label: {
-            Label("Fork session with…", systemImage: "doc.on.doc")
+        // A data-driven group avoids the macOS Table context-menu bridge
+        // truncating a large heterogeneous ViewBuilder tuple. Keep every
+        // standard single-session command in this one flattened group.
+        ForEach(SessionContextMenuAction.standard) { action in
+            contextMenuItem(action, session: session, hasSessionId: hasSessionId)
         }
-        .disabled(!hasSessionId)
-        Button("Copy Session ID") { model.copySessionId(session) }
-        Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
-        Button("Export Session…") { model.exportSession(session) }
-        Button("Reveal Bodies in Finder") { model.revealSessionBodies(session) }
-        Divider()
-        Button("Delete Session's Traces…", role: .destructive) {
-            model.deleteSessionTraces(session)
+    }
+
+    @ViewBuilder
+    private func contextMenuItem(
+        _ action: SessionContextMenuAction, session: TraceSession, hasSessionId: Bool
+    ) -> some View {
+        switch action {
+        case .fork:
+            Button(action.title) { model.copyForkCommand(session) }
+                .disabled(!hasSessionId)
+        case .copySessionId:
+            Button(action.title) { model.copySessionId(session) }
+        case .copyLastReply:
+            Button(action.title) { model.copyLastReply(session) }
+        case .export:
+            Button(action.title) { model.exportSession(session) }
+        case .revealBodies:
+            Button(action.title) { model.revealSessionBodies(session) }
+        case .destructiveDivider:
+            Divider()
+        case .delete:
+            Button(action.title, role: .destructive) { model.deleteSessionTraces(session) }
         }
     }
 
@@ -2446,6 +2495,45 @@ private struct SessionListView: View {
         Button("Delete \(selected.count) Sessions' Traces…", role: .destructive) {
             model.deleteSelectedSessions()
         }
+    }
+}
+
+enum SessionContextMenuAction: String, CaseIterable, Identifiable {
+    case fork
+    case copySessionId
+    case copyLastReply
+    case export
+    case revealBodies
+    case destructiveDivider
+    case delete
+
+    var id: Self { self }
+
+    static let standard = allCases
+
+    var title: String {
+        switch self {
+        case .fork: "Fork session with…"
+        case .copySessionId: "Copy Session ID"
+        case .copyLastReply: "Copy Last Reply as Markdown"
+        case .export: "Export Session…"
+        case .revealBodies: "Reveal Bodies in Finder"
+        case .destructiveDivider: ""
+        case .delete: "Delete Session's Traces…"
+        }
+    }
+}
+
+enum SessionContextMenuSelection {
+    static func resolve(
+        ids: Set<String>, fallbackIds: Set<String>, sessions: [TraceSession]
+    ) -> [TraceSession] {
+        let requested = ids.isEmpty ? fallbackIds : ids
+        guard !requested.isEmpty else { return [] }
+        let byId = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0) })
+        let resolved = requested.sorted().compactMap { byId[$0] }
+        if !resolved.isEmpty || requested == fallbackIds { return resolved }
+        return fallbackIds.sorted().compactMap { byId[$0] }
     }
 }
 
@@ -2941,7 +3029,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
     ///   already holds a `TraceBrowserWindowController`: pass the session id
     ///   here instead of calling `show(harness:)` alone.
     func show(
-        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil,
+        above relativeWindow: NSWindow? = nil
     ) {
         if window == nil {
             let model = TraceBrowserModel(
@@ -2970,6 +3059,17 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         if let window {
             DockIconManager.shared.track(window)
             window.makeKeyAndOrderFront(nil)
+            if let relativeWindow, relativeWindow.isVisible {
+                window.order(.above, relativeTo: relativeWindow.windowNumber)
+                // The originating button can make its window key again as
+                // AppKit finishes dispatching the click. Reassert on the next
+                // run-loop turn so the browser remains visibly in front.
+                DispatchQueue.main.async { [weak window, weak relativeWindow] in
+                    guard let window, let relativeWindow, relativeWindow.isVisible else { return }
+                    window.makeKeyAndOrderFront(nil)
+                    window.order(.above, relativeTo: relativeWindow.windowNumber)
+                }
+            }
             NSApp.activate(ignoringOtherApps: true)
         }
     }
