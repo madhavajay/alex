@@ -33,4 +33,6 @@ toml = { workspace = true }
 
 [dev-dependencies]
 alex-fakeprov = { path = "../alex-fakeprov" }
+alex-lar-scale = { path = "../alex-lar-scale" }
+libc = "0.2"
 tower = "0.5"

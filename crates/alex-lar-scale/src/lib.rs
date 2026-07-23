@@ -35,7 +35,7 @@ const BROWSER_MEDIUM_TURNS: usize = 6;
 const BROWSER_MEDIUM_BODY_BYTES: usize = 64 * 1024;
 const BROWSER_TOOL_BODY_BYTES: usize = 32 * 1024;
 const BROWSER_BASE_TIMESTAMP_MS: i64 = 1_700_000_000_000;
-const BROWSER_SESSION_ID: &str = "trace-browser-long-session";
+pub const BROWSER_SESSION_ID: &str = "trace-browser-long-session";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

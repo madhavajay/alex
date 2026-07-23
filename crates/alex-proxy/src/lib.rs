@@ -707,6 +707,7 @@ pub struct AppState {
     middleware_leases: std::sync::Mutex<HashMap<String, middleware::MiddlewareRouteLease>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
+    transcript_cache: std::sync::Mutex<TranscriptCache>,
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
@@ -1096,6 +1097,7 @@ pub fn build_state_with_substitution(
         middleware_leases: std::sync::Mutex::new(middleware_leases),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
+        transcript_cache: std::sync::Mutex::new(TranscriptCache::new(512)),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
     })
 }
@@ -4993,7 +4995,12 @@ async fn admin_storage_prune(
     let report =
         tokio::task::spawn_blocking(move || store.prune(cutoff, bodies_only, dry_run)).await;
     match report {
-        Ok(Ok(r)) => axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response(),
+        Ok(Ok(r)) => {
+            if !dry_run {
+                state.transcript_cache.lock().unwrap().clear();
+            }
+            axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response()
+        }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -5444,6 +5451,10 @@ static TEST_BODY_FILE_READS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> 
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
+static TEST_STORED_TRACE_BODY_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 fn test_body_file_reads_under(root: &std::path::Path) -> Vec<String> {
     TEST_BODY_FILE_READS
         .lock()
@@ -5683,6 +5694,10 @@ fn stored_trace_body(
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
     let trace_id = row["id"].as_str()?;
+    #[cfg(test)]
+    if trace_id.starts_with("trace-browser-long-") {
+        TEST_STORED_TRACE_BODY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     match store.read_trace_body(trace_id, kind, max_bytes) {
         Ok(Some(body)) => Some(body.bytes),
         Ok(None) => {
@@ -6403,24 +6418,138 @@ fn codex_user_history_signature(store: &Store, row: &Value) -> Option<String> {
     openai_responses_user_history_signature(&stored_trace_json(store, row, TraceBodyKind::Request)?)
 }
 
-fn build_session_transcript(
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TranscriptCacheKey {
+    trace_id: String,
+    completed_ms: i64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TranscriptCacheValue {
+    inherited: Option<Vec<Value>>,
+    signature: Option<String>,
+    turn: Value,
+}
+
+struct TranscriptCache {
+    entries: HashMap<TranscriptCacheKey, (TranscriptCacheValue, u64)>,
+    capacity: usize,
+    tick: u64,
+}
+
+impl TranscriptCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, key: &TranscriptCacheKey) -> Option<TranscriptCacheValue> {
+        self.tick = self.tick.wrapping_add(1);
+        let (value, used) = self.entries.get_mut(key)?;
+        *used = self.tick;
+        Some(value.clone())
+    }
+
+    fn insert(&mut self, key: TranscriptCacheKey, value: TranscriptCacheValue) {
+        self.tick = self.tick.wrapping_add(1);
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, self.tick));
+    }
+
+    fn remove_trace(&mut self, trace_id: &str) {
+        self.entries.retain(|key, _| key.trace_id != trace_id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|(value, _)| serde_json::to_vec(value).map_or(0, |bytes| bytes.len()))
+            .sum()
+    }
+}
+
+struct TranscriptCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TranscriptCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn transcript_cache_value(
+    store: &Store,
+    row: &Value,
+    include_inherited: bool,
+) -> TranscriptCacheValue {
+    TranscriptCacheValue {
+        inherited: include_inherited.then(|| transcript_inherited_turns(store, row)),
+        signature: codex_user_history_signature(store, row),
+        turn: transcript_turn(store, row),
+    }
+}
+
+fn build_session_transcript_cached(
     store: &Store,
     rows: &[Value],
     tools: &[Value],
     limit: usize,
+    cache: Option<&std::sync::Mutex<TranscriptCache>>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Vec<Value> {
     let mut previous_codex_user_history: Option<String> = None;
     let mut turns = Vec::new();
     for (index, row) in rows.iter().take(limit).enumerate() {
-        if index == 0 {
-            turns.extend(transcript_inherited_turns(store, row));
+        if cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed)) {
+            break;
         }
-        let signature = codex_user_history_signature(store, row);
+        let key = row["id"].as_str().zip(row["ts_response_ms"].as_i64()).map(
+            |(trace_id, completed_ms)| TranscriptCacheKey {
+                trace_id: trace_id.to_string(),
+                completed_ms,
+            },
+        );
+        let cached = key
+            .as_ref()
+            .and_then(|key| cache.and_then(|cache| cache.lock().unwrap().get(key)));
+        let mut value = cached.unwrap_or_else(|| {
+            let value = transcript_cache_value(store, row, index == 0);
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+            value
+        });
+        if index == 0 && value.inherited.is_none() {
+            value.inherited = Some(transcript_inherited_turns(store, row));
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+        }
+        if index == 0 {
+            turns.extend(value.inherited.unwrap_or_default());
+        }
+        let signature = value.signature;
         let replayed_user = signature.is_some() && signature == previous_codex_user_history;
         if signature.is_some() {
             previous_codex_user_history = signature;
         }
-        let mut turn = transcript_turn(store, row);
+        let mut turn = value.turn;
         // Pi emits a tool start after the model response that requested it
         // and before the next provider request. Associate by explicit
         // trace_id when available, otherwise by that session-local time
@@ -6450,6 +6579,16 @@ fn build_session_transcript(
     turns
 }
 
+#[cfg(test)]
+fn build_session_transcript(
+    store: &Store,
+    rows: &[Value],
+    tools: &[Value],
+    limit: usize,
+) -> Vec<Value> {
+    build_session_transcript_cached(store, rows, tools, limit, None, None)
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -6460,18 +6599,36 @@ async fn traces_session_transcript(
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(500);
-    let rows = match state.store.session_traces(&session_id, since) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let tools = match state.store.session_tool_calls(&session_id) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let turns = build_session_transcript(&state.store, &rows, &tools, limit);
-    let tab_counts = transcript_tab_counts(&turns);
-    axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
-        .into_response()
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = TranscriptCancellation(cancelled.clone());
+    let response = spawn_blocking_response(move || {
+        let rows = match state.store.session_traces(&session_id, since) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let tools = match state.store.session_tool_calls(&session_id) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let turns = build_session_transcript_cached(
+            &state.store,
+            &rows,
+            &tools,
+            limit,
+            Some(&state.transcript_cache),
+            Some(&cancelled),
+        );
+        let tab_counts = transcript_tab_counts(&turns);
+        axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
+            .into_response()
+    })
+    .await;
+    drop(guard);
+    response
 }
 
 const TRANSCRIPT_PAGE_DEFAULT: usize = 20;
@@ -6592,6 +6749,10 @@ fn expanded_turn_tool(mut tool: Value) -> Value {
 /// bodies and explicitly trace-linked tool bodies are read here—and nowhere in
 /// the page endpoint—so an unrelated turn can never be pulled into the read.
 async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_turn_blocking(state, id)).await
+}
+
+fn trace_turn_blocking(state: Arc<AppState>, id: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -6702,6 +6863,10 @@ async fn trace_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || trace_body_blocking(state, id, kind)).await
+}
+
+fn trace_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -6784,6 +6949,10 @@ async fn tool_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || tool_body_blocking(state, id, kind)).await
+}
+
+fn tool_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_tool_call(&id) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -6810,6 +6979,10 @@ async fn tool_body(
 }
 
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_reply_md_blocking(state, id)).await
+}
+
+fn trace_reply_md_blocking(state: Arc<AppState>, id: String) -> Response {
     use alex_core::translate;
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
@@ -6843,6 +7016,7 @@ async fn trace_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>
     }
     match state.store.delete_trace(&id) {
         Ok(paths) => {
+            state.transcript_cache.lock().unwrap().remove_trace(&id);
             let removed = paths
                 .iter()
                 .filter(|p| std::fs::remove_file(p).is_ok())
@@ -9114,6 +9288,15 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         axum::Json(json!({"error": {"type": "alex", "message": message}})),
     )
         .into_response()
+}
+
+async fn spawn_blocking_response(
+    operation: impl FnOnce() -> Response + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(response) => response,
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 fn client_key(headers: &HeaderMap) -> Option<String> {
@@ -19110,6 +19293,274 @@ mod tests {
         selected_legacy_paths.sort();
         assert_eq!(reads, selected_legacy_paths);
         assert!(unrelated_paths.iter().all(|path| !reads.contains(path)));
+    }
+
+    fn transcript_perf_state(root: &std::path::Path) -> Arc<AppState> {
+        let store = Arc::new(Store::open(root.to_path_buf()).unwrap());
+        let vault = Arc::new(Vault::open(root.join("vault")).unwrap());
+        build_state(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
+        )
+    }
+
+    async fn measured_transcript_poll(state: Arc<AppState>) -> u64 {
+        let started = std::time::Instant::now();
+        let response = traces_session_transcript(
+            State(state),
+            Path(alex_lar_scale::BROWSER_SESSION_ID.into()),
+            Query(HashMap::from([("limit".into(), "500".into())])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn test_peak_rss_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(status, 0);
+        let value = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            value
+        } else {
+            value.saturating_mul(1024)
+        }
+    }
+
+    fn transcript_cache_entry_count(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().entries.len()
+    }
+
+    fn transcript_cache_retained_bytes(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().retained_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_browser_transcript_perf_budgets() {
+        const WARM_P95_BUDGET_MS: u64 = 750;
+        const ABORT_BUDGET_MS: u64 = 250;
+        const STORE_WAIT_BUDGET_MS: u64 = 100;
+        const CACHE_ENTRY_CEILING: usize = 512;
+        const CACHE_BYTES_CEILING: usize = 16 * 1024 * 1024;
+        const RSS_GROWTH_CEILING: u64 = 128 * 1024 * 1024;
+
+        let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/trace-browser-perf-corpus-v1");
+        let manifest_path = corpus_root.join(alex_lar_scale::BROWSER_MANIFEST_FILE);
+        let (manifest, generation) = if manifest_path.is_file() {
+            (
+                serde_json::from_reader(std::fs::File::open(manifest_path).unwrap()).unwrap(),
+                Duration::ZERO,
+            )
+        } else {
+            if corpus_root.exists() {
+                std::fs::remove_dir_all(&corpus_root).unwrap();
+            }
+            alex_lar_scale::generate_browser_corpus(&corpus_root).unwrap()
+        };
+        assert_eq!(manifest.long_turns, 500);
+        let state = transcript_perf_state(&corpus_root);
+        let cold_ms = measured_transcript_poll(state.clone()).await;
+        let mut warm_samples = Vec::new();
+        for _ in 0..3 {
+            warm_samples.push(measured_transcript_poll(state.clone()).await);
+        }
+        warm_samples.sort_unstable();
+        let warm_p95_ms = *warm_samples.last().unwrap();
+
+        state.transcript_cache.lock().unwrap().clear();
+        TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let abandoned_state = state.clone();
+        let abandoned = tokio::spawn(async move {
+            measured_transcript_poll(abandoned_state).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let abort_started = std::time::Instant::now();
+        abandoned.abort();
+        let store_started = std::time::Instant::now();
+        let session_count = state.store.sessions(None, 100).unwrap().len();
+        let store_wait_ms = store_started.elapsed().as_millis() as u64;
+        let _ = abandoned.await;
+        let abort_ms = abort_started.elapsed().as_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let abandoned_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(session_count, 51);
+
+        let mut rss_growth = u64::MAX;
+        let mut cache_entries = transcript_cache_entry_count(&state);
+        let mut cache_bytes_before = usize::MAX;
+        let mut cache_bytes_after = usize::MAX;
+        if warm_p95_ms <= WARM_P95_BUDGET_MS {
+            measured_transcript_poll(state.clone()).await;
+            TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..20 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            cache_bytes_before = transcript_cache_retained_bytes(&state);
+            let rss_before = test_peak_rss_bytes();
+            for _ in 0..100 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            let rss_after = test_peak_rss_bytes();
+            rss_growth = rss_after.saturating_sub(rss_before);
+            cache_entries = transcript_cache_entry_count(&state);
+            cache_bytes_after = transcript_cache_retained_bytes(&state);
+        }
+        let warm_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "T2 trace-browser generation_ms={} cold_ms={cold_ms} warm_p95_ms={warm_p95_ms} abort_ms={abort_ms} abandoned_body_reads={abandoned_body_reads} store_wait_ms={store_wait_ms} rss_growth_bytes={rss_growth} cache_entries={cache_entries} cache_bytes_before={cache_bytes_before} cache_bytes_after={cache_bytes_after} warm_body_reads={warm_body_reads}",
+            generation.as_millis()
+        );
+
+        assert!(
+            warm_p95_ms <= WARM_P95_BUDGET_MS,
+            "warm transcript p95 {warm_p95_ms}ms exceeds {WARM_P95_BUDGET_MS}ms"
+        );
+        assert!(abort_ms <= ABORT_BUDGET_MS, "abort took {abort_ms}ms");
+        assert!(
+            abandoned_body_reads <= 3,
+            "abandoned transcript read {abandoned_body_reads} bodies"
+        );
+        assert!(
+            store_wait_ms <= STORE_WAIT_BUDGET_MS,
+            "concurrent store query waited {store_wait_ms}ms"
+        );
+        assert!(
+            cache_entries > 0 && cache_entries <= CACHE_ENTRY_CEILING,
+            "cache entries {cache_entries} exceed bounded range"
+        );
+        assert_eq!(
+            cache_bytes_after, cache_bytes_before,
+            "cache retained bytes grew"
+        );
+        assert!(
+            cache_bytes_after <= CACHE_BYTES_CEILING,
+            "cache retains {cache_bytes_after} bytes"
+        );
+        assert_eq!(warm_body_reads, 0, "warm polls reopened trace bodies");
+        assert!(
+            rss_growth <= RSS_GROWTH_CEILING,
+            "100 warm polls grew peak RSS by {rss_growth} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_cache_refreshes_and_invalidates_on_delete_and_prune() {
+        let state = test_state("transcript-cache-invalidation");
+        let session_id = "cache-session";
+        for (id, completed_ms, assistant) in [("cached-a", 2, "first"), ("cached-b", 4, "second")] {
+            let request_path = state
+                .store
+                .write_body(
+                    id,
+                    "request.json",
+                    br#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                )
+                .unwrap();
+            let response_path = state
+                .store
+                .write_body(
+                    id,
+                    "response.json",
+                    json!({"choices": [{"message": {"content": assistant}}]})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: completed_ms - 1,
+                    ts_response_ms: Some(completed_ms),
+                    session_id: Some(session_id.into()),
+                    client_format: Some("openai-chat".into()),
+                    upstream_format: Some("openai-chat".into()),
+                    req_body_path: Some(request_path),
+                    resp_body_path: Some(response_path),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let (_, first) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["turns"][0]["assistant"], "first");
+        assert_eq!(transcript_cache_entry_count(&state), 2);
+
+        let response_path = state
+            .store
+            .write_body(
+                "cached-a",
+                "response.json",
+                br#"{"choices":[{"message":{"content":"updated"}}]}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "cached-a".into(),
+                ts_request_ms: 1,
+                ts_response_ms: Some(5),
+                session_id: Some(session_id.into()),
+                client_format: Some("openai-chat".into()),
+                upstream_format: Some("openai-chat".into()),
+                resp_body_path: Some(response_path),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, refreshed) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(refreshed["turns"][0]["assistant"], "updated");
+        assert_eq!(refreshed["turns"][1]["assistant"], "second");
+
+        assert_eq!(
+            trace_delete(State(state.clone()), Path("cached-a".into()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(state
+            .transcript_cache
+            .lock()
+            .unwrap()
+            .entries
+            .keys()
+            .all(|key| key.trace_id != "cached-a"));
+        assert_eq!(
+            admin_storage_prune(
+                State(state.clone()),
+                axum::Json(json!({
+                    "older_than_ms": now_ms(),
+                    "bodies_only": true,
+                })),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(transcript_cache_entry_count(&state), 0);
     }
 
     #[tokio::test]
