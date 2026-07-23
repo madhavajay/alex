@@ -620,15 +620,74 @@ pub async fn run_update(
         println!("cancelled");
         return Ok(());
     }
-    #[cfg(windows)]
-    install_windows(&exe, &update).await?;
-    #[cfg(unix)]
-    install_unix(&exe, &update).await?;
-    if no_restart {
-        println!("daemon restart skipped (--no-restart)");
-    } else {
-        restart_daemon(config, &exe, &update.latest).await?;
+    let install_result: Result<()> = async {
+        #[cfg(windows)]
+        install_windows(&exe, &update).await?;
+        #[cfg(unix)]
+        install_unix(&exe, &update).await?;
+        if no_restart {
+            println!("daemon restart skipped (--no-restart)");
+        } else {
+            restart_daemon(config, &exe, &update.latest).await?;
+        }
+        Ok(())
     }
+    .await;
+    match install_result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("self-update failed: {error:#}");
+            offer_installer_fallback(yes)
+        }
+    }
+}
+
+/// In-place self-update can fail for environmental reasons (a locked
+/// executable, permissions, a stray daemon). Rather than stranding the user
+/// on the old build, offer the standalone release installer — the same
+/// checksum-verified path a fresh install uses — and run it on confirmation.
+fn offer_installer_fallback(assume_yes: bool) -> Result<()> {
+    #[cfg(windows)]
+    let fallback_command = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -useb https://raw.githubusercontent.com/madhavajay/alex/main/install-release.ps1 | iex\"";
+    #[cfg(not(windows))]
+    let fallback_command =
+        "curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh";
+
+    println!();
+    println!("The standalone installer can force the update instead:");
+    println!("  {fallback_command}");
+    let run_it = if assume_yes {
+        true
+    } else {
+        print!("Force update by running the installer now? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+    };
+    if !run_it {
+        println!("not running the installer; the command above can be run manually");
+        return Ok(());
+    }
+    #[cfg(windows)]
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "iwr -useb https://raw.githubusercontent.com/madhavajay/alex/main/install-release.ps1 | iex",
+        ])
+        .status()
+        .context("running the standalone Windows installer")?;
+    #[cfg(not(windows))]
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh")
+        .status()
+        .context("running the standalone installer")?;
+    anyhow::ensure!(status.success(), "the standalone installer failed; see its output above");
+    println!("standalone installer finished");
     Ok(())
 }
 
