@@ -58,12 +58,6 @@ harness_matrix!(
     "requires a live OpenCode installation"
 );
 harness_matrix!(
-    mini_swe_agent_install_and_model_roundtrip,
-    mini_swe_agent_subagent_lineage_detected,
-    mini_swe_agent_tool_capture_logged,
-    "requires a live mini-swe-agent installation"
-);
-harness_matrix!(
     kimi_install_and_model_roundtrip,
     kimi_subagent_lineage_detected,
     kimi_tool_capture_logged,
@@ -218,22 +212,10 @@ harness_matrix!(
     "requires a live Goose installation"
 );
 harness_matrix!(
-    opensage_install_and_model_roundtrip,
-    opensage_subagent_lineage_detected,
-    opensage_tool_capture_logged,
-    "requires a live OpenSage ADK installation"
-);
-harness_matrix!(
     pydantic_ai_install_and_model_roundtrip,
     pydantic_ai_subagent_lineage_detected,
     pydantic_ai_tool_capture_logged,
     "requires a live Pydantic AI Harness installation"
-);
-harness_matrix!(
-    stirrup_install_and_model_roundtrip,
-    stirrup_subagent_lineage_detected,
-    stirrup_tool_capture_logged,
-    "requires a live Stirrup installation"
 );
 harness_matrix!(
     jcode_install_and_model_roundtrip,

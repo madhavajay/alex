@@ -14100,7 +14100,7 @@ local_key = "alx-test"
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
         assert!(body["checked_ms"].as_i64().unwrap() > 0);
-        assert_eq!(harnesses.len(), 19);
+        assert_eq!(harnesses.len(), 16);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));

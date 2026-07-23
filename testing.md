@@ -6,6 +6,22 @@ upstream API server ("fakeprov") that impersonates every provider Alex talks
 to — model calls, OAuth/signup, usage stats, model lists, logout, errors, and
 ping/smoke — driven by recorded real responses.
 
+## Optional live-tier environment
+
+`test.sh` sources and exports simple `KEY=VALUE` entries from a repo-root
+`.env` when it exists. The file is gitignored. The credentialed `wire` and
+`harness` tiers can use `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GEMINI_API_KEY`, `OPENROUTER_API_KEY`, and `AMP_API_KEY`; their live cells
+still require the corresponding accounts to be configured in Alex.
+
+Optional harness fixtures use these existing image/command groups:
+`ALEX_INTEGRATION_PI_IMAGE` with `ALEX_INTEGRATION_PI_COMMAND` or
+`ALEX_INTEGRATION_PI_SUBAGENT_COMMAND`; the `CLAUDE_TOOL`, `CODEX_TOOL`,
+`KIMI_TOOL`, and `GEMINI_TOOL` `ALEX_INTEGRATION_*_IMAGE`/`*_COMMAND` pairs;
+the `CODEX_SUBAGENT` pair; and the `GROK` and `GEMINI` pairs. Missing
+credentials or fixtures produce live-tier skips. `harness-mock` is fully
+offline and never needs any of these variables.
+
 ---
 
 ## 0. Current state (what exists today)

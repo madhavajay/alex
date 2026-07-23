@@ -3,6 +3,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  . "$ROOT/.env"
+  set +a
+fi
 CONFIG_FILE="${ALEX_CONFIG:-$HOME/.alex/config.toml}"
 PROMPT="Reply with exactly: alex-test-ok"
 

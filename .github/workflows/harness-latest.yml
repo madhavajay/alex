@@ -1,0 +1,60 @@
+name: Harness latest (informational)
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  latest:
+    runs-on: namespace-profile-linux-medium
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: harness-latest
+      - name: Bump all package harness pins
+        run: scripts/bump-harness-versions.sh
+      - name: Show harness catalog diff
+        run: git diff -- crates/alex/config/harnesses.json
+      - name: Test latest harnesses offline
+        run: ./test.sh harness-mock --json | tee harness-latest.json
+      - name: Detect optional live smoke
+        id: live
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Seed OpenRouter live account
+        if: steps.live.outputs.enabled == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/alex-live"
+          {
+            printf 'ALEX_HOME=%s\n' "$RUNNER_TEMP/alex-live"
+            printf 'ALEX_CONFIG=%s\n' "$RUNNER_TEMP/alex-live/config.toml"
+            printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY"
+          } > .env
+          ALEX_HOME="$RUNNER_TEMP/alex-live" target/debug/alex auth openrouter-key
+      - name: Run optional OpenRouter wire smoke
+        if: steps.live.outputs.enabled == 'true'
+        run: ./test.sh wire --provider openrouter --json | tee harness-latest-live.json
+      - name: Upload cell reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-latest-cell-reports
+          path: |
+            harness-latest.json
+            harness-latest-live.json
+          if-no-files-found: warn
+          retention-days: 14
