@@ -10,9 +10,9 @@ const REFRESH_STORAGE_KEY = "alex.web.refresh-seconds";
 const PROVIDERS = [
   ["claude", "Anthropic", "oauth"],
   ["codex", "OpenAI", "oauth"],
-  ["gemini", "Google Gemini", "oauth"],
+  ["gemini", "Gemini", "oauth"],
   ["grok", "xAI", "oauth"],
-  ["kimi", "Moonshot Kimi", "oauth"],
+  ["kimi", "Kimi", "oauth"],
   ["amp", "Amp", "import"],
   ["openrouter", "OpenRouter", "form"],
   ["exo", "Exo", "form"],
@@ -47,6 +47,10 @@ const HARNESS_LOGOS = Object.freeze({
   qwen: "qwen-code.png",
   goose: "goose.jpg",
 });
+const HARNESS_ORDER = Object.freeze([
+  "pi", "claude", "codex", "grok", "amp", "gemini", "opencode",
+  "kimi", "cursor", "droid", "qwen", "goose",
+]);
 const LOGIN_PROVIDERS = {
   claude: ["Claude Code", "Anthropic", "A", "claude"],
   anthropic: ["Claude Code", "Anthropic", "A", "claude"],
@@ -84,6 +88,10 @@ const state = {
   accounts: [],
   providers: [],
   harnesses: [],
+  providerTab: null,
+  harnessTab: null,
+  providerAnalytics: null,
+  providerRoutings: [],
   analytics: null,
   limits: null,
   dario: null,
@@ -338,7 +346,8 @@ function enterApplication() {
     $("#trace-filters").elements.harness.value = sharedHarnessFilter;
   }
   const requested = location.hash.slice(1);
-  selectView(state.auth?.onboarding_completed ? (VIEW_COPY[requested] ? requested : "dashboard") : "onboarding", false);
+  const requestedView = requested.split("/", 1)[0];
+  selectView(state.auth?.onboarding_completed ? (VIEW_COPY[requestedView] ? requested : "dashboard") : "onboarding", false);
   refreshSharedData().catch((error) => toast(error.message, "danger"));
 }
 
@@ -508,7 +517,7 @@ function renderOnboardingProviderDetail(message = "", kind = "success") {
   $("[data-add-provider-account]", node)?.addEventListener("click", () => {
     if (mode === "oauth") startLogin(id);
     else if (mode === "import") loadOnboardingImports(true);
-    else { selectView("providers", true); $(`#${id}-form`)?.scrollIntoView({ behavior: "smooth" }); }
+    else { selectView(`providers/${id}`, true); $(`#${id}-form`)?.scrollIntoView({ behavior: "smooth" }); }
   });
 }
 
@@ -782,10 +791,22 @@ const VIEW_LOADERS = {
   onboarding: async () => { await refreshSharedData(); renderOnboardingData(); },
 };
 
+function viewRoute(requested) {
+  const [view, encodedSection] = String(requested || "").split("/", 2);
+  let section = null;
+  if (encodedSection) {
+    try { section = decodeURIComponent(encodedSection); } catch { section = null; }
+  }
+  return { view, section };
+}
+
 function selectView(requested, updateHash = true) {
-  let view = VIEW_COPY[requested] ? requested : "dashboard";
+  const route = viewRoute(requested);
+  let view = VIEW_COPY[route.view] ? route.view : "dashboard";
   // Traces stays reachable mid-onboarding so "See your trace" can open it in a new tab.
   if (!state.auth?.onboarding_completed && view !== "traces") view = "onboarding";
+  if (view === "providers") state.providerTab = route.section;
+  if (view === "harnesses") state.harnessTab = route.section;
   state.currentView = view;
   $$('[data-panel]').forEach((panel) => { panel.hidden = panel.id !== `${view}-view`; });
   $$('nav [data-view]').forEach((button) => {
@@ -796,9 +817,23 @@ function selectView(requested, updateHash = true) {
   $("#page-title").textContent = title;
   $("#page-subtitle").textContent = subtitle;
   document.body.classList.remove("nav-open");
-  if (updateHash && location.hash !== `#${view}`) history.pushState(null, "", `#${view}`);
+  const section = view === "providers" ? state.providerTab : view === "harnesses" ? state.harnessTab : null;
+  const nextHash = `#${view}${section ? `/${encodeURIComponent(section)}` : ""}`;
+  if (updateHash && location.hash !== nextHash) history.pushState(null, "", nextHash);
   if (view === "onboarding") showOnboardingStep(state.onboardingStep);
   VIEW_LOADERS[view]?.().catch((error) => toast(error.message, "danger"));
+}
+
+function selectSectionTab(view, id, scroll = false) {
+  if (view === "providers") {
+    state.providerTab = id || null;
+    renderProvidersView();
+  } else {
+    state.harnessTab = id || null;
+    renderHarnessesView(scroll);
+  }
+  const nextHash = `#${view}${id ? `/${encodeURIComponent(id)}` : ""}`;
+  if (location.hash !== nextHash) history.pushState(null, "", nextHash);
 }
 
 async function refreshCurrentView() {
@@ -933,7 +968,14 @@ function renderLimits(node, providers) {
 }
 
 function compactAccounts(accounts) {
-  return accounts.length ? accounts.slice(0, 6).map((account) => `<div class="account-row"><span class="status-dot ${escapeHtml(account.health || "unknown")}"></span><div><strong>${escapeHtml(account.email || account.label || account.name)}</strong><small>${escapeHtml(account.provider)} · ${escapeHtml(account.health || account.status)}</small></div>${account.needs_reauth ? `<button data-reauth-id="${escapeHtml(account.id)}" data-reauth-provider="${escapeHtml(account.provider)}">Re-auth</button>` : ""}</div>`).join("") : '<p class="muted">No accounts connected.</p>';
+  return accounts.length ? accounts.slice(0, 6).map((account) => {
+    const health = accountHealth(account);
+    return `<div class="account-row"><span class="status-dot ${escapeHtml(health.value)}"></span><div><strong>${escapeHtml(account.email || account.label || account.name)}</strong><small>${escapeHtml(account.provider)} · ${escapeHtml(health.label)}</small></div>${account.needs_reauth ? `<button data-reauth-id="${escapeHtml(account.id)}" data-reauth-provider="${escapeHtml(account.provider)}">Re-auth</button>` : ""}</div>`;
+  }).join("") : '<p class="muted">No accounts connected.</p>';
+}
+
+function darioEmptyState() {
+  return '<div class="dario-empty"><p>Dario routes Anthropic subscriptions into non-Claude harnesses. Connect an Anthropic subscription to enable it.</p><a class="button-link" href="#providers/claude">Connect Anthropic</a></div>';
 }
 
 async function loadDashboard() {
@@ -967,7 +1009,7 @@ async function loadDashboard() {
   $("#dashboard-accounts").innerHTML = compactAccounts(state.accounts);
   bindAccountActions($("#dashboard-accounts"));
   $("#dashboard-harnesses").innerHTML = state.harnesses.filter((item) => item.installed).slice(0, 5).map((item) => `<div class="mini-row"><div>${harnessLogoTile(item.name, item.display_name || item.name)}<strong>${escapeHtml(item.display_name || item.name)}</strong></div><span class="pill ${item.connected ? "success" : "neutral"}">${item.connected ? "Connected" : "Detected"}</span></div>`).join("") || '<p class="muted">No supported harness detected.</p>';
-  $("#dashboard-dario").innerHTML = state.dario ? facts([["Health", state.dario.health], ["Active generation", state.dario.active_generation_id], ["Generations", state.dario.generations?.length || 0], ["Route enabled", state.dario.route_enabled]]) : '<p class="muted">Dario mode is not enabled.</p>';
+  $("#dashboard-dario").innerHTML = state.dario?.health === "not-applicable" ? darioEmptyState() : state.dario ? facts([["Health", state.dario.health], ["Active generation", state.dario.active_generation_id], ["Generations", state.dario.generations?.length || 0], ["Route enabled", state.dario.route_enabled]]) : '<p class="muted">Dario mode is not enabled.</p>';
   const traceRows = traces.status === "fulfilled" ? traces.value.traces || [] : [];
   $("#dashboard-traces").innerHTML = traceRows.map((trace) => `<button class="trace-mini" data-dashboard-trace="${escapeHtml(trace.id)}"><code>${escapeHtml(trace.model || trace.id)}</code><span>${escapeHtml(trace.provider || "unrouted")} · ${escapeHtml(formatTime(trace.ts_request_ms))}</span><b>${escapeHtml(trace.status ?? "—")}</b></button>`).join("") || '<p class="muted">No recent traces.</p>';
   bindActions($("#dashboard-traces"), "[data-dashboard-trace]", (event) => { selectView("traces", true); openTrace(event.currentTarget.dataset.dashboardTrace); });
@@ -1039,20 +1081,40 @@ function providerCanonical(provider) {
   return ({ claude: "anthropic", codex: "openai", grok: "xai" })[provider] || provider;
 }
 
+function providerTabId(provider) {
+  return ({ anthropic: "claude", openai: "codex", xai: "grok" })[providerCanonical(provider)] || providerCanonical(provider);
+}
+
+function providerMatchesTab(provider, tab = state.providerTab) {
+  return !tab || providerCanonical(provider) === providerCanonical(tab);
+}
+
+function accountHealth(account) {
+  const health = account.health || "unknown";
+  return { value: health, label: health === "unknown" ? "not checked yet" : health.replaceAll("_", " ") };
+}
+
+function renderSectionTabs(node, items, selected, kind) {
+  const logo = kind === "providers" ? providerLogoTile : harnessLogoTile;
+  node.innerHTML = `<button class="section-tab ${selected ? "" : "selected"}" data-section-tab="" aria-current="${selected ? "false" : "page"}"><span class="section-tab-all" aria-hidden="true">•••</span><strong>All</strong></button>${items.map(({ id, label }) => `<button class="section-tab ${selected === id ? "selected" : ""}" data-section-tab="${escapeHtml(id)}" aria-current="${selected === id ? "page" : "false"}">${logo(id, label, "section-tab-logo")}<strong>${escapeHtml(label)}</strong></button>`).join("")}`;
+  bindActions(node, "[data-section-tab]", (event) => selectSectionTab(kind, event.currentTarget.dataset.sectionTab || null, kind === "harnesses"));
+}
+
 function renderProviderPicker(node, collapsible = true) {
   const counts = new Map();
   state.accounts.forEach((account) => counts.set(account.provider, (counts.get(account.provider) || 0) + 1));
-  node.innerHTML = PROVIDERS.map(([id, label, mode]) => {
+  const definitions = state.providerTab ? PROVIDERS.filter(([id]) => id === state.providerTab) : PROVIDERS;
+  node.innerHTML = definitions.map(([id, label, mode]) => {
     const count = counts.get(providerCanonical(id)) || 0;
     const action = mode === "oauth" ? "Connect subscription" : mode === "import" ? "Review import" : "Configure below";
     return `<button class="provider-picker-choice" data-provider="${escapeHtml(id)}" data-provider-mode="${escapeHtml(mode)}">${providerLogoTile(id, label)}<span class="provider-choice-copy"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(`${count} connected · ${action}`)}</span></span></button>`;
   }).join("");
-  node.hidden = collapsible ? node.hidden : false;
+  node.hidden = state.providerTab ? false : (collapsible ? node.hidden : false);
   bindActions(node, "[data-provider]", (event) => {
     const button = event.currentTarget;
     if (button.dataset.providerMode === "oauth") startLogin(button.dataset.provider);
-    else if (button.dataset.providerMode === "import") { selectView("providers", true); loadImportCandidates(); }
-    else { selectView("providers", true); $(`#${button.dataset.provider}-form`)?.scrollIntoView({ behavior: "smooth" }); }
+    else if (button.dataset.providerMode === "import") { selectSectionTab("providers", button.dataset.provider); loadImportCandidates(); }
+    else { selectSectionTab("providers", button.dataset.provider); $(`#${button.dataset.provider}-form`)?.scrollIntoView({ behavior: "smooth" }); }
   });
 }
 
@@ -1067,10 +1129,10 @@ function quotaMarkup(limits) {
 }
 
 function renderAccountCard(account) {
-  const health = account.health || "unknown";
-  const needsReauth = account.kind === "oauth" && (account.needs_reauth || health === "auth_failed" || account.status !== "active");
+  const health = accountHealth(account);
+  const needsReauth = account.kind === "oauth" && (account.needs_reauth || health.value === "auth_failed" || account.status !== "active");
   return `<article class="account-card" data-account-card="${escapeHtml(account.id)}">
-    <div class="account-head"><span class="status-dot ${escapeHtml(health)}"></span><div><span class="section-kicker">${escapeHtml(account.provider)}</span><h3>${escapeHtml(accountTitle(account))}</h3><small>${escapeHtml(health)} · ${escapeHtml(account.kind)}${account.paused ? " · paused" : ""}</small></div></div>
+    <div class="account-head">${providerLogoTile(account.provider, account.provider, "account-provider-logo")}<span class="status-dot ${escapeHtml(health.value)}"></span><div><span class="section-kicker">${escapeHtml(account.provider)}</span><h3>${escapeHtml(accountTitle(account))}</h3><small>${escapeHtml(health.label)} · ${escapeHtml(account.kind)}${account.paused ? " · paused" : ""}</small></div></div>
     ${quotaMarkup(account.limits)}
     ${facts([["Status", account.status], ["Expires", account.expires_in_s === null || account.expires_in_s === undefined ? "—" : formatAge(account.expires_in_s)], ["Routing", account.routing?.eligible ? `Priority ${finite(account.routing.priority) + 1}` : "Ineligible"], ["Reserve", account.routing?.reserve_pct === undefined ? "—" : `${account.routing.reserve_pct}%`]])}
     <div class="card-actions"><button data-account-pause="${escapeHtml(account.id)}" data-paused="${account.paused}">${account.paused ? "Resume" : "Pause"}</button>${needsReauth ? `<button data-reauth-id="${escapeHtml(account.id)}" data-reauth-provider="${escapeHtml(account.provider)}">Re-authenticate</button>` : ""}<button class="danger-button" data-account-remove="${escapeHtml(account.id)}">Remove</button></div>
@@ -1106,6 +1168,18 @@ function renderUsageAnalytics(data) {
     return `<div><i class="chart-color-${index % CHART_COLORS.length}"></i><span>${escapeHtml(account.account_id)}</span><strong>${escapeHtml(`${formatNumber(share)}%`)}</strong></div>`;
   }).join("") : '<p class="muted">No account traffic in the selected period.</p>';
   renderUsageChart(data);
+}
+
+function providerAnalytics(data, tab) {
+  if (!tab) return data;
+  const accountIds = new Set(state.accounts.filter((account) => providerMatchesTab(account.provider, tab)).map((account) => account.id));
+  const belongs = (entry) => accountIds.has(entry.account_id);
+  return {
+    ...data,
+    by_account: (data.by_account || []).filter(belongs),
+    series: (data.series || []).filter(belongs),
+    plot_series: (data.plot_series || []).filter(belongs),
+  };
 }
 
 function renderUsageChart(data) {
@@ -1154,29 +1228,92 @@ async function saveRouting(event) {
 
 async function loadProviders() {
   const [accounts, analytics] = await Promise.all([loadAccounts(), api("/admin/accounts/analytics?since_minutes=1440&bucket_minutes=60")]);
-  renderUsageAnalytics(analytics);
-  renderProviderPicker($("#provider-picker"), true);
   const providers = [...new Set(accounts.map((account) => account.provider))];
   const routings = await Promise.all(providers.map((provider) => api(`/admin/routing/${encodeURIComponent(provider)}`).catch(() => null)));
-  $("#provider-accounts").innerHTML = accounts.length ? `${accounts.map(renderAccountCard).join("")}${routings.filter(Boolean).map(routingEditor).join("")}` : '<article class="settings-card"><p class="muted">No provider accounts connected. Choose Add provider to begin.</p></article>';
-  bindAccountActions($("#provider-accounts"));
-  $$('.routing-form', $("#provider-accounts")).forEach((form) => form.addEventListener("submit", saveRouting));
+  state.providerAnalytics = analytics;
+  state.providerRoutings = routings.filter(Boolean);
+  renderProvidersView();
   await Promise.allSettled([loadOpenRouterModels(), loadExo(), loadCLIProxyAPI(), loadImportCandidates()]);
 }
 
-async function testCredentials() {
-  const button = $("#test-credentials");
-  const output = $("#credential-test-result");
-  button.disabled = true;
-  inlineMessage(output, "Sending a low-cost routed request through each active provider…", "neutral");
+function renderProvidersView() {
+  const validTab = PROVIDERS.some(([id]) => id === state.providerTab) ? state.providerTab : null;
+  if (state.providerTab && !validTab && state.currentView === "providers") history.replaceState(null, "", "#providers");
+  state.providerTab = validTab;
+  renderSectionTabs($("#provider-tabs"), PROVIDERS.map(([id, label]) => ({ id, label })), validTab, "providers");
+  const accounts = state.accounts.filter((account) => providerMatchesTab(account.provider, validTab));
+  const routings = state.providerRoutings.filter((snapshot) => providerMatchesTab(snapshot.provider, validTab));
+  renderUsageAnalytics(providerAnalytics(state.providerAnalytics || {}, validTab));
+  renderProviderPicker($("#provider-picker"), true);
+  const accountList = $("#provider-accounts");
+  const empty = validTab ? `No ${PROVIDERS.find(([id]) => id === validTab)?.[1] || validTab} accounts connected yet.` : "No provider accounts connected. Choose Add provider to begin.";
+  accountList.innerHTML = accounts.length ? `${accounts.map(renderAccountCard).join("")}${routings.map(routingEditor).join("")}` : `<article class="settings-card provider-empty-state"><p class="muted">${escapeHtml(empty)}</p></article>`;
+  bindAccountActions(accountList);
+  $$('.routing-form', accountList).forEach((form) => form.addEventListener("submit", saveRouting));
+  $$('[data-provider-setup]', $("#provider-setup")).forEach((section) => { section.hidden = Boolean(validTab) && section.dataset.providerSetup !== validTab; });
+  $("#provider-setup").hidden = Boolean(validTab) && !$$('[data-provider-setup]', $("#provider-setup")).some((section) => !section.hidden);
+  renderImportCandidates();
+}
+
+let credentialPingRun = 0;
+
+function credentialPingResult(account, results) {
+  const exact = results.find((result) => result.account_id === account.id);
+  if (exact) return exact;
+  const providerResults = results.filter((result) => providerCanonical(result.provider) === providerCanonical(account.provider));
+  const providerAccounts = state.accounts.filter((candidate) => providerCanonical(candidate.provider) === providerCanonical(account.provider));
+  return providerResults.length === 1 && providerAccounts.length === 1 ? providerResults[0] : null;
+}
+
+function renderCredentialPingRows(results = null, requestError = "") {
+  const rows = $("#credential-ping-rows");
+  if (!state.accounts.length) {
+    rows.innerHTML = '<div class="credential-ping-empty">No provider credentials are connected.</div>';
+    return { passed: 0, total: 0 };
+  }
+  let passed = 0;
+  rows.innerHTML = state.accounts.map((account) => {
+    if (!results && !requestError) {
+      return `<div class="credential-ping-row pending">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}</small></div><span class="spinner" aria-label="Checking"></span></div>`;
+    }
+    const result = requestError ? null : credentialPingResult(account, results || []);
+    const ok = Boolean(result?.ok);
+    if (ok) passed += 1;
+    const message = requestError || result?.message || "No ping result was returned for this credential.";
+    return `<div class="credential-ping-row ${ok ? "passed" : "failed"}">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}${result ? ` · ${escapeHtml(`${result.latency_ms} ms`)}` : ""}</small>${ok ? "" : `<p>${escapeHtml(message)}</p>`}</div><span class="credential-ping-mark" aria-label="${ok ? "Passed" : "Failed"}">${ok ? "✓" : "×"}</span></div>`;
+  }).join("");
+  return { passed, total: state.accounts.length };
+}
+
+async function runCredentialPingChecks() {
+  const run = ++credentialPingRun;
+  const rerun = $("#rerun-credential-ping");
+  const summary = $("#credential-ping-summary");
+  rerun.disabled = true;
+  summary.className = "credential-ping-summary checking";
+  summary.textContent = `Checking ${state.accounts.length} credential${state.accounts.length === 1 ? "" : "s"}…`;
+  renderCredentialPingRows();
   try {
     const data = await api("/admin/accounts/test", { method: "POST" });
-    output.hidden = false;
-    output.className = `inline-message ${data.healthy === data.total ? "success" : "warning"}`;
-    output.innerHTML = `<strong>${escapeHtml(`${data.healthy}/${data.total} credentials passed`)}</strong><ul>${(data.results || []).map((result) => `<li>${result.ok ? "✓" : "×"} ${escapeHtml(result.provider)} · ${escapeHtml(result.latency_ms)} ms · ${escapeHtml(result.message)}</li>`).join("")}</ul>`;
+    if (run !== credentialPingRun) return;
+    const outcome = renderCredentialPingRows(data.results || []);
+    summary.className = `credential-ping-summary ${outcome.passed === outcome.total ? "success" : "warning"}`;
+    summary.textContent = `${outcome.passed}/${outcome.total} credentials passed`;
     await loadAccounts();
-  } catch (error) { inlineMessage(output, error.message); }
-  finally { button.disabled = false; }
+  } catch (error) {
+    if (run !== credentialPingRun) return;
+    const outcome = renderCredentialPingRows([], error.message);
+    summary.className = "credential-ping-summary warning";
+    summary.textContent = `${outcome.passed}/${outcome.total} credentials passed`;
+  } finally {
+    if (run === credentialPingRun) rerun.disabled = false;
+  }
+}
+
+function openCredentialPingChecks() {
+  const dialog = $("#credential-ping-dialog");
+  if (!dialog.open) dialog.showModal();
+  runCredentialPingChecks();
 }
 
 async function saveGeminiKey(event) {
@@ -1260,9 +1397,17 @@ async function loadImportCandidates() {
   const node = $("#import-candidates");
   try {
     const data = await api("/admin/auth/import-candidates");
-    node.innerHTML = (data.candidates || []).map((candidate) => `<div class="mini-row"><div><strong>${escapeHtml(candidate.label)}</strong><small>${escapeHtml(candidate.provider)} · ${escapeHtml(candidate.kind)} · ${escapeHtml(candidate.source_path)}</small></div><button data-import-source="${escapeHtml(candidate.source)}">Review & import</button></div>`).join("") || '<p class="muted">No importable CLI credentials detected.</p>';
-    bindActions(node, "[data-import-source]", importCredential);
+    state.importCandidates = data.candidates || [];
+    renderImportCandidates();
   } catch (error) { renderError(node, error, "Credential scan failed"); }
+}
+
+function renderImportCandidates() {
+  const node = $("#import-candidates");
+  if (!node) return;
+  const candidates = state.importCandidates.filter((candidate) => providerMatchesTab(candidate.provider));
+  node.innerHTML = candidates.map((candidate) => `<div class="mini-row"><div><strong>${escapeHtml(candidate.label)}</strong><small>${escapeHtml(candidate.provider)} · ${escapeHtml(candidate.kind)} · ${escapeHtml(candidate.source_path)}</small></div><button data-import-source="${escapeHtml(candidate.source)}">Review & import</button></div>`).join("") || '<p class="muted">No importable CLI credentials detected.</p>';
+  bindActions(node, "[data-import-source]", importCredential);
 }
 
 async function importCredential(event) {
@@ -1340,7 +1485,28 @@ function renderHarnessCard(harness) {
 }
 
 async function loadHarnesses(refresh = false) {
-  const harnesses = await loadHarnessesData(refresh);
+  await loadHarnessesData(refresh);
+  renderHarnessesView();
+  renderOnboardingData();
+}
+
+function orderedHarnesses(harnesses) {
+  return [...harnesses].sort((left, right) => {
+    const leftIndex = HARNESS_ORDER.indexOf(left.name);
+    const rightIndex = HARNESS_ORDER.indexOf(right.name);
+    const leftOrder = leftIndex === -1 ? HARNESS_ORDER.length : leftIndex;
+    const rightOrder = rightIndex === -1 ? HARNESS_ORDER.length : rightIndex;
+    return leftOrder - rightOrder || String(left.display_name || left.name).localeCompare(String(right.display_name || right.name));
+  });
+}
+
+function renderHarnessesView(scroll = false) {
+  const harnesses = orderedHarnesses(state.harnesses);
+  const detected = harnesses.filter((item) => item.installed);
+  const validTab = detected.some((item) => item.name === state.harnessTab) ? state.harnessTab : null;
+  if (state.harnessTab && !validTab && state.currentView === "harnesses") history.replaceState(null, "", "#harnesses");
+  state.harnessTab = validTab;
+  renderSectionTabs($("#harness-tabs"), detected.map((item) => ({ id: item.name, label: item.display_name || item.name })), validTab, "harnesses");
   $("#harness-summary").innerHTML = statCards([
     ["Detected", harnesses.filter((item) => item.installed).length],
     ["Connected", harnesses.filter((item) => item.connected).length],
@@ -1348,9 +1514,11 @@ async function loadHarnesses(refresh = false) {
     ["Tool capture", harnesses.filter((item) => item.tool_capture_enabled).length],
   ]);
   const list = $("#harness-list");
-  list.innerHTML = harnesses.map(renderHarnessCard).join("") || '<p class="muted">Harness detection returned no entries.</p>';
+  const visible = validTab ? harnesses.filter((item) => item.name === validTab) : harnesses;
+  list.innerHTML = visible.map(renderHarnessCard).join("") || '<article class="settings-card provider-empty-state"><p class="muted">No detected harnesses to show.</p></article>';
   $$('.harness-card', list).forEach(bindHarnessCard);
-  renderOnboardingData();
+  $("#harness-advanced").hidden = Boolean(validTab);
+  if (scroll && validTab) requestAnimationFrame(() => $(`[data-harness-card="${CSS.escape(validTab)}"]`, list)?.scrollIntoView({ behavior: "smooth", block: "start" }));
 }
 
 function bindHarnessCard(card) {
@@ -1476,6 +1644,14 @@ function darioCacheRows(caches) {
 async function loadDario() {
   const [status, caches] = await Promise.all([api("/admin/dario"), api("/admin/dario/prompt-caches")]);
   state.dario = status;
+  const notApplicable = status.health === "not-applicable";
+  $("#dario-status").className = notApplicable ? "dario-page-empty settings-card" : "stat-grid";
+  $("#dario-details").hidden = notApplicable;
+  $("#ping-dario").hidden = notApplicable;
+  if (notApplicable) {
+    $("#dario-status").innerHTML = darioEmptyState();
+    return;
+  }
   $("#dario-status").innerHTML = statCards([
     ["Health", status.health],
     ["Generation", status.active_generation_id],
@@ -1781,7 +1957,7 @@ async function startLogin(provider) {
 
 async function startReauth(provider, accountId) {
   clearTimeout(state.loginPoll);
-  selectView("providers", true);
+  selectView(`providers/${providerTabId(provider)}`, true);
   setLoginFlow("Starting secure re-authentication…");
   $("#provider-login-flow").scrollIntoView({ behavior: "smooth" });
   try {
@@ -2198,9 +2374,12 @@ function bindStaticEvents() {
   $("#sidebar-update").addEventListener("click", applySidebarUpdate);
   $("#quick-refresh").addEventListener("click", refreshCurrentView);
   $("#refresh-interval").addEventListener("change", setRefreshInterval);
-  $("#run-ping").addEventListener("click", testCredentials);
-  $("#test-credentials").addEventListener("click", testCredentials);
-  $("#add-provider").addEventListener("click", () => { const picker = $("#provider-picker"); picker.hidden = !picker.hidden; });
+  $("#run-ping").addEventListener("click", openCredentialPingChecks);
+  $("#test-credentials").addEventListener("click", openCredentialPingChecks);
+  $("#rerun-credential-ping").addEventListener("click", runCredentialPingChecks);
+  $("#close-credential-ping").addEventListener("click", () => $("#credential-ping-dialog").close());
+  $("#done-credential-ping").addEventListener("click", () => $("#credential-ping-dialog").close());
+  $("#add-provider").addEventListener("click", () => { const picker = $("#provider-picker"); picker.hidden = state.providerTab ? false : !picker.hidden; });
   $("#gemini-key-form").addEventListener("submit", saveGeminiKey);
   $("#openrouter-form").addEventListener("submit", saveOpenRouter);
   $("#exo-form").addEventListener("submit", probeExo);

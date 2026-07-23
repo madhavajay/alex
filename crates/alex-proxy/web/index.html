@@ -140,26 +140,27 @@
 
         <section id="providers-view" class="panel settings-panel" data-panel hidden>
           <div class="panel-head"><div><h2>Providers</h2><p>Usage, accounts, quotas, routing, API keys, and local models</p></div><div class="head-actions"><button id="test-credentials">Run ping checks</button><button id="add-provider" class="primary">Add provider</button></div></div>
-          <div id="credential-test-result" class="inline-message" hidden></div>
+          <nav id="provider-tabs" class="section-tabs" aria-label="Provider sections"></nav>
           <article class="settings-card analytics-card"><div class="card-heading"><div><span class="section-kicker">LAST 24 HOURS</span><h3>Traffic by account</h3></div><div id="analytics-total" class="mono muted"></div></div><div id="usage-share" class="usage-share"></div><div id="usage-chart" class="chart"></div></article>
           <div id="provider-picker" class="provider-grid" hidden></div>
           <div id="provider-login-flow" class="login-flow" hidden aria-live="polite"></div>
           <div id="provider-accounts" class="account-list"></div>
-          <article class="settings-card">
+          <article id="provider-setup" class="settings-card">
             <div class="section-label first">API-KEY & LOCAL PROVIDERS</div>
-            <details><summary>Gemini API key</summary><form id="gemini-key-form" class="form-grid"><label>Google AI Studio API key<input name="key" type="password" required autocomplete="off"></label><button class="primary">Save API key</button></form></details>
-            <details><summary>Import existing CLI credentials</summary><p class="setting-caption">Discovery is read-only. Alex imports only after you review and confirm a detected source.</p><div id="import-candidates" class="mini-list"></div><button id="refresh-imports" type="button">Scan for credentials</button></details>
-            <details><summary>OpenRouter</summary><form id="openrouter-form" class="form-grid"><label>Display name<input name="display_name" value="default"></label><label>API key<input name="key" type="password" required autocomplete="off"></label><label>HTTP-Referer (optional)<input name="http_referer"></label><label>X-Title (optional)<input name="x_title"></label><button class="primary">Save key</button></form><div id="openrouter-models"></div></details>
-            <details><summary>Exo local inference</summary><form id="exo-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:52415" required></label><button>Check endpoint</button></form><div id="exo-result"></div></details>
-            <details><summary>CLIProxyAPI</summary><form id="cliproxyapi-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:8317/v1" required></label><label>Credential<input name="credential" type="password" required autocomplete="off"></label><button class="primary">Probe and connect</button></form><div id="cliproxyapi-result" hidden></div></details>
+            <details data-provider-setup="gemini"><summary>Gemini API key</summary><form id="gemini-key-form" class="form-grid"><label>Google AI Studio API key<input name="key" type="password" required autocomplete="off"></label><button class="primary">Save API key</button></form></details>
+            <details data-provider-setup="amp"><summary>Import existing CLI credentials</summary><p class="setting-caption">Discovery is read-only. Alex imports only after you review and confirm a detected source.</p><div id="import-candidates" class="mini-list"></div><button id="refresh-imports" type="button">Scan for credentials</button></details>
+            <details data-provider-setup="openrouter"><summary>OpenRouter</summary><form id="openrouter-form" class="form-grid"><label>Display name<input name="display_name" value="default"></label><label>API key<input name="key" type="password" required autocomplete="off"></label><label>HTTP-Referer (optional)<input name="http_referer"></label><label>X-Title (optional)<input name="x_title"></label><button class="primary">Save key</button></form><div id="openrouter-models"></div></details>
+            <details data-provider-setup="exo"><summary>Exo local inference</summary><form id="exo-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:52415" required></label><button>Check endpoint</button></form><div id="exo-result"></div></details>
+            <details data-provider-setup="cliproxyapi"><summary>CLIProxyAPI</summary><form id="cliproxyapi-form" class="form-grid"><label>Endpoint URL<input name="url" type="url" value="http://127.0.0.1:8317/v1" required></label><label>Credential<input name="credential" type="password" required autocomplete="off"></label><button class="primary">Probe and connect</button></form><div id="cliproxyapi-result" hidden></div></details>
           </article>
         </section>
 
         <section id="harnesses-view" class="panel settings-panel" data-panel hidden>
           <div class="panel-head"><div><h2>Harnesses</h2><p>Connect coding tools, refresh model catalogs, and capture tool calls</p></div><button id="refresh-harnesses">Refresh detection</button></div>
+          <nav id="harness-tabs" class="section-tabs" aria-label="Harness sections"></nav>
           <div id="harness-summary" class="stat-grid"></div>
           <div id="harness-list" class="harness-list"></div>
-          <article class="settings-card"><div class="section-label first">REMOTE & ADVANCED</div><div class="setting-row"><div><strong>Remote harness</strong><small>Use a scoped key from Credentials and point the tool at this Alex URL</small></div><button data-go="credentials">Create connection key</button></div><div class="setting-row"><div><strong>Config overrides</strong><small>Binary and config-directory overrides are available inside each detected harness card</small></div></div></article>
+          <article id="harness-advanced" class="settings-card"><div class="section-label first">REMOTE & ADVANCED</div><div class="setting-row"><div><strong>Remote harness</strong><small>Use a scoped key from Credentials and point the tool at this Alex URL</small></div><button data-go="credentials">Create connection key</button></div><div class="setting-row"><div><strong>Config overrides</strong><small>Binary and config-directory overrides are available inside each detected harness card</small></div></div></article>
         </section>
 
         <section id="credentials-view" class="panel settings-panel" data-panel hidden>
@@ -182,7 +183,7 @@
         <section id="dario-view" class="panel settings-panel" data-panel hidden>
           <div class="panel-head"><div><h2>Dario</h2><p>Claude subscription runtime, generations, and prompt caches</p></div><div class="head-actions"><button id="ping-dario">Ping runtime</button><button id="refresh-dario">Refresh</button></div></div>
           <div id="dario-status" class="stat-grid"></div>
-          <article class="settings-card"><div class="section-label first">ROUTING</div><div id="dario-routing" class="setting-details"></div><div class="section-label">GENERATIONS</div><div class="table-wrap"><table><thead><tr><th>Generation</th><th>Version</th><th>Phase</th><th>Port</th><th>PID</th><th>Busy</th><th>Age</th></tr></thead><tbody id="dario-generations"></tbody></table></div><div class="section-label">PROMPT CACHE</div><div id="dario-caches" class="cache-list"></div><div class="section-label">RUNTIME</div><pre id="dario-runtime" class="console"></pre></article>
+          <article id="dario-details" class="settings-card"><div class="section-label first">ROUTING</div><div id="dario-routing" class="setting-details"></div><div class="section-label">GENERATIONS</div><div class="table-wrap"><table><thead><tr><th>Generation</th><th>Version</th><th>Phase</th><th>Port</th><th>PID</th><th>Busy</th><th>Age</th></tr></thead><tbody id="dario-generations"></tbody></table></div><div class="section-label">PROMPT CACHE</div><div id="dario-caches" class="cache-list"></div><div class="section-label">RUNTIME</div><pre id="dario-runtime" class="console"></pre></article>
         </section>
 
         <section id="middleware-view" class="panel settings-panel" data-panel hidden>
@@ -235,6 +236,12 @@
     </main>
   </div>
 
+  <dialog id="credential-ping-dialog" class="credential-ping-dialog" aria-labelledby="credential-ping-title">
+    <div class="credential-ping-head"><div><span class="section-kicker">PROVIDERS</span><h2 id="credential-ping-title">Credential ping checks</h2></div><button id="close-credential-ping" class="dialog-close" aria-label="Close credential ping checks">×</button></div>
+    <p id="credential-ping-summary" class="credential-ping-summary" role="status"></p>
+    <div id="credential-ping-rows" class="credential-ping-rows"></div>
+    <div class="credential-ping-actions"><button id="rerun-credential-ping">Re-run checks</button><button id="done-credential-ping" class="primary">Close</button></div>
+  </dialog>
   <div id="toast" class="toast" hidden role="status"></div>
   <noscript><p class="noscript">Alex is running, but the control plane requires JavaScript. Use <code>alex status</code> from a terminal.</p></noscript>
   <script src="/ui/app.js" defer></script>

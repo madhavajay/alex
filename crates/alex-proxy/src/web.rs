@@ -246,8 +246,13 @@ mod tests {
         for id in [
             "provider-accounts",
             "provider-picker",
+            "provider-tabs",
             "harness-list",
+            "harness-tabs",
             "credential-inventory",
+            "credential-ping-dialog",
+            "credential-ping-summary",
+            "credential-ping-rows",
             "dario-runtime",
             "dario-generations",
             "dario-caches",
@@ -349,7 +354,29 @@ mod tests {
         assert_eq!(INDEX.matches("data-onboarding-step=").count(), 8);
         assert!(!INDEX.contains("<span class=\"nav-icon\">"));
         assert!(INDEX.contains("id=\"cliproxyapi-form\""));
+        assert!(INDEX.contains("<dialog id=\"credential-ping-dialog\""));
+        assert!(!INDEX.contains("credential-test-result"));
         assert_eq!(INDEX.matches("data-refresh-card").count(), 5);
+
+        // Nested settings destinations stay deep-linkable while their bare
+        // hashes retain the all-items view. Credential checks use one shared
+        // native modal from both dashboard and provider entry points.
+        assert!(APP_JS.contains("providerTab: null"));
+        assert!(APP_JS.contains("harnessTab: null"));
+        assert!(APP_JS.contains(
+            "\"pi\", \"claude\", \"codex\", \"grok\", \"amp\", \"gemini\", \"opencode\""
+        ));
+        assert!(APP_JS.contains("renderSectionTabs"));
+        assert!(APP_JS.contains("encodeURIComponent(section)"));
+        assert!(APP_JS.contains("not checked yet"));
+        assert!(APP_JS.contains("#providers/claude"));
+        assert!(STYLES.contains(".section-tabs{position:sticky"));
+        assert!(STYLES.contains(".credential-ping-dialog::backdrop"));
+        let open_ping = javascript_function(APP_JS, "openCredentialPingChecks");
+        assert!(open_ping.contains("showModal"));
+        let run_ping = javascript_function(APP_JS, "runCredentialPingChecks");
+        assert!(run_ping.contains("/admin/accounts/test"));
+        assert!(run_ping.contains("renderCredentialPingRows"));
 
         // The bootstrap key is page-memory only. The sole browser-persisted
         // preference is the harmless refresh cadence.
