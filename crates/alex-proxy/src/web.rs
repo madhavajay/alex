@@ -239,6 +239,7 @@ mod tests {
             "dashboard",
             "traces",
             "general",
+            "updates",
             "providers",
             "harnesses",
             "credentials",
@@ -260,6 +261,9 @@ mod tests {
             "dashboard-harnesses",
             "dashboard-dario",
             "dashboard-traces",
+            "update-versions",
+            "update-status-detail",
+            "update-confirm-dialog",
         ] {
             assert_html_id(id);
         }
@@ -382,6 +386,7 @@ mod tests {
         assert!(!INDEX.contains("<span class=\"nav-icon\">"));
         assert!(INDEX.contains("id=\"cliproxyapi-form\""));
         assert!(INDEX.contains("<dialog id=\"credential-ping-dialog\""));
+        assert!(INDEX.contains("<dialog id=\"update-confirm-dialog\""));
         assert!(!INDEX.contains("credential-test-result"));
         assert_eq!(INDEX.matches("data-refresh-card").count(), 5);
 
@@ -404,6 +409,12 @@ mod tests {
         let run_ping = javascript_function(APP_JS, "runCredentialPingChecks");
         assert!(run_ping.contains("/admin/accounts/test"));
         assert!(run_ping.contains("renderCredentialPingRows"));
+        let refresh_updates = javascript_function(APP_JS, "refreshUpdateState");
+        assert!(refresh_updates.contains("/admin/update"));
+        assert!(refresh_updates.contains("/health"));
+        let install_update = javascript_function(APP_JS, "installUpdate");
+        assert!(install_update.contains("method: \"POST\""));
+        assert!(install_update.contains("waitForUpdatedDaemon"));
 
         // The bootstrap key is page-memory only. Browser persistence is
         // limited to harmless presentation preferences.

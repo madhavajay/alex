@@ -28,6 +28,7 @@ const ONBOARDING_STEP_TITLES = [
   "Beyond single provider",
 ];
 const REFRESH_STORAGE_KEY = "alex.web.refresh-seconds";
+const ALEX_RELEASES_URL = "https://github.com/madhavajay/alex/releases";
 const PROVIDERS = [
   ["claude", "Anthropic", "oauth"],
   ["codex", "OpenAI", "oauth"],
@@ -100,7 +101,8 @@ const VIEW_COPY = {
   onboarding: ["Onboarding", "Set up Alex in a few small steps"],
   dashboard: ["Dashboard", "Daemon, providers, tools, and recent activity"],
   traces: ["Trace Browser", "Body-safe request inspection"],
-  general: ["General", "Daemon, updates, storage, and web access"],
+  general: ["General", "Daemon, storage, and web access"],
+  updates: ["Updates", "Versions, release channel, and safe installation"],
   providers: ["Providers", "Accounts, usage, quotas, and routing"],
   harnesses: ["Harnesses", "Connect and configure coding tools"],
   credentials: ["Credentials", "Scoped access and outbound credential status"],
@@ -130,6 +132,9 @@ const state = {
   limits: null,
   dario: null,
   update: null,
+  updateCheckedAt: null,
+  updateInstalling: false,
+  updateOutcome: null,
   middleware: null,
   fixtures: [],
   cliproxyapi: null,
@@ -224,38 +229,49 @@ const errorMessage = (payload, response) => {
 };
 
 async function api(path, options = {}) {
+  const { suppressSessionRecovery = false, ...fetchOptions } = options;
   const headers = new Headers(options.headers || {});
   if (state.adminKey && !state.sessionAuthenticated) headers.set("x-api-key", state.adminKey);
   if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   let response;
   try {
-    response = await fetch(path, { credentials: "same-origin", ...options, headers });
+    response = await fetch(path, { credentials: "same-origin", ...fetchOptions, headers });
     state.networkFailures = 0;
   } catch {
     state.networkFailures += 1;
-    if (state.sessionAuthenticated && state.networkFailures >= 2) endExpiredSession();
-    throw new Error(state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help.");
+    if (state.sessionAuthenticated && state.networkFailures >= 2 && !suppressSessionRecovery && !state.updateInstalling) endExpiredSession();
+    throw new Error(state.updateInstalling || suppressSessionRecovery
+      ? "The daemon is restarting and is temporarily unreachable."
+      : (state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help."));
   }
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
-  if (response.status === 401 && state.sessionAuthenticated) endExpiredSession();
-  if (!response.ok) throw new Error(errorMessage(payload, response));
+  if (response.status === 401 && state.sessionAuthenticated && !suppressSessionRecovery && !state.updateInstalling) endExpiredSession();
+  if (!response.ok) {
+    const error = new Error(errorMessage(payload, response));
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
   return payload;
 }
 
 async function apiText(path, options = {}) {
+  const { suppressSessionRecovery = false, ...fetchOptions } = options;
   const headers = new Headers(options.headers || {});
   if (state.adminKey && !state.sessionAuthenticated) headers.set("x-api-key", state.adminKey);
   let response;
   try {
-    response = await fetch(path, { credentials: "same-origin", ...options, headers });
+    response = await fetch(path, { credentials: "same-origin", ...fetchOptions, headers });
     state.networkFailures = 0;
   } catch {
     state.networkFailures += 1;
-    if (state.sessionAuthenticated && state.networkFailures >= 2) endExpiredSession();
-    throw new Error(state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help.");
+    if (state.sessionAuthenticated && state.networkFailures >= 2 && !suppressSessionRecovery && !state.updateInstalling) endExpiredSession();
+    throw new Error(state.updateInstalling || suppressSessionRecovery
+      ? "The daemon is restarting and is temporarily unreachable."
+      : (state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help."));
   }
   const text = await response.text();
-  if (response.status === 401 && state.sessionAuthenticated) endExpiredSession();
+  if (response.status === 401 && state.sessionAuthenticated && !suppressSessionRecovery && !state.updateInstalling) endExpiredSession();
   if (!response.ok) {
     let payload = null;
     try { payload = JSON.parse(text); } catch { /* plain-text response */ }
@@ -834,6 +850,7 @@ async function logout() {
 const VIEW_LOADERS = {
   dashboard: loadDashboard,
   general: loadGeneral,
+  updates: loadUpdates,
   providers: loadProviders,
   harnesses: () => loadHarnesses(false),
   credentials: loadCredentials,
@@ -917,9 +934,7 @@ function setRefreshInterval(event) {
 }
 
 /* 4. Shared data loaders. */
-async function loadHealth() {
-  state.health = await api("/health");
-  const health = state.health;
+function loadHealthDisplay(health) {
   $("#daemon-status").className = "pill success";
   $("#daemon-status").textContent = `Online · ${health.version}`;
   $("#sidebar-dot").className = "status-dot ok";
@@ -927,37 +942,120 @@ async function loadHealth() {
   $("#sidebar-uptime").textContent = `daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
   $("#sidebar-version").textContent = `v${health.version}`;
   $("#about-version").textContent = health.version;
-  return health;
 }
 
 function renderSidebarUpdate(update) {
   const button = $("#sidebar-update");
   button.hidden = !update?.update_available;
-  button.title = update?.update_available ? `Update daemon to ${update.latest}` : "Daemon is up to date";
+  button.disabled = state.updateInstalling;
+  button.title = state.updateInstalling ? "Installing update; daemon restarting" : (update?.update_available ? `Review update to ${update.latest}` : "Daemon is up to date");
 }
 
-async function loadSidebarUpdate() {
-  state.update = await api("/admin/update");
+function renderDashboardUpdate(update) {
+  const banner = $("#update-banner");
+  if (!banner) return;
+  banner.hidden = !update?.update_available && !state.updateInstalling;
+  if (banner.hidden) {
+    banner.innerHTML = "";
+    return;
+  }
+  banner.innerHTML = state.updateInstalling
+    ? '<div><strong>Installing Alex update</strong><span>The daemon is restarting; this browser stays signed in.</span></div><button data-review-dashboard-update>View progress</button>'
+    : `<div><strong>Alex ${escapeHtml(update.latest)} is available</strong><span>You are running ${escapeHtml(update.current)}.</span></div><button data-review-dashboard-update>Review update</button>`;
+  $('[data-review-dashboard-update]', banner)?.addEventListener("click", () => selectView("updates", true));
+}
+
+function updateReleaseUrl(version) {
+  return version ? safeUrl(`${ALEX_RELEASES_URL}/tag/v${encodeURIComponent(version)}`) : "";
+}
+
+function renderUpdatesPage() {
+  const update = state.update;
+  const health = state.health;
+  if (!$("#updates-view") || !update || !health) return;
+
+  $("#update-versions").innerHTML = facts([
+    ["Daemon & web UI", health.version],
+  ]);
+
+  const available = Boolean(update.update_available);
+  const uncertain = !available && update.confirmed === false;
+  const current = update.current || health.version;
+  const latest = update.latest || current;
+  const title = $("#update-status-title");
+  const pill = $("#update-status-pill");
+  if (state.updateInstalling) {
+    title.textContent = "Installing… daemon restarting";
+    pill.textContent = "Installing";
+    pill.className = "pill warning";
+  } else if (available) {
+    title.textContent = `Alex ${latest} is available`;
+    pill.textContent = "Available";
+    pill.className = "pill warning";
+  } else if (uncertain) {
+    title.textContent = "Latest release could not be confirmed";
+    pill.textContent = "Unconfirmed";
+    pill.className = "pill warning";
+  } else {
+    title.textContent = `You're on the latest ${current}`;
+    pill.textContent = "Up to date";
+    pill.className = "pill success";
+  }
+
+  const checkedAt = state.updateCheckedAt || update.checked_at_ms;
+  const statusRows = [
+    ["Current version", current],
+    ["Available version", update.latest || "No newer release"],
+    ["Last checked", checkedAt ? formatTime(checkedAt) : "Not checked yet"],
+  ];
+  if (update.reason) statusRows.splice(2, 0, ["Reason", update.reason]);
+  $("#update-status-detail").innerHTML = facts(statusRows);
+  if (update.notes_url) {
+    const notesUrl = safeUrl(update.notes_url);
+    if (notesUrl) $("#update-status-detail").insertAdjacentHTML("beforeend", `<p class="update-notes"><a href="${escapeHtml(notesUrl)}" target="_blank" rel="noopener">Release notes ↗</a></p>`);
+  }
+
+  const releaseLink = $("#update-release-link");
+  const releaseUrl = updateReleaseUrl(update.latest);
+  releaseLink.hidden = !releaseUrl;
+  if (releaseUrl) releaseLink.href = releaseUrl;
+  $("#all-releases-link").href = safeUrl(ALEX_RELEASES_URL);
+  const install = $("#install-update");
+  install.hidden = !available;
+  install.disabled = state.updateInstalling;
+  install.textContent = state.updateInstalling ? "Installing… daemon restarting" : "Install update…";
+  $("#check-updates").disabled = state.updateInstalling;
+  $$("select, button", $("#update-channel-form")).forEach((control) => { control.disabled = state.updateInstalling; });
+
+  const outcome = $("#update-outcome");
+  if (state.updateOutcome) inlineMessage(outcome, state.updateOutcome.message, state.updateOutcome.kind);
+  else inlineMessage(outcome, "");
+}
+
+function renderUpdateState() {
   renderSidebarUpdate(state.update);
-  return state.update;
+  renderDashboardUpdate(state.update);
+  renderUpdatesPage();
+}
+
+async function refreshUpdateState({ markChecked = false, suppressSessionRecovery = false } = {}) {
+  const [health, update] = await Promise.all([
+    api("/health", { suppressSessionRecovery }),
+    api("/admin/update", { suppressSessionRecovery }),
+  ]);
+  state.health = health;
+  state.update = update;
+  if (markChecked) state.updateCheckedAt = Date.now();
+  loadHealthDisplay(health);
+  renderUpdateState();
+  return update;
 }
 
 async function refreshSidebarStatus() {
   const button = $("#sidebar-refresh");
   button.disabled = true;
-  try { await Promise.all([loadHealth(), loadSidebarUpdate()]); }
+  try { await refreshUpdateState({ markChecked: true }); }
   catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
-  finally { button.disabled = false; }
-}
-
-async function applySidebarUpdate() {
-  const button = $("#sidebar-update");
-  button.disabled = true;
-  try {
-    const result = await api("/admin/update", { method: "POST" });
-    toast(result.applying ? "Daemon update started. It may restart briefly." : (result.message || "Daemon is already up to date."));
-    await loadSidebarUpdate();
-  } catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
   finally { button.disabled = false; }
 }
 
@@ -982,8 +1080,8 @@ async function loadProvidersData() {
 
 async function refreshSharedData() {
   const results = await Promise.allSettled([
-    loadHealth(), loadAccounts(), loadHarnessesData(false), loadProvidersData(),
-    api("/admin/middleware"), api("/admin/analytics?since_minutes=60"), loadSidebarUpdate(),
+    refreshUpdateState(), loadAccounts(), loadHarnessesData(false), loadProvidersData(),
+    api("/admin/middleware"), api("/admin/analytics?since_minutes=60"),
   ]);
   if (results[4].status === "fulfilled") state.middleware = results[4].value;
   if (results[5].status === "fulfilled") state.analytics = results[5].value;
@@ -1033,18 +1131,16 @@ function darioEmptyState() {
 
 async function loadDashboard() {
   const requests = [
-    loadHealth(), loadAccounts(), loadHarnessesData(false),
+    refreshUpdateState(), loadAccounts(), loadHarnessesData(false),
     api("/admin/analytics?since_minutes=60"), api("/admin/analytics?since_minutes=1440"),
-    api("/admin/limits"), api("/admin/dario"), api("/admin/update"),
+    api("/admin/limits"), api("/admin/dario"),
     api(`/traces/summaries?limit=6`),
   ];
-  const [health, accounts, harnesses, hour, day, limits, darioResult, update, traces] = await Promise.allSettled(requests);
+  const [health, accounts, harnesses, hour, day, limits, darioResult, traces] = await Promise.allSettled(requests);
   if (health.status === "rejected") throw health.reason;
   state.analytics = hour.status === "fulfilled" ? hour.value : state.analytics;
   state.limits = limits.status === "fulfilled" ? limits.value : { providers: [] };
   state.dario = darioResult.status === "fulfilled" ? darioResult.value : null;
-  state.update = update.status === "fulfilled" ? update.value : null;
-  renderSidebarUpdate(state.update);
   const hourTotals = analyticsTotals(hour.value);
   const dayTotals = analyticsTotals(day.value);
   $("#dashboard-lede").textContent = `Alex ${state.health.version} has been online ${formatAge(state.health.uptime_s)} with ${formatInteger(state.health.in_flight)} request${state.health.in_flight === 1 ? "" : "s"} in flight.`;
@@ -1054,10 +1150,7 @@ async function loadDashboard() {
     ["24h cost", formatMoney(dayTotals.cost), "Recorded estimate"],
     ["In flight", formatInteger(state.health.in_flight), `Uptime ${formatAge(state.health.uptime_s)}`],
   ]);
-  const banner = $("#update-banner");
-  banner.hidden = !state.update?.update_available;
-  banner.innerHTML = state.update?.update_available ? `<div><strong>Alex ${escapeHtml(state.update.latest)} is available</strong><span>You are running ${escapeHtml(state.update.current)}.</span></div><button data-apply-dashboard-update>Review update</button>` : "";
-  $('[data-apply-dashboard-update]', banner)?.addEventListener("click", () => selectView("general", true));
+  renderDashboardUpdate(state.update);
   renderLimits($("#dashboard-limits"), state.limits.providers || []);
   $("#dashboard-accounts").innerHTML = compactAccounts(state.accounts);
   bindAccountActions($("#dashboard-accounts"));
@@ -1071,15 +1164,10 @@ async function loadDashboard() {
 /* 6. Settings destinations: General, Providers, Harnesses, Credentials, Dario,
  * Middleware, and Notifications. */
 async function loadGeneral() {
-  const [health, storage, update, channel] = await Promise.allSettled([
-    loadHealth(), api("/admin/storage"), api("/admin/update"), api("/admin/update/channel"),
+  const [health, storage] = await Promise.allSettled([
+    refreshUpdateState(), api("/admin/storage"),
   ]);
   if (health.status === "rejected") throw health.reason;
-  state.update = update.status === "fulfilled" ? update.value : null;
-  renderSidebarUpdate(state.update);
-  const updateSummary = $("#update-summary");
-  updateSummary.textContent = state.update ? `${state.update.current}${state.update.update_available ? ` → ${state.update.latest} available` : " is current"}` : (update.reason?.message || "Update status unavailable");
-  if (channel.status === "fulfilled") $("#update-form").elements.channel.value = channel.value.channel;
   $("#daemon-settings").innerHTML = facts([
     ["Version", state.health.version],
     ["Uptime", formatAge(state.health.uptime_s)],
@@ -1094,25 +1182,99 @@ async function loadGeneral() {
   $("#storage-summary").innerHTML = storage.status === "fulfilled" ? facts(Object.entries(storage.value || {}).map(([key, value]) => [key.replaceAll("_", " "), typeof value === "object" ? JSON.stringify(value) : value])) : `<p class="inline-message danger">${escapeHtml(storage.reason?.message || "Storage status unavailable")}</p>`;
 }
 
+async function loadUpdates() {
+  const [update, channel] = await Promise.allSettled([
+    refreshUpdateState(),
+    api("/admin/update/channel"),
+  ]);
+  if (update.status === "rejected") throw update.reason;
+  const selectedChannel = channel.status === "fulfilled" ? channel.value.channel : state.update?.update_channel;
+  if (selectedChannel) $("#update-channel-form").elements.channel.value = selectedChannel;
+  renderUpdatesPage();
+}
+
+async function checkForUpdates() {
+  const button = $("#check-updates");
+  button.disabled = true;
+  state.updateOutcome = null;
+  renderUpdatesPage();
+  try {
+    await refreshUpdateState({ markChecked: true });
+    toast(state.update?.update_available ? `Alex ${state.update.latest} is available.` : "Update check completed.");
+  } catch (error) {
+    state.updateOutcome = { kind: "danger", message: error.message };
+    renderUpdatesPage();
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function submitUpdateChannel(event) {
   event.preventDefault();
   const channel = new FormData(event.currentTarget).get("channel");
   try {
     await api("/admin/update/channel", { method: "POST", body: JSON.stringify({ channel }) });
     toast(`Update channel set to ${channel}.`);
-    await loadGeneral();
+    state.updateOutcome = null;
+    await refreshUpdateState({ markChecked: true });
   } catch (error) { toast(error.message, "danger"); }
 }
 
-async function applyUpdate() {
-  const button = $("#apply-update");
-  button.disabled = true;
+function openUpdateConfirmation() {
+  if (!state.update?.update_available || state.updateInstalling) return;
+  const current = state.update.current || state.health?.version || "current";
+  const latest = state.update.latest || "latest";
+  $("#update-confirm-title").textContent = `Install ${current} → ${latest}?`;
+  $("#update-confirm-copy").textContent = `Install ${current} → ${latest}? The daemon restarts; this browser stays signed in.`;
+  $("#update-confirm-dialog").showModal();
+}
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForUpdatedDaemon(targetVersion, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastVersion = state.health?.version;
+  let sawUnavailable = false;
+  while (Date.now() < deadline) {
+    await wait(1000);
+    try {
+      const health = await api("/health", { suppressSessionRecovery: true });
+      lastVersion = health.version;
+      if (health.version === targetVersion) return health;
+    } catch {
+      sawUnavailable = true;
+    }
+  }
+  const restartDetail = sawUnavailable ? "The daemon restarted" : "No restart was observed";
+  throw new Error(`${restartDetail}, but version ${targetVersion} did not return within 60 seconds${lastVersion ? ` (last response: ${lastVersion})` : ""}.`);
+}
+
+async function installUpdate() {
+  $("#update-confirm-dialog").close();
+  const targetVersion = state.update?.latest;
+  if (!targetVersion || state.updateInstalling) return;
+  state.updateInstalling = true;
+  state.updateOutcome = null;
+  renderUpdateState();
   try {
     const result = await api("/admin/update", { method: "POST" });
-    toast(result.applying ? "Update started. The daemon may restart." : (result.message || "Update check completed."));
-    await loadGeneral();
-  } catch (error) { toast(error.message, "danger"); }
-  finally { button.disabled = false; }
+    if (!result.applying) {
+      await refreshUpdateState({ markChecked: true, suppressSessionRecovery: true });
+      state.updateOutcome = { kind: "success", message: `Alex ${state.health.version} is already up to date.` };
+      return;
+    }
+    await waitForUpdatedDaemon(targetVersion);
+    await refreshUpdateState({ markChecked: true, suppressSessionRecovery: true });
+    if (state.health.version !== targetVersion) throw new Error(`The daemon returned on ${state.health.version}; expected ${targetVersion}.`);
+    state.updateOutcome = { kind: "success", message: `Update installed successfully. Alex ${state.health.version} is running.` };
+    toast(`Alex ${state.health.version} installed successfully.`);
+  } catch (error) {
+    await refreshUpdateState({ markChecked: true, suppressSessionRecovery: true }).catch(() => {});
+    state.updateOutcome = { kind: "danger", message: `Update failed: ${error.payload?.reason || error.message}` };
+  } finally {
+    state.updateInstalling = false;
+    renderUpdateState();
+  }
 }
 
 async function pruneStorage(event) {
@@ -2863,7 +3025,7 @@ function bindStaticEvents() {
   $("#mobile-menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
   $("#global-refresh").addEventListener("click", refreshCurrentView);
   $("#sidebar-refresh").addEventListener("click", refreshSidebarStatus);
-  $("#sidebar-update").addEventListener("click", applySidebarUpdate);
+  $("#sidebar-update").addEventListener("click", () => selectView("updates", true));
   $("#quick-refresh").addEventListener("click", refreshCurrentView);
   $("#refresh-interval").addEventListener("change", setRefreshInterval);
   $("#run-ping").addEventListener("click", openCredentialPingChecks);
@@ -2892,8 +3054,11 @@ function bindStaticEvents() {
   $("#validate-telegram").addEventListener("click", () => notificationAction("validate"));
   $("#discover-telegram").addEventListener("click", () => notificationAction("discover"));
   $("#test-telegram").addEventListener("click", () => notificationAction("test"));
-  $("#update-form").addEventListener("submit", submitUpdateChannel);
-  $("#apply-update").addEventListener("click", applyUpdate);
+  $("#check-updates").addEventListener("click", checkForUpdates);
+  $("#update-channel-form").addEventListener("submit", submitUpdateChannel);
+  $("#install-update").addEventListener("click", openUpdateConfirmation);
+  $("#cancel-update-install").addEventListener("click", () => $("#update-confirm-dialog").close());
+  $("#confirm-update-install").addEventListener("click", installUpdate);
   $("#storage-prune-form").addEventListener("submit", pruneStorage);
   $("#refresh-traces").addEventListener("click", () => loadTraces(false));
   $("#more-traces").addEventListener("click", () => loadTraces(true));

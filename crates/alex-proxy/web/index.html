@@ -47,6 +47,7 @@
         <button data-view="traces"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18V6m0 6h5l3-6 4 12 2-6h2"/></svg>Trace Browser</button>
         <p class="nav-label">Settings</p>
         <button data-view="general"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>General</button>
+        <button data-view="updates"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5"/><path d="M5 18v3h14v-3"/></svg>Updates</button>
         <button data-view="providers"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="12" r="4"/><circle cx="16" cy="8" r="4"/><circle cx="16" cy="16" r="4"/></svg>Providers</button>
         <button data-view="harnesses"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3m5 0h5"/></svg>Harnesses</button>
         <button data-view="credentials"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8m-3 3 2 2m-5 1 2 2"/></svg>Credentials</button>
@@ -58,7 +59,7 @@
         <span id="sidebar-dot" class="status-dot pending"></span>
         <div class="daemon-copy"><strong id="sidebar-status">Connecting</strong><small id="sidebar-uptime">Local daemon</small></div>
         <button id="sidebar-refresh" class="sidebar-icon-button" title="Refresh daemon status" aria-label="Refresh daemon status"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
-        <button id="sidebar-update" class="sidebar-icon-button update" title="Update Alex daemon" aria-label="Update Alex daemon" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg></button>
+        <button id="sidebar-update" class="sidebar-icon-button update" title="Review Alex update" aria-label="Review Alex update" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg></button>
       </div>
     </aside>
 
@@ -108,7 +109,7 @@
         </section>
 
         <section id="general-view" class="panel settings-panel" data-panel hidden>
-          <div class="panel-head"><div><h2>General</h2><p>Daemon, update, browser, storage, and platform preferences</p></div></div>
+          <div class="panel-head"><div><h2>General</h2><p>Daemon, browser, storage, and platform preferences</p></div></div>
           <div class="settings-card">
             <div class="section-label first">SETUP</div>
             <div class="setting-row"><div><strong>Run Onboarding Tutorial</strong><small>Walk from your first provider through traces, credentials, notifications, and failover</small></div><button id="restart-onboarding" class="primary">✦ Run Tutorial</button></div>
@@ -123,7 +124,7 @@
             <div class="setting-row platform-row"><div><strong>Launch at login</strong><small>Managed by the installed tray or macOS app on the daemon machine</small></div><span class="pill neutral">Platform local</span></div>
             <div class="setting-row platform-row"><div><strong>Open commands in</strong><small>Terminal selection is managed by the native app</small></div><span class="pill neutral">Platform local</span></div>
             <div class="section-label">UPDATES</div>
-            <form id="update-form" class="setting-form"><div><strong>Release channel</strong><small id="update-summary">Loading update state…</small></div><div class="inline-fields"><select name="channel"><option value="stable">Stable</option><option value="beta">Beta</option></select><button>Save channel</button><button id="apply-update" class="primary" type="button">Check / apply</button></div></form>
+            <div class="setting-row"><div><strong>Software updates</strong><small>Choose a release channel, check versions, and install with confirmation</small></div><button data-go="updates">Updates →</button></div>
             <div class="section-label">DAEMON & NETWORK</div>
             <div id="daemon-settings" class="setting-details"></div>
             <div class="setting-row"><div><strong>Network exposure</strong><small>Binding changes remain CLI/native-managed because changing them can cut off this browser</small></div><span id="network-exposure" class="pill warning">Checking</span></div>
@@ -136,6 +137,25 @@
             <div class="section-label">ABOUT</div>
             <div class="setting-row"><div><strong>Alex</strong><small>Local-first LLM subscription router</small></div><span id="about-version" class="mono">—</span></div>
           </div>
+        </section>
+
+        <section id="updates-view" class="panel settings-panel" data-panel hidden>
+          <div class="panel-head"><div><h2>Updates</h2><p>Review versions and install Alex releases safely</p></div><button id="check-updates">Check for updates</button></div>
+          <article class="settings-card update-versions-card">
+            <div class="section-label first">VERSIONS</div>
+            <div id="update-versions" class="setting-details"></div>
+            <form id="update-channel-form" class="setting-form"><div><strong>Update channel</strong><small>Stable receives production releases; beta includes previews</small></div><div class="inline-fields"><select name="channel"><option value="stable">Stable</option><option value="beta">Beta</option></select><button>Save channel</button></div></form>
+          </article>
+          <article class="settings-card update-status-card">
+            <div class="update-card-heading"><div><span class="section-kicker">UPDATE STATUS</span><h3 id="update-status-title">Loading update status…</h3></div><span id="update-status-pill" class="pill neutral">Checking</span></div>
+            <div id="update-status-detail" class="update-status-detail" aria-live="polite"></div>
+            <div id="update-outcome" class="inline-message" hidden role="status"></div>
+            <div class="update-actions">
+              <a id="update-release-link" class="button-link" target="_blank" rel="noopener" hidden>View release on GitHub</a>
+              <a id="all-releases-link" class="button-link" target="_blank" rel="noopener">All releases</a>
+              <button id="install-update" class="primary" hidden>Install update…</button>
+            </div>
+          </article>
         </section>
 
         <section id="providers-view" class="panel settings-panel" data-panel hidden>
@@ -255,6 +275,14 @@
     <p id="credential-ping-summary" class="credential-ping-summary" role="status"></p>
     <div id="credential-ping-rows" class="credential-ping-rows"></div>
     <div class="credential-ping-actions"><button id="rerun-credential-ping">Re-run checks</button><button id="done-credential-ping" class="primary">Close</button></div>
+  </dialog>
+  <dialog id="update-confirm-dialog" class="update-confirm-dialog" aria-labelledby="update-confirm-title">
+    <div class="update-confirm-body">
+      <span class="section-kicker">SOFTWARE UPDATE</span>
+      <h2 id="update-confirm-title">Install update?</h2>
+      <p id="update-confirm-copy"></p>
+      <div class="update-confirm-actions"><button id="cancel-update-install">Cancel</button><button id="confirm-update-install" class="primary">Install and restart</button></div>
+    </div>
   </dialog>
   <div id="toast" class="toast" hidden role="status"></div>
   <noscript><p class="noscript">Alex is running, but the control plane requires JavaScript. Use <code>alex status</code> from a terminal.</p></noscript>
