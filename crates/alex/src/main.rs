@@ -10915,15 +10915,22 @@ async fn up_cmd(
     // Pi's non-interactive mode does not consistently honour its persisted
     // defaultProvider across releases, so pass the connected profile explicitly
     // while retaining every user argument after it (including an override).
-    let mut launch_args = if harness == "pi" {
-        vec![
+    // Claude only reads the Alex profile when told to; a plain `claude` exec
+    // would use the user's own settings and report Alex as not configured.
+    let mut launch_args = match harness {
+        "pi" => vec![
             OsString::from("--provider"),
             OsString::from("alex"),
             OsString::from("--model"),
             OsString::from(model),
-        ]
-    } else {
-        Vec::new()
+        ],
+        "claude" => vec![
+            OsString::from("--settings"),
+            config_dir
+                .join(harness_connect::CLAUDE_PROFILE_FILE)
+                .into_os_string(),
+        ],
+        _ => Vec::new(),
     };
     launch_args.extend(args.into_iter().map(OsString::from));
     launch_harness(&binary, &launch_args)

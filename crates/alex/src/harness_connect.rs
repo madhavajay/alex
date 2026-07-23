@@ -1439,6 +1439,11 @@ pub(crate) fn write_pi_connection_with_capture(
 /// calls this after connection so its explicit default wins over a harness's
 /// usual "first catalog entry" choice.
 pub(crate) fn set_default_model(harness: &str, config_dir: &Path, model: &str) -> Result<()> {
+    if harness == "claude" {
+        // Claude gateway ids are matched raw; short_alex_model_id would
+        // mangle claude-alex/… into alex/claude-alex/….
+        return set_claude_default_model(config_dir, model);
+    }
     let model = short_alex_model_id(model);
     match harness {
         "pi" => {
@@ -1463,6 +1468,37 @@ pub(crate) fn set_default_model(harness: &str, config_dir: &Path, model: &str) -
         "codex" => set_codex_default_model(config_dir, &model),
         _ => bail!("setting a default Alex model is not yet supported for {harness}"),
     }
+}
+
+/// Claude's default model lives in the Alex profile (`alex-settings.json`)
+/// as a `claude-alex/…` gateway id. Accepts either the gateway id or the
+/// `alex/…` display id and validates against the written catalog.
+fn set_claude_default_model(config_dir: &Path, model: &str) -> Result<()> {
+    let profile_path = config_dir.join(CLAUDE_PROFILE_FILE);
+    if !claude_config_connected(config_dir)? {
+        bail!("Claude Code is not connected to Alex");
+    }
+    let catalog = read_json_object(&config_dir.join(CLAUDE_CATALOG_FILE))?;
+    let rows = catalog["models"]
+        .as_array()
+        .context("Claude Alex model catalog is missing its models list")?;
+    let gateway_id = rows
+        .iter()
+        .find_map(|row| {
+            let id = row["id"].as_str()?;
+            let display = row["display_name"].as_str().unwrap_or_default();
+            (id == model
+                || display == model
+                || id == format!("claude-alex/{}", model.strip_prefix("alex/").unwrap_or(model)))
+            .then(|| id.to_string())
+        })
+        .with_context(|| format!("{model} is not in Claude's Alex model catalog"))?;
+    let mut profile = read_json_object(&profile_path)?;
+    let object = profile
+        .as_object_mut()
+        .with_context(|| format!("{} must contain a JSON object", profile_path.display()))?;
+    object.insert("model".into(), json!(gateway_id));
+    atomic_write_json(&profile_path, &profile)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -5588,6 +5624,43 @@ mod tests {
             preferred_claude_model_for_providers(&models, Some(&connected)),
             "claude-alex/kimi-for-coding"
         );
+    }
+
+    #[test]
+    fn claude_default_model_can_be_set_after_connect() {
+        let dir = tmpdir("claude-set-default");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_claude_connection(
+            dir.clone(),
+            "http://192.168.1.150:4100".into(),
+            "rk-provided".into(),
+            "alxk-test".into(),
+            vec!["alex/gpt-5.6-sol".into(), "alex/claude-sonnet-5".into()],
+            Some("2.0.0".into()),
+        )
+        .unwrap();
+
+        // Accepts alex/, bare, and gateway ids; writes the gateway id.
+        for input in [
+            "alex/claude-sonnet-5",
+            "claude-sonnet-5",
+            "claude-alex/claude-sonnet-5",
+        ] {
+            set_default_model("claude", &dir, input).unwrap();
+            let profile = read_json_object(&dir.join(CLAUDE_PROFILE_FILE)).unwrap();
+            assert_eq!(
+                profile["model"].as_str(),
+                Some("claude-alex/claude-sonnet-5"),
+                "input {input}"
+            );
+        }
+
+        let unknown = set_default_model("claude", &dir, "alex/not-a-model");
+        assert!(unknown
+            .unwrap_err()
+            .to_string()
+            .contains("not in Claude's Alex model catalog"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]

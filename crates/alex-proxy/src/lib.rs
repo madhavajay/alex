@@ -9116,6 +9116,19 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// A missing account is configuration, not a transient upstream failure.
+/// 502 makes client SDKs retry for tens of seconds before showing the fix;
+/// 403 is non-retryable in the Anthropic/OpenAI/Gemini SDKs, so the
+/// `run \`alex auth\`` hint surfaces immediately.
+fn account_selection_error(e: anyhow::Error) -> (StatusCode, String) {
+    let message = e.to_string();
+    if message.contains("no active") && message.contains("account") {
+        (StatusCode::FORBIDDEN, message)
+    } else {
+        (StatusCode::BAD_GATEWAY, message)
+    }
+}
+
 fn client_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
@@ -9436,7 +9449,7 @@ async fn plan_upstream(
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
                     .await
-                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    .map_err(account_selection_error)?;
                 (
                     upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
                     account,
@@ -9458,7 +9471,7 @@ async fn plan_upstream(
                         .vault
                         .account_for_excluding(provider, true, excluded_accounts)
                         .await
-                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                        .map_err(account_selection_error)?;
                     (
                         upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
                         account,
@@ -9503,7 +9516,7 @@ async fn plan_upstream(
                                 .vault
                                 .account_for_excluding(provider, true, excluded_accounts)
                                 .await
-                                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                                .map_err(account_selection_error)?;
                             (
                                 active.base_url.trim_end_matches('/').to_string(),
                                 attribution_account,
@@ -9591,7 +9604,7 @@ async fn plan_upstream(
                     preferred.is_some() && !policy.allow_mid_thread_failover,
                 )
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let oauth = account.kind == "oauth";
             let openai_base = if oauth {
                 codex_upstream_base(state)
@@ -9738,7 +9751,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let extra_headers = vec![
                 ("x-grok-model-override".into(), routed_model.to_string()),
                 ("x-grok-conv-id".into(), trace_id.to_string()),
@@ -9800,7 +9813,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let raw_base = account
                 .account_meta
                 .get("api_base")
@@ -9889,7 +9902,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             match format {
                 ClientFormat::OpenaiChat => {
                     body_json["model"] = json!(routed_model);
@@ -9972,7 +9985,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             match format {
                 ClientFormat::OpenaiChat => {
                     body_json["model"] = json!(routed_model);
@@ -10034,7 +10047,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let (gemini_req, respond_as) = match format {
                 ClientFormat::GeminiGenerate => {
                     let mut g = body_json.clone();
@@ -16377,6 +16390,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn missing_account_maps_to_forbidden_not_bad_gateway() {
+        let (status, message) = account_selection_error(anyhow::anyhow!(
+            "no active anthropic account; run `alex auth import`"
+        ));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("alex auth"));
+
+        let (status, _) =
+            account_selection_error(anyhow::anyhow!("connection reset by upstream"));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
 
     #[test]
     fn reauth_login_tracker_dedupes_pending_and_replaces_expired_session() {
