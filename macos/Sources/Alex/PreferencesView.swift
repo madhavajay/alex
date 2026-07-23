@@ -11,6 +11,7 @@ import AlexCore
 enum PreferencesSection: String, CaseIterable, Hashable {
     case general = "General"
     case providers = "Providers"
+    case models = "Models"
     case harnesses = "Harnesses"
     case credentials = "Credentials"
     case dario = "Dario"
@@ -22,6 +23,7 @@ enum PreferencesSection: String, CaseIterable, Hashable {
         switch self {
         case .general: "gearshape"
         case .providers: "bolt"
+        case .models: "square.grid.2x2"
         case .harnesses: "terminal"
         case .credentials: "key"
         case .dario: "server.rack"
@@ -136,6 +138,8 @@ struct PreferencesView: View {
                     ProvidersPreferencesSection(
                         store: store,
                         onAuthenticate: onAuthenticate)
+                case .models:
+                    ModelsPreferencesSection(store: store)
                 case .harnesses:
                     HarnessesPreferencesSection(
                         store: store, onOpenTraceBrowser: onOpenTraceBrowser)

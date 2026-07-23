@@ -771,6 +771,21 @@ pub(crate) async fn harness_statuses(
     join_all(statuses).await.into_iter().collect()
 }
 
+/// Whether a harness's Alex-managed config marks it as connected, without a
+/// binary probe. The daemon's harness-config sync uses this to pick which
+/// configs to rewrite.
+pub(crate) fn harness_config_connected(name: &str, config_dir: &Path) -> bool {
+    match name {
+        "pi" => models_json_connected(&config_dir.join("models.json")).unwrap_or(false),
+        "claude" => claude_config_connected(config_dir).unwrap_or(false),
+        "codex" => codex_config_connected(config_dir).unwrap_or(false),
+        "grok" => grok_config_connected(config_dir).unwrap_or(false),
+        "amp" => amp_config_connected(config_dir).unwrap_or(false),
+        "kimi" => kimi_config_connected(config_dir).unwrap_or(false),
+        _ => false,
+    }
+}
+
 pub(crate) async fn harness_status(
     config: &Config,
     spec: &'static HarnessSpec,
@@ -780,15 +795,7 @@ pub(crate) async fn harness_status(
     let detection = detect_harness(config, spec).await;
     let config_dir = resolve_config_dir(config, spec, explicit_config_dir);
     let config_dir_exists = config_dir.is_dir();
-    let connected = match spec.name {
-        "pi" => models_json_connected(&config_dir.join("models.json")).unwrap_or(false),
-        "claude" => claude_config_connected(&config_dir).unwrap_or(false),
-        "codex" => codex_config_connected(&config_dir).unwrap_or(false),
-        "grok" => grok_config_connected(&config_dir).unwrap_or(false),
-        "amp" => amp_config_connected(&config_dir).unwrap_or(false),
-        "kimi" => kimi_config_connected(&config_dir).unwrap_or(false),
-        _ => false,
-    };
+    let connected = harness_config_connected(spec.name, &config_dir);
     let override_ = override_json(config.harness_overrides.get(spec.name));
     let default_route = (spec.name == "codex")
         .then(|| codex_default_route(&config_dir).ok().flatten())
@@ -5782,6 +5789,7 @@ mod tests {
             exo_url: crate::default_exo_url(),
             exo_enabled_models: Vec::new(),
             openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
+            exposed_models: None,
             gemini_project: String::new(),
             anthropic_upstream: crate::default_anthropic_upstream(),
             dario_mode_migrated: true,

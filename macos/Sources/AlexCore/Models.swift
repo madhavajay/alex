@@ -1164,6 +1164,55 @@ public struct OpenRouterCatalogResponse: Codable, Sendable, Equatable {
     }
 }
 
+/// One row of `GET /admin/models`: a published (or curated) model id, the
+/// provider it routes to, and whether it is still present upstream.
+public struct ModelAdminRow: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let provider: String?
+    public let available: Bool
+
+    public init(id: String, provider: String? = nil, available: Bool = true) {
+        self.id = id
+        self.provider = provider
+        self.available = available
+    }
+}
+
+/// `GET /admin/models`: the merged live catalog plus the curated list (in
+/// user-chosen order) for the Models settings pane.
+public struct ModelsAdminResponse: Codable, Sendable, Equatable {
+    public let catalog: [ModelAdminRow]
+    public let curationEnabled: Bool
+    public let curated: [ModelAdminRow]
+
+    enum CodingKeys: String, CodingKey {
+        case catalog
+        case curationEnabled = "curation_enabled"
+        case curated
+    }
+
+    public init(
+        catalog: [ModelAdminRow] = [], curationEnabled: Bool = false,
+        curated: [ModelAdminRow] = []
+    ) {
+        self.catalog = catalog
+        self.curationEnabled = curationEnabled
+        self.curated = curated
+    }
+}
+
+/// `POST /admin/models/check`: per-model availability after a live re-fetch.
+public struct ModelsCheckResponse: Codable, Sendable, Equatable {
+    public let checked: [ModelAdminRow]
+    public let missing: Int
+
+    public init(checked: [ModelAdminRow] = [], missing: Int = 0) {
+        self.checked = checked
+        self.missing = missing
+    }
+}
+
+
 /// `GET/POST /admin/openrouter/exposed`: the user-curated model ids that are
 /// advertised and injected into connected harnesses. `available` mirrors the
 /// catalog so a single GET can render both transfer-list columns.
