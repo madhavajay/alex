@@ -58,4 +58,31 @@ import Testing
         #expect(ProviderPresentation.paneState(for: "anthropic", accounts: [codexAccount]) == .connectAccount)
         #expect(ProviderPresentation.paneState(for: "openai", accounts: [codexAccount]) == .connected)
     }
+
+    @Test func openRouterCreditsDecodeAndMatchTheirAccount() throws {
+        let openRouter = try decode(
+            """
+            {"provider":"openrouter","account_id":"openrouter-api-key","source":"openrouter credits API","individual_credits_usd":12.34}
+            """, as: ProviderLimits.self)
+        let account = try decode(
+            """
+            {"id":"openrouter-api-key","provider":"openrouter","name":"default","kind":"api_key","paused":false,"status":"active"}
+            """, as: Account.self)
+
+        #expect(openRouter.individualCreditsUsd == 12.34)
+        #expect(openRouter.formattedIndividualCredits == "$12.34")
+        #expect(ProviderPresentation.creditBalanceText(openRouter) == "$12.34 credits")
+        #expect(ProviderPresentation.limits(for: account, in: [openRouter])?.accountId == account.id)
+    }
+
+    @Test func codexDisabledCreditsRemainWindowBarsWithoutCreditBalance() throws {
+        let codex = try decode(
+            """
+            {"provider":"openai","credits":{"has_credits":false,"unlimited":false,"balance":0},"quota":{"kind":"rate_window","label":"Rate window"},"windows":[{"window":"5h","used_pct":6},{"window":"7d","used_pct":82}]}
+            """, as: ProviderLimits.self)
+
+        #expect(codex.windows?.map(\.remainingPct) == [94, 18])
+        #expect(codex.quota?.isCreditPrimary == false)
+        #expect(ProviderPresentation.creditBalanceText(codex) == nil)
+    }
 }

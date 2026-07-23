@@ -17,7 +17,7 @@ struct MessageBubble: View {
     /// didn't carry it).
     var fetchToolBodyText: ((String, String) async -> String?)?
 
-    @State private var expandedHarnessBody = false
+    @State private var expandedHarnessBody = TranscriptPresentationDefaults.chatBodiesExpanded
 
     /// Both `.user` and `.harness` render on the left with the same gray
     /// bubble treatment ("left-side mono bubbles" — only the avatar glyph
@@ -144,9 +144,8 @@ struct MessageBubble: View {
         }
     }
 
-    /// Long harness tool-result bodies collapse to their first ~4 lines by
-    /// default, consistent with the tool-call card's collapsed-by-default
-    /// treatment; user/assistant bubbles are unaffected.
+    /// Long harness tool-result bodies can still be collapsed, but transcript
+    /// content starts open so a session is readable without opening each row.
     private var harnessLines: [Substring] {
         message.content.split(separator: "\n", omittingEmptySubsequences: false)
     }

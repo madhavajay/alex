@@ -166,7 +166,19 @@ Alex translates between Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 | --- | --- |
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/claude.png" alt="OpenAI GPT-5.6 running in Claude Code through Alex" width="500"> | **GPT-5.6 in Claude Code.** Mix OpenAI models into an Anthropic-native harness. |
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** Run Fable 5 from a compatible connected harness such as Codex. Your tokens, your choice! |
-| <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/pi.png" alt="A custom PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **PAM in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
+| <img src="https://github.com/madhavajay/pam/raw/main/assets/pi.png" alt="The PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **[PAM](https://github.com/madhavajay/pam) in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
+
+## PAM — Pi Agents Mixed
+
+[![PAM capability dial](https://github.com/madhavajay/pam/raw/main/assets/demo2.webp)](https://github.com/madhavajay/pam)
+
+[PAM](https://github.com/madhavajay/pam) is an extension for the [Pi coding harness](https://pi.dev/) with an Agent ↔ Oracle mixture-of-agents dial, inspired by Amp Code's The Dial: your primary work stays on the faster agent while a smarter, slower oracle gives second opinions. Turn it up to 11 with `Ctrl+S`.
+
+```sh
+pi install npm:@madhavajay/pam
+```
+
+PAM works with whatever providers Pi has — and works best with Alex, where a single dial can mix providers and benefit from subscription bonding, automatic failover, and middleware reroutes.
 
 A complete record of agent work.
 Requests, responses, token usage, latency, cost, sessions, subagents, requested tools, and executed tool results can all be captured locally and inspected as a coherent transcript.

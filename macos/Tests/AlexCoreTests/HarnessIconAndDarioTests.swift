@@ -260,7 +260,7 @@ import Testing
         let start = ContinuousClock.now
         let doc = TranscriptRender.document(turns: turns)
         let elapsed = start.duration(to: .now)
-        #expect(doc.length > 500 * 8000)
+        #expect(doc.length > 500 * TranscriptRender.maxTurnChars)
         #expect(elapsed < .seconds(10))
     }
 

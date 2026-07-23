@@ -128,11 +128,78 @@ import Testing
                 return Self.makeTurn(index, text: "loaded", traceId: traceId)
             })
         model.selectFromUser("paged-session")
-        try await waitUntil { await MainActor.run { model.turns.count == 24 } }
+        try await waitUntil {
+            await MainActor.run { model.turns.count == TranscriptApplyPolicy.initialTurnCount }
+        }
         let count = await spy.count
         model.stop()
-        #expect(count == 24)
-        #expect(model.hiddenTurnCount == 476)
+        #expect(count == TranscriptApplyPolicy.initialTurnCount)
+        #expect(model.hiddenTurnCount == 500 - TranscriptApplyPolicy.initialTurnCount)
+    }
+
+    @Test @MainActor func hugeTurnIsCappedAndAppliedWithinBatchBudgets() async throws {
+        let huge = String(repeating: "multi-hundred-kb payload ", count: 14_000)
+        let model = TraceBrowserModel(
+            store: SnapshotStore(),
+            transcriptPageFetcher: { sessionId, _, _ in
+                TranscriptPageResponse(
+                    sessionId: sessionId, turns: [Self.metadata(sessionId)], limit: 50,
+                    hasMore: false, nextCursor: nil)
+            },
+            traceTurnFetcher: { traceId in
+                Self.makeTurn(0, text: huge, traceId: traceId)
+            })
+        model.selectFromUser("huge-session")
+        try await waitUntil {
+            await MainActor.run {
+                model.turns.count == 1 && model.transcriptEntries.count == 2
+                    && !model.transcriptRendering
+            }
+        }
+        let turn = try #require(model.turns.first)
+        #expect(turn.user?.count == TurnTextCap.maxChars)
+        #expect(turn.assistant?.count == TurnTextCap.maxChars)
+        #expect(model.lastTurnApplyBatchCharacterCounts.count == 1)
+        #expect(model.lastTurnApplyBatchCharacterCounts.max() ?? 0
+            <= TranscriptApplyPolicy.maxCharsPerBatch)
+        #expect(model.lastChatPaneBatchCharacterCounts.count == 2)
+        #expect(model.lastChatPaneBatchCharacterCounts.max() ?? 0
+            <= TranscriptApplyPolicy.maxCharsPerBatch)
+
+        let initialTurns = (0..<TranscriptApplyPolicy.initialTurnCount).map {
+            TranscriptInlineDisplay.capped(Self.makeTurn($0, text: huge))
+        }
+        let turnBatches = TranscriptApplyPolicy.turnBatches(initialTurns)
+        #expect(turnBatches.count > 1)
+        #expect(turnBatches.allSatisfy { batch in
+            batch.reduce(0) {
+                $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+            } <= TranscriptApplyPolicy.maxCharsPerBatch
+        })
+        let document = TranscriptRender.build(turns: initialTurns)
+        let chunks = TranscriptStorageBatch.chunks(document.text)
+        #expect(chunks.allSatisfy {
+            $0.length <= TranscriptApplyPolicy.maxCharsPerBatch + 2
+        })
+        let textView = TranscriptTextView(usingTextLayoutManager: true)
+        textView.frame = NSRect(x: 0, y: 0, width: 820, height: 640)
+        textView.isVerticallyResizable = true
+        textView.textContainer?.widthTracksTextView = true
+        let layoutStart = ContinuousClock.now
+        for (index, chunk) in chunks.enumerated() {
+            if index == 0 {
+                textView.textStorage?.setAttributedString(chunk)
+            } else {
+                textView.textStorage?.append(chunk)
+            }
+        }
+        textView.invalidateBubbleRects()
+        textView.rebuildBubbleRects()
+        let layoutMs = milliseconds(layoutStart.duration(to: .now))
+        #expect(layoutMs < 100)
+        model.stop()
+        print(
+            "trace-browser huge_turn_inline_chars=\(TranscriptApplyPolicy.inlineCharacterCount(turn)) chat_batches=\(model.lastChatPaneBatchCharacterCounts.count) initial_turns=\(initialTurns.count) classic_batches=\(chunks.count) initial_window_layout_ms=\(layoutMs)")
     }
 
     @Test @MainActor func renderedArtifactCacheHitsAndCompletionChangeMisses() {
@@ -204,6 +271,30 @@ import Testing
             for: firstKey)
         #expect(cache.count == 0)
         #expect(cache.approximateByteCost == 0)
+    }
+
+    @Test func hangBreadcrumbSnapshotAndLogRotationPolicy() {
+        TraceBrowserSignpost.resetForTesting()
+        for index in 0..<(TraceBrowserSignpost.breadcrumbLimit + 4) {
+            let interval = TraceBrowserSignpost.begin(.turnFetch, "trace_id=trace-\(index)")
+            TraceBrowserSignpost.end(interval, "bytes=\(index)")
+        }
+        let active = TraceBrowserSignpost.begin(
+            .transcriptApply, "turns=7 total_chars=70000")
+        let snapshot = TraceBrowserSignpost.snapshot()
+        #expect(snapshot.breadcrumbs.count == TraceBrowserSignpost.breadcrumbLimit)
+        #expect(snapshot.active.map(\.operation) == ["transcript apply"])
+        let line = UIHangLog.formatLine(
+            timestamp: Date(timeIntervalSince1970: 0), durationMilliseconds: 825,
+            snapshot: snapshot)
+        #expect(line.contains("duration_ms=825.0"))
+        #expect(line.contains("operation=transcript apply"))
+        #expect(line.contains("turns=7 total_chars=70000"))
+        #expect(!UIHangLog.shouldRotate(fileBytes: UIHangLog.maxFileBytes))
+        #expect(UIHangLog.shouldRotate(
+            fileBytes: UIHangLog.maxFileBytes, incomingBytes: 1))
+        #expect(UIHangLog.shouldRotate(fileBytes: 8, incomingBytes: 3, limit: 10))
+        TraceBrowserSignpost.end(active)
     }
 
     @MainActor

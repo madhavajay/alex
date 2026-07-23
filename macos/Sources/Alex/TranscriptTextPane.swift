@@ -2,6 +2,26 @@ import AppKit
 import SwiftUI
 import AlexCore
 
+enum TranscriptStorageBatch {
+    static func chunks(
+        _ document: NSAttributedString,
+        maxChars: Int = TranscriptApplyPolicy.maxCharsPerBatch
+    ) -> [NSAttributedString] {
+        guard document.length > 0 else { return [document] }
+        let string = document.string as NSString
+        var chunks: [NSAttributedString] = []
+        var location = 0
+        while location < document.length {
+            let length = min(maxChars, document.length - location)
+            let proposed = NSRange(location: location, length: length)
+            let range = string.rangeOfComposedCharacterSequences(for: proposed)
+            chunks.append(document.attributedSubstring(from: range))
+            location = range.upperBound
+        }
+        return chunks
+    }
+}
+
 final class TranscriptTextView: NSTextView {
     var onTurnClick: ((Int) -> Void)?
     var selectedTurnProvider: (() -> String?)?
@@ -196,6 +216,7 @@ struct TranscriptTextPane: NSViewRepresentable {
         private var lastFindCommand = 0
         private var lastScrollToRange = 0
         private var lastSelectedTurn: String?
+        private var storageApplyTask: Task<Void, Never>?
         nonisolated(unsafe) private var observer: NSObjectProtocol?
         nonisolated(unsafe) private var keyMonitor: Any?
 
@@ -222,6 +243,7 @@ struct TranscriptTextPane: NSViewRepresentable {
         }
 
         deinit {
+            storageApplyTask?.cancel()
             if let observer { NotificationCenter.default.removeObserver(observer) }
             if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         }
@@ -287,15 +309,12 @@ struct TranscriptTextPane: NSViewRepresentable {
             syncFindBarVisible(findBarVisible)
             if let render = model.renderOp, render.version != lastVersion {
                 lastVersion = render.version
-                BarLog.measure(.browser, label: "transcript apply v\(render.version)") {
-                    switch render.op {
-                    case let .set(doc): storage.setAttributedString(doc)
-                    case let .append(doc): storage.append(doc)
-                    }
+                let previous = storageApplyTask
+                storageApplyTask = Task { [weak self] in
+                    await previous?.value
+                    guard !Task.isCancelled, let self else { return }
+                    await self.applyStorage(render, model: model)
                 }
-                textView.invalidateBubbleRects()
-                textView.rebuildBubbleRects()
-                if model.userAtBottom, !findBarVisible { scrollToBottom() }
             }
             if lastSelectedTurn != model.inspectorTraceId {
                 lastSelectedTurn = model.inspectorTraceId
@@ -315,6 +334,53 @@ struct TranscriptTextPane: NSViewRepresentable {
                 lastFindCommand = model.findCommand
                 showFindBar()
             }
+        }
+
+        private func applyStorage(
+            _ render: (version: Int, op: TraceBrowserModel.TranscriptRenderOp),
+            model: TraceBrowserModel
+        ) async {
+            guard let textView, let storage = textView.textStorage else { return }
+            let operation: String
+            let document: NSAttributedString
+            let replace: Bool
+            switch render.op {
+            case let .set(value):
+                operation = "set"
+                document = value
+                replace = true
+            case let .append(value):
+                operation = "append"
+                document = value
+                replace = false
+            }
+            let applyInterval = TraceBrowserSignpost.begin(
+                .classicPaneUpdate,
+                "operation=\(operation) total_chars=\(document.length)")
+            let chunks = TranscriptStorageBatch.chunks(document)
+            for (index, chunk) in chunks.enumerated() {
+                guard !Task.isCancelled else { return }
+                let interval = TraceBrowserSignpost.begin(
+                    .classicPaneUpdate,
+                    "operation=\(operation) batch=\(index + 1)/\(chunks.count) chars=\(chunk.length)")
+                BarLog.measure(
+                    .browser, label: "transcript apply v\(render.version) batch=\(index + 1)") {
+                    if replace && index == 0 {
+                        storage.setAttributedString(chunk)
+                    } else {
+                        storage.append(chunk)
+                    }
+                }
+                TraceBrowserSignpost.end(interval, "storage_chars=\(storage.length)")
+                textView.invalidateBubbleRects()
+                if index + 1 < chunks.count {
+                    await Task.yield()
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+            }
+            textView.rebuildBubbleRects()
+            TraceBrowserSignpost.end(applyInterval, "storage_chars=\(storage.length)")
+            if model.userAtBottom, !findBarVisible { scrollToBottom() }
         }
 
         private func scrollToBottom() {

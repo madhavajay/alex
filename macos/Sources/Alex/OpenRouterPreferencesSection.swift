@@ -36,6 +36,11 @@ struct OpenRouterPreferencesSection: View {
         ProviderPresentation.hasAccount(for: "openrouter", in: store.accounts)
     }
 
+    private var creditBalanceText: String? {
+        ProviderPresentation.creditBalanceText(
+            store.limits.first { $0.provider == "openrouter" })
+    }
+
     private var availableModels: [String] {
         OpenRouterCuration.available(catalog: catalog, exposed: exposed, search: search)
     }
@@ -93,6 +98,14 @@ struct OpenRouterPreferencesSection: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(
                         hasKey ? AlexTheme.Colors.success : AlexTheme.Colors.textSecondary)
+            }
+            if let creditBalanceText {
+                HStack(spacing: 6) {
+                    Text("💰")
+                    Text(creditBalanceText)
+                        .font(AlexTheme.Fonts.mono(11, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.success)
+                }
             }
             Text("OpenRouter uses a long-lived API key, not OAuth. The key is sent only to your local Alex daemon for encrypted vault storage; it is never displayed back.")
                 .font(.system(size: 11))

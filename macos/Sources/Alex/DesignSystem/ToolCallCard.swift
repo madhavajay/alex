@@ -21,7 +21,7 @@ struct ToolCallCard: View {
     @State private var loadingOutput = false
 
     var body: some View {
-        CollapsibleCard {
+        CollapsibleCard(initiallyExpanded: TranscriptPresentationDefaults.chatBodiesExpanded) {
             headerContent
         } expanded: {
             expandedContent

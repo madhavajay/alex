@@ -31,6 +31,20 @@ public enum ProviderPresentation {
         return limits.filter { providersWithAccounts.contains($0.provider) }
     }
 
+    public static func limits(
+        for account: Account, in limits: [ProviderLimits]
+    ) -> ProviderLimits? {
+        limits.first {
+            $0.provider == account.provider && $0.accountId == account.id
+        } ?? limits.first {
+            $0.provider == account.provider && $0.accountId == nil
+        }
+    }
+
+    public static func creditBalanceText(_ limits: ProviderLimits?) -> String? {
+        limits?.formattedIndividualCredits.map { "\($0) credits" }
+    }
+
     public static func menuProviders(
         limits: [ProviderLimits], accounts: [Account], includeAnthropicDario: Bool = false
     ) -> [String] {

@@ -7,6 +7,38 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-07-23
+
+### Added
+- **Provider credit balances are available across every client.** OpenRouter
+  and Amp API-key balances now appear in status output, Telegram, the macOS
+  menu bar, the web UI, and the TUI. Codex quota bars remain visible alongside
+  credit snapshots.
+- **Onboarding covers network exposure on macOS.** The new step explains and
+  configures dashboard access beyond localhost; web onboarding locks unrelated
+  navigation until setup completes and can open the Trace Browser in a new tab.
+- Stable GitHub releases now attach versioned Windows CLI archives and Inno
+  Setup installers, with SHA-256 files, for both x86_64 and ARM64.
+
+### Changed
+- **The macOS Trace Browser now keeps large sessions responsive.** Transcript
+  work moves off the main thread, incremental updates are batched, inline text
+  is capped, rendered artifacts are cached, and a hang watchdog records
+  diagnostics in `ui-hangs.log`.
+- Provider credentials are pinged per account so one account's result cannot
+  mask another account's state.
+- The web Trace Browser uses a more compact layout with a dedicated filters
+  toolbar; version and refresh controls moved to the footer, and the logo now
+  links to the GitHub repository.
+- The Providers page opens directly on the first provider instead of an
+  aggregate view. Dashboard passwords accept any non-empty value up to 256
+  characters.
+
+### Fixed
+- Removed the confusing newer-activity pill and improved Trace Browser forks,
+  context menus, cursor behavior, and default expansion of chat bodies.
+- Onboarding and header imagery consistently use the current header asset.
+
 ## [0.1.29] - 2026-07-22
 
 First stable release of the 0.1.29 line. It includes all changes from the

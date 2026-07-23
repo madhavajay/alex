@@ -168,7 +168,9 @@ export default async function globalSetup() {
     ].join('\n');
     const accounts = [
       { id: 'mock-anthropic', provider: 'anthropic', kind: 'api_key', name: 'mock', api_key: 'mock-anthropic-key', status: 'active' },
-      { id: 'mock-openai', provider: 'openai', kind: 'api_key', name: 'mock', api_key: 'mock-openai-key', status: 'active' }
+      { id: 'mock-openai', provider: 'openai', kind: 'api_key', name: 'mock', api_key: 'mock-openai-key', status: 'active' },
+      { id: 'mock-openrouter', provider: 'openrouter', kind: 'api_key', name: 'mock', api_key: 'mock-openrouter-key', status: 'active' },
+      { id: 'mock-amp', provider: 'amp', kind: 'api_key', name: 'mock', api_key: 'mock-amp-key', status: 'active' }
     ];
     const configPath = path.join(home, 'config.toml');
     await writeFile(configPath, config);

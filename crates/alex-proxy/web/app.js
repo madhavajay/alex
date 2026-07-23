@@ -124,7 +124,7 @@ const state = {
   accounts: [],
   providers: [],
   harnesses: [],
-  providerTab: null,
+  providerTab: PROVIDERS[0][0],
   harnessTab: null,
   providerAnalytics: null,
   providerRoutings: [],
@@ -416,7 +416,10 @@ function enterApplication() {
   }
   const requested = location.hash.slice(1);
   const requestedView = requested.split("/", 1)[0];
-  selectView(state.auth?.onboarding_completed ? (VIEW_COPY[requestedView] ? requested : "dashboard") : "onboarding", false);
+  const initialView = state.auth?.onboarding_completed
+    ? (VIEW_COPY[requestedView] ? requested : "dashboard")
+    : (requestedView === "traces" ? requested : "onboarding");
+  selectView(initialView, false, !state.auth?.onboarding_completed && requestedView === "traces");
   refreshSharedData().catch((error) => toast(error.message, "danger"));
 }
 
@@ -692,8 +695,7 @@ function renderOnboardingHarnessStages() {
   const stageOneBody = stageOneComplete ? "" : `<div class="harness-choice-grid">${cards || '<p class="muted">No installed, connectable harnesses were detected. Add one manually or skip this page and continue.</p>'}</div>${renderHarnessPlan()}<details class="manual-harness" ${state.manualHarnessResult ? "open" : ""}><summary>Add harness manually</summary><p>Choose the harness and enter its binary path. Alex saves the existing override, refreshes detection, and reports the detected version.</p><form id="manual-harness-form" class="manual-harness-form"><select name="harness" required>${manualOptions}</select><input name="binary" required placeholder="/absolute/path/to/binary" spellcheck="false"><button>Check binary</button></form><div id="manual-harness-result">${manualResult}</div></details>`;
   const command = state.selectedHarness ? harnessTestCommand(state.selectedHarness) : "";
   const stageTwoBody = stageOneComplete && !stageTwoComplete ? `<p>Use the connected profile and send one real request through Alex.</p><div class="copy-code"><code>${escapeHtml(command)}</code><button data-copy-harness-command>Copy</button></div>${operationMarkup(state.harnessTraceStatus === "failure" ? "failure" : "working", traceStatusMessage())}<button data-check-harness-trace>Check for Request</button>` : "";
-  const traceLink = safeUrl(state.selectedHarness ? `/ui/?harness=${encodeURIComponent(state.selectedHarness)}#traces` : "/ui/#traces");
-  const stageThreeBody = stageTwoComplete ? `${renderTraceSummary(state.harnessTrace)}<a class="primary button-link" href="${escapeHtml(traceLink)}" target="_blank" rel="noopener">Open Trace Browser</a><p class="micro">Opens in a new tab filtered with <code>harness:${escapeHtml(state.selectedHarness)}</code>.</p>` : '<p class="locked-copy">Complete the previous stage to unlock this one.</p>';
+  const stageThreeBody = stageTwoComplete ? `${renderTraceSummary(state.harnessTrace)}<a class="primary button-link" href="/ui#traces" target="_blank" rel="noopener">Open Trace Browser</a><p class="micro">Opens the Trace Browser in a new tab.</p>` : '<p class="locked-copy">Complete the previous stage to unlock this one.</p>';
   node.innerHTML = `<section class="onboarding-stage ${stageOneComplete ? "collapsed" : ""}">${stageHeader(1, "Pick your harness", stageOneComplete, state.harnessSummary ? `${state.harnessSummary.models_total || 0} models ready ✓` : "Connected", "change")}${stageOneBody}</section><section class="onboarding-stage ${!stageOneComplete ? "locked" : ""} ${stageTwoComplete ? "collapsed" : ""}">${stageHeader(2, "Send a test request", stageTwoComplete, stageTwoComplete ? `${state.harnessTrace.model || "alex model"} · ${finite(state.harnessTrace.input_tokens) + finite(state.harnessTrace.output_tokens)} tokens` : "")}${!stageOneComplete ? '<p class="locked-copy">Complete the previous stage to unlock this one.</p>' : stageTwoBody}</section><section class="onboarding-stage ${!stageTwoComplete ? "locked" : ""}">${stageHeader(3, "See your trace", false)}${stageThreeBody}</section>`;
   bindActions(node, "[data-onboarding-harness]", (event) => selectOnboardingHarness(event.currentTarget.dataset.onboardingHarness));
   $("[data-connect-onboarding-harness]", node)?.addEventListener("click", connectOnboardingHarness);
@@ -870,14 +872,17 @@ function viewRoute(requested) {
   return { view, section };
 }
 
-function selectView(requested, updateHash = true) {
+function selectView(requested, updateHash = true, allowOnboardingTrace = false) {
   const route = viewRoute(requested);
   let view = VIEW_COPY[route.view] ? route.view : "dashboard";
-  // Traces stays reachable mid-onboarding so "See your trace" can open it in a new tab.
-  if (!state.auth?.onboarding_completed && view !== "traces") view = "onboarding";
-  if (view === "providers") state.providerTab = route.section;
+  const onboardingLocked = !state.auth?.onboarding_completed && !(allowOnboardingTrace && view === "traces");
+  if (onboardingLocked) view = "onboarding";
+  if (view === "providers") state.providerTab = PROVIDERS.some(([id]) => id === route.section) ? route.section : PROVIDERS[0][0];
   if (view === "harnesses") state.harnessTab = route.section;
   state.currentView = view;
+  const hideNavigation = !state.auth?.onboarding_completed && view === "onboarding";
+  $(".sidebar nav").hidden = hideNavigation;
+  $("#mobile-menu").hidden = hideNavigation;
   $$('[data-panel]').forEach((panel) => { panel.hidden = panel.id !== `${view}-view`; });
   $$('nav [data-view]').forEach((button) => {
     if (button.dataset.view === view) button.setAttribute("aria-current", "page");
@@ -890,19 +895,21 @@ function selectView(requested, updateHash = true) {
   const section = view === "providers" ? state.providerTab : view === "harnesses" ? state.harnessTab : null;
   const nextHash = `#${view}${section ? `/${encodeURIComponent(section)}` : ""}`;
   if (updateHash && location.hash !== nextHash) history.pushState(null, "", nextHash);
+  else if (!updateHash && location.hash !== nextHash && (onboardingLocked || view === "providers")) history.replaceState(null, "", nextHash);
   if (view === "onboarding") showOnboardingStep(state.onboardingStep);
   VIEW_LOADERS[view]?.().catch((error) => toast(error.message, "danger"));
 }
 
 function selectSectionTab(view, id, scroll = false) {
   if (view === "providers") {
-    state.providerTab = id || null;
+    state.providerTab = PROVIDERS.some(([provider]) => provider === id) ? id : PROVIDERS[0][0];
     renderProvidersView();
   } else {
     state.harnessTab = id || null;
     renderHarnessesView(scroll);
   }
-  const nextHash = `#${view}${id ? `/${encodeURIComponent(id)}` : ""}`;
+  const section = view === "providers" ? state.providerTab : id;
+  const nextHash = `#${view}${section ? `/${encodeURIComponent(section)}` : ""}`;
   if (location.hash !== nextHash) history.pushState(null, "", nextHash);
 }
 
@@ -935,12 +942,10 @@ function setRefreshInterval(event) {
 
 /* 4. Shared data loaders. */
 function loadHealthDisplay(health) {
-  $("#daemon-status").className = "pill success";
-  $("#daemon-status").textContent = `Online · ${health.version}`;
+  $("#daemon-status").textContent = "Online";
   $("#sidebar-dot").className = "status-dot ok";
-  $("#sidebar-status").textContent = "Daemon online";
-  $("#sidebar-uptime").textContent = `daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
-  $("#sidebar-version").textContent = `v${health.version}`;
+  $("#sidebar-web-version").textContent = `Web UI v${health.version}`;
+  $("#sidebar-uptime").textContent = `Daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
   $("#about-version").textContent = health.version;
 }
 
@@ -1051,14 +1056,6 @@ async function refreshUpdateState({ markChecked = false, suppressSessionRecovery
   return update;
 }
 
-async function refreshSidebarStatus() {
-  const button = $("#sidebar-refresh");
-  button.disabled = true;
-  try { await refreshUpdateState({ markChecked: true }); }
-  catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
-  finally { button.disabled = false; }
-}
-
 async function loadAccounts() {
   const data = await api("/admin/accounts");
   state.accounts = data.accounts || [];
@@ -1110,8 +1107,18 @@ function quotaPercent(entry) {
   return windows.length ? Math.max(...windows.map((window) => clamp(window.used_pct, 0, 100))) : 0;
 }
 
+function creditBalanceText(entry) {
+  const raw = entry?.individual_credits_usd;
+  if (raw === null || raw === undefined || !Number.isFinite(Number(raw))) return null;
+  return `💰 $${Number(raw).toFixed(2)} credits`;
+}
+
 function renderLimits(node, providers) {
   node.innerHTML = providers.length ? providers.map((provider) => {
+    const credits = creditBalanceText(provider);
+    if (credits) {
+      return `<div class="limit-row" data-credit-provider="${escapeHtml(provider.provider)}"><div><strong>${escapeHtml(provider.provider)}</strong><small>${escapeHtml(provider.source || "Credit balance")}</small></div><span data-credit-balance>${escapeHtml(credits)}</span></div>`;
+    }
     const used = quotaPercent(provider);
     const label = provider.quota?.state || provider.plan || provider.source || "Observed usage";
     return `<div class="limit-row"><div><strong>${escapeHtml(provider.provider)}</strong><small>${escapeHtml(label)}</small></div><progress max="100" value="${escapeHtml(used)}"></progress><span>${escapeHtml(`${formatNumber(used)}% used`)}</span></div>`;
@@ -1301,7 +1308,7 @@ function providerTabId(provider) {
 }
 
 function providerMatchesTab(provider, tab = state.providerTab) {
-  return !tab || providerCanonical(provider) === providerCanonical(tab);
+  return providerCanonical(provider) === providerCanonical(tab || PROVIDERS[0][0]);
 }
 
 function accountHealth(account) {
@@ -1311,20 +1318,21 @@ function accountHealth(account) {
 
 function renderSectionTabs(node, items, selected, kind) {
   const logo = kind === "providers" ? providerLogoTile : harnessLogoTile;
-  node.innerHTML = `<button class="section-tab ${selected ? "" : "selected"}" data-section-tab="" aria-current="${selected ? "false" : "page"}"><span class="section-tab-all" aria-hidden="true">•••</span><strong>All</strong></button>${items.map(({ id, label }) => `<button class="section-tab ${selected === id ? "selected" : ""}" data-section-tab="${escapeHtml(id)}" aria-current="${selected === id ? "page" : "false"}">${logo(id, label, "section-tab-logo")}<strong>${escapeHtml(label)}</strong></button>`).join("")}`;
+  const allTab = kind === "providers" ? "" : `<button class="section-tab ${selected ? "" : "selected"}" data-section-tab="" aria-current="${selected ? "false" : "page"}"><span class="section-tab-all" aria-hidden="true">•••</span><strong>All</strong></button>`;
+  node.innerHTML = `${allTab}${items.map(({ id, label }) => `<button class="section-tab ${selected === id ? "selected" : ""}" data-section-tab="${escapeHtml(id)}" aria-current="${selected === id ? "page" : "false"}">${logo(id, label, "section-tab-logo")}<strong>${escapeHtml(label)}</strong></button>`).join("")}`;
   bindActions(node, "[data-section-tab]", (event) => selectSectionTab(kind, event.currentTarget.dataset.sectionTab || null, kind === "harnesses"));
 }
 
-function renderProviderPicker(node, collapsible = true) {
+function renderProviderPicker(node) {
   const counts = new Map();
   state.accounts.forEach((account) => counts.set(account.provider, (counts.get(account.provider) || 0) + 1));
-  const definitions = state.providerTab ? PROVIDERS.filter(([id]) => id === state.providerTab) : PROVIDERS;
+  const definitions = PROVIDERS.filter(([id]) => id === state.providerTab);
   node.innerHTML = definitions.map(([id, label, mode]) => {
     const count = counts.get(providerCanonical(id)) || 0;
     const action = mode === "oauth" ? "Connect subscription" : mode === "import" ? "Review import" : "Configure below";
     return `<button class="provider-picker-choice" data-provider="${escapeHtml(id)}" data-provider-mode="${escapeHtml(mode)}">${providerLogoTile(id, label)}<span class="provider-choice-copy"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(`${count} connected · ${action}`)}</span></span></button>`;
   }).join("");
-  node.hidden = state.providerTab ? false : (collapsible ? node.hidden : false);
+  node.hidden = false;
   bindActions(node, "[data-provider]", (event) => {
     const button = event.currentTarget;
     if (button.dataset.providerMode === "oauth") startLogin(button.dataset.provider);
@@ -1339,8 +1347,17 @@ function accountTitle(account) {
 
 function quotaMarkup(limits) {
   if (!limits || typeof limits !== "object") return '<span class="muted">No quota observation</span>';
+  const credits = creditBalanceText(limits);
+  if (credits) return `<div class="quota-line credit-balance" data-credit-balance><span>Credit balance</span><strong>${escapeHtml(credits)}</strong></div>`;
   const percent = quotaPercent(limits);
   return `<div class="quota-line"><progress max="100" value="${escapeHtml(percent)}"></progress><span>${escapeHtml(`${formatNumber(percent)}% used`)}</span></div>`;
+}
+
+function providerLimitsForAccount(account) {
+  const limits = state.limits?.providers || [];
+  return limits.find((entry) => entry.provider === account.provider && entry.account_id === account.id)
+    || limits.find((entry) => entry.provider === account.provider && !entry.account_id)
+    || null;
 }
 
 function renderAccountCard(account) {
@@ -1348,7 +1365,7 @@ function renderAccountCard(account) {
   const needsReauth = account.kind === "oauth" && (account.needs_reauth || health.value === "auth_failed" || account.status !== "active");
   return `<article class="account-card" data-account-card="${escapeHtml(account.id)}">
     <div class="account-head">${providerLogoTile(account.provider, account.provider, "account-provider-logo")}<span class="status-dot ${escapeHtml(health.value)}"></span><div><span class="section-kicker">${escapeHtml(account.provider)}</span><h3>${escapeHtml(accountTitle(account))}</h3><small>${escapeHtml(health.label)} · ${escapeHtml(account.kind)}${account.paused ? " · paused" : ""}</small></div></div>
-    ${quotaMarkup(account.limits)}
+    ${quotaMarkup(account.limits || providerLimitsForAccount(account))}
     ${facts([["Status", account.status], ["Expires", account.expires_in_s === null || account.expires_in_s === undefined ? "—" : formatAge(account.expires_in_s)], ["Routing", account.routing?.eligible ? `Priority ${finite(account.routing.priority) + 1}` : "Ineligible"], ["Reserve", account.routing?.reserve_pct === undefined ? "—" : `${account.routing.reserve_pct}%`]])}
     <div class="card-actions"><button data-account-pause="${escapeHtml(account.id)}" data-paused="${account.paused}">${account.paused ? "Resume" : "Pause"}</button>${needsReauth ? `<button data-reauth-id="${escapeHtml(account.id)}" data-reauth-provider="${escapeHtml(account.provider)}">Re-authenticate</button>` : ""}<button class="danger-button" data-account-remove="${escapeHtml(account.id)}">Remove</button></div>
   </article>`;
@@ -1442,31 +1459,36 @@ async function saveRouting(event) {
 }
 
 async function loadProviders() {
-  const [accounts, analytics] = await Promise.all([loadAccounts(), api("/admin/accounts/analytics?since_minutes=1440&bucket_minutes=60")]);
+  const [accounts, analytics, limits] = await Promise.all([
+    loadAccounts(),
+    api("/admin/accounts/analytics?since_minutes=1440&bucket_minutes=60"),
+    api("/admin/limits"),
+  ]);
   const providers = [...new Set(accounts.map((account) => account.provider))];
   const routings = await Promise.all(providers.map((provider) => api(`/admin/routing/${encodeURIComponent(provider)}`).catch(() => null)));
   state.providerAnalytics = analytics;
+  state.limits = limits;
   state.providerRoutings = routings.filter(Boolean);
   renderProvidersView();
   await Promise.allSettled([loadOpenRouterModels(), loadExo(), loadCLIProxyAPI(), loadImportCandidates()]);
 }
 
 function renderProvidersView() {
-  const validTab = PROVIDERS.some(([id]) => id === state.providerTab) ? state.providerTab : null;
-  if (state.providerTab && !validTab && state.currentView === "providers") history.replaceState(null, "", "#providers");
+  const validTab = PROVIDERS.some(([id]) => id === state.providerTab) ? state.providerTab : PROVIDERS[0][0];
+  if (state.currentView === "providers" && location.hash !== `#providers/${encodeURIComponent(validTab)}`) history.replaceState(null, "", `#providers/${encodeURIComponent(validTab)}`);
   state.providerTab = validTab;
   renderSectionTabs($("#provider-tabs"), PROVIDERS.map(([id, label]) => ({ id, label })), validTab, "providers");
   const accounts = state.accounts.filter((account) => providerMatchesTab(account.provider, validTab));
   const routings = state.providerRoutings.filter((snapshot) => providerMatchesTab(snapshot.provider, validTab));
   renderUsageAnalytics(providerAnalytics(state.providerAnalytics || {}, validTab));
-  renderProviderPicker($("#provider-picker"), true);
+  renderProviderPicker($("#provider-picker"));
   const accountList = $("#provider-accounts");
-  const empty = validTab ? `No ${PROVIDERS.find(([id]) => id === validTab)?.[1] || validTab} accounts connected yet.` : "No provider accounts connected. Choose Add provider to begin.";
+  const empty = `No ${PROVIDERS.find(([id]) => id === validTab)?.[1] || validTab} accounts connected yet.`;
   accountList.innerHTML = accounts.length ? `${accounts.map(renderAccountCard).join("")}${routings.map(routingEditor).join("")}` : `<article class="settings-card provider-empty-state"><p class="muted">${escapeHtml(empty)}</p></article>`;
   bindAccountActions(accountList);
   $$('.routing-form', accountList).forEach((form) => form.addEventListener("submit", saveRouting));
-  $$('[data-provider-setup]', $("#provider-setup")).forEach((section) => { section.hidden = Boolean(validTab) && section.dataset.providerSetup !== validTab; });
-  $("#provider-setup").hidden = Boolean(validTab) && !$$('[data-provider-setup]', $("#provider-setup")).some((section) => !section.hidden);
+  $$('[data-provider-setup]', $("#provider-setup")).forEach((section) => { section.hidden = section.dataset.providerSetup !== validTab; });
+  $("#provider-setup").hidden = !$$('[data-provider-setup]', $("#provider-setup")).some((section) => !section.hidden);
   renderImportCandidates();
 }
 
@@ -1476,18 +1498,23 @@ function credentialPingResult(account, results) {
   const exact = results.find((result) => result.account_id === account.id);
   if (exact) return exact;
   const providerResults = results.filter((result) => providerCanonical(result.provider) === providerCanonical(account.provider));
-  const providerAccounts = state.accounts.filter((candidate) => providerCanonical(candidate.provider) === providerCanonical(account.provider));
+  const providerAccounts = activeCredentialAccounts().filter((candidate) => providerCanonical(candidate.provider) === providerCanonical(account.provider));
   return providerResults.length === 1 && providerAccounts.length === 1 ? providerResults[0] : null;
+}
+
+function activeCredentialAccounts() {
+  return state.accounts.filter((account) => account.status === "active" && !account.paused);
 }
 
 function renderCredentialPingRows(results = null, requestError = "") {
   const rows = $("#credential-ping-rows");
-  if (!state.accounts.length) {
+  const accounts = activeCredentialAccounts();
+  if (!accounts.length) {
     rows.innerHTML = '<div class="credential-ping-empty">No provider credentials are connected.</div>';
     return { passed: 0, total: 0 };
   }
   let passed = 0;
-  rows.innerHTML = state.accounts.map((account) => {
+  rows.innerHTML = accounts.map((account) => {
     if (!results && !requestError) {
       return `<div class="credential-ping-row pending">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}</small></div><span class="spinner" aria-label="Checking"></span></div>`;
     }
@@ -1497,7 +1524,7 @@ function renderCredentialPingRows(results = null, requestError = "") {
     const message = requestError || result?.message || "No ping result was returned for this credential.";
     return `<div class="credential-ping-row ${ok ? "passed" : "failed"}">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}${result ? ` · ${escapeHtml(`${result.latency_ms} ms`)}` : ""}</small>${ok ? "" : `<p>${escapeHtml(message)}</p>`}</div><span class="credential-ping-mark" aria-label="${ok ? "Passed" : "Failed"}">${ok ? "✓" : "×"}</span></div>`;
   }).join("");
-  return { passed, total: state.accounts.length };
+  return { passed, total: accounts.length };
 }
 
 async function runCredentialPingChecks() {
@@ -1506,7 +1533,8 @@ async function runCredentialPingChecks() {
   const summary = $("#credential-ping-summary");
   rerun.disabled = true;
   summary.className = "credential-ping-summary checking";
-  summary.textContent = `Checking ${state.accounts.length} credential${state.accounts.length === 1 ? "" : "s"}…`;
+  const accountCount = activeCredentialAccounts().length;
+  summary.textContent = `Checking ${accountCount} credential${accountCount === 1 ? "" : "s"}…`;
   renderCredentialPingRows();
   try {
     const data = await api("/admin/accounts/test", { method: "POST" });
@@ -3024,7 +3052,6 @@ function bindStaticEvents() {
   $$('[data-refresh-card]').forEach((button) => button.addEventListener("click", refreshCurrentView));
   $("#mobile-menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
   $("#global-refresh").addEventListener("click", refreshCurrentView);
-  $("#sidebar-refresh").addEventListener("click", refreshSidebarStatus);
   $("#sidebar-update").addEventListener("click", () => selectView("updates", true));
   $("#quick-refresh").addEventListener("click", refreshCurrentView);
   $("#refresh-interval").addEventListener("change", setRefreshInterval);

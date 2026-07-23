@@ -32,7 +32,7 @@ final class OnboardingModel {
     static let currentVersion = OnboardingLaunchPolicy.currentVersion
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
-        "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
+        "Credentials for compatible apps", "Network", "Never lose a login", "Keep your agents running",
         "Beyond single provider",
     ]
 
@@ -917,8 +917,9 @@ struct OnboardingView: View {
         case 1: providerPicker
         case 2: stagedConnect
         case 3: credentials
-        case 4: notifications
-        case 5: failover
+        case 4: network
+        case 5: notifications
+        case 6: failover
         default: beyondSingleProvider
         }
     }
@@ -926,7 +927,7 @@ struct OnboardingView: View {
     private var meetAlex: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let image = HarnessIconLoader.image(
-                resource: "header-v2", extension: "jpg", subdirectory: "onboarding")
+                resource: "header", extension: "jpg", subdirectory: "onboarding")
             {
                 Image(nsImage: image)
                     .resizable().aspectRatio(contentMode: .fill)
@@ -1500,6 +1501,15 @@ struct OnboardingView: View {
         }
     }
 
+    private var network: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intro(
+                "Network",
+                "Choose which interfaces Alex listens on. Loopback is right unless other devices need to reach this daemon.")
+            NetworkExposureSection(store: model.store)
+        }
+    }
+
     private var notifications: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "paperplane.circle.fill").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.primary)
@@ -1768,6 +1778,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let store: SnapshotStore
     private let openProviderSettings: @MainActor () -> Void
     private let openTraceBrowser: @MainActor (String?) -> Void
+
+    var orderingWindow: NSWindow? { window }
 
     init(
         store: SnapshotStore,

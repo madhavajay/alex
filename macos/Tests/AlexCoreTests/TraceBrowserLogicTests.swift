@@ -336,33 +336,6 @@ import Testing
         #expect(!SessionKind.isPingOrTest(sessionId: "real-session", harness: nil))
     }
 
-    @Test func newerActivityPill() {
-        #expect(LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: 100,
-            newestId: "b", newestLastTsMs: 200))
-        #expect(!LiveFollow.newerActivity(
-            live: false, selectedId: "a", selectedLastTsMs: 100,
-            newestId: "b", newestLastTsMs: 200))
-        #expect(!LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: 200,
-            newestId: "b", newestLastTsMs: 100))
-        #expect(!LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: 100,
-            newestId: "b", newestLastTsMs: 100))
-        #expect(!LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: 100,
-            newestId: "a", newestLastTsMs: 200))
-        #expect(!LiveFollow.newerActivity(
-            live: true, selectedId: nil, selectedLastTsMs: nil,
-            newestId: "b", newestLastTsMs: 200))
-        #expect(!LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: 100,
-            newestId: nil, newestLastTsMs: nil))
-        #expect(LiveFollow.newerActivity(
-            live: true, selectedId: "a", selectedLastTsMs: nil,
-            newestId: "b", newestLastTsMs: 1))
-    }
-
     @Test func sessionsDecoding() throws {
         let json = #"""
         {"sessions":[{"account_ids":["openai-oauth-a","openai-oauth-b"],"efforts":["minimal"],"errors":0,"first_ts_ms":1783484392318,"harness":"alex-ping","last_status":200,"last_ts_ms":1783484841250,"models":["grok-code-fast-1"],"run_id":null,"session_id":"auto-36237cced1dcc659","tags":{},"total_cost_usd":0.00005262,"total_input_tokens":426,"total_output_tokens":9,"trace_count":3}]}

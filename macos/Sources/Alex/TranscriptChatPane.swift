@@ -370,7 +370,7 @@ enum TranscriptChatMessages {
         }
         return AttemptEvent(
             title: titleParts.joined(separator: " · "),
-            detail: details.joined(separator: "\n"),
+            detail: cap(details.joined(separator: "\n")),
             model: failed?.model ?? attempts.first?.model,
             provider: failed?.provider ?? attempts.first?.provider)
     }
@@ -466,6 +466,6 @@ enum TranscriptChatMessages {
     }
 
     static func cap(_ text: String) -> String {
-        TurnTextCap.cap(text, maxChars: TranscriptRender.maxTurnChars, maxLines: .max).text
+        TurnTextCap.cap(text).text
     }
 }

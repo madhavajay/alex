@@ -8987,6 +8987,12 @@ fn fmt_reset(v: &serde_json::Value) -> String {
     }
 }
 
+pub(crate) fn individual_credit_balance_text(entry: &serde_json::Value) -> Option<String> {
+    entry["individual_credits_usd"]
+        .as_f64()
+        .map(|usd| format!("${usd:.2} credits"))
+}
+
 fn print_limits(snap: &serde_json::Value) {
     let providers = snap["providers"].as_array().cloned().unwrap_or_default();
     if providers.is_empty() {
@@ -9019,6 +9025,9 @@ fn print_limits(snap: &serde_json::Value) {
         let quota = &p["quota"];
         let quota_kind = quota["kind"].as_str().unwrap_or("rate_window");
         let credit_primary = quota_kind != "rate_window";
+        let individual_credit = (!credit_primary)
+            .then(|| individual_credit_balance_text(p))
+            .flatten();
         match quota_kind {
             "out_of_credits" => {
                 println!("   {}", ui::red("OUT OF CREDITS"));
@@ -9042,6 +9051,9 @@ fn print_limits(snap: &serde_json::Value) {
             }
             _ => {}
         }
+        if let Some(balance) = &individual_credit {
+            println!("   {}", ui::green(&format!("Credit balance: {balance}")));
+        }
         let windows = p["windows"].as_array().cloned().unwrap_or_default();
         let label_width = windows
             .iter()
@@ -9050,7 +9062,7 @@ fn print_limits(snap: &serde_json::Value) {
             .max()
             .unwrap_or(2)
             .max(2);
-        let mut printed = false;
+        let mut printed = individual_credit.is_some();
         for w in &windows {
             let raw_label = w["window"].as_str().unwrap_or("-");
             // The Grok billing window is already printed as the primary credit
@@ -11337,6 +11349,18 @@ mod tests {
     use reqwest::{Method, StatusCode};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn openrouter_individual_credits_render_for_status_and_limits_cli() {
+        let entry = json!({
+            "provider": "openrouter",
+            "individual_credits_usd": 12.34
+        });
+        assert_eq!(
+            individual_credit_balance_text(&entry).as_deref(),
+            Some("$12.34 credits")
+        );
+    }
 
     #[test]
     fn cursor_project_key_flattens_unix_paths() {

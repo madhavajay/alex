@@ -469,6 +469,8 @@ private struct ProviderPreferencesDetail: View {
                 ForEach(accounts) { account in
                     SubscriptionAccountRow(
                         account: account,
+                        providerLimits: ProviderPresentation.limits(
+                            for: account, in: store.limits),
                         usage: usageByAccount[account.id],
                         routing: routingByAccount[account.id],
                         reservePct: routing?.reservePct ?? 10,
@@ -745,6 +747,7 @@ private struct SubscriptionAccountRow: View {
     }
 
     let account: Account
+    let providerLimits: ProviderLimits?
     let usage: AccountUsage?
     let routing: CodexRoutingAccount?
     let reservePct: Double
@@ -792,6 +795,10 @@ private struct SubscriptionAccountRow: View {
     private var creditQuota: QuotaState? {
         guard let quota = account.limits?.quota, quota.isCreditPrimary else { return nil }
         return quota
+    }
+
+    private var creditBalanceText: String? {
+        ProviderPresentation.creditBalanceText(providerLimits)
     }
 
     var body: some View {
@@ -894,7 +901,7 @@ private struct SubscriptionAccountRow: View {
 
     @ViewBuilder
     private var quotaBars: some View {
-        if !quotaWindows.isEmpty || creditQuota != nil {
+        if !quotaWindows.isEmpty || creditQuota != nil || creditBalanceText != nil {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(Array(quotaWindows.enumerated()), id: \.offset) { _, window in
                     if let remaining = window.remainingPct {
@@ -919,6 +926,17 @@ private struct SubscriptionAccountRow: View {
                         detailText: quota.balance,
                         fraction: remaining / 100,
                         fill: accentColor)
+                }
+                if let balance = creditBalanceText {
+                    HStack(spacing: 6) {
+                        Text("💰")
+                        Text("Credit balance")
+                            .foregroundStyle(AlexTheme.Colors.textTertiary)
+                        Text(balance)
+                            .font(AlexTheme.Fonts.mono(10, weight: .semibold))
+                            .foregroundStyle(AlexTheme.Colors.success)
+                    }
+                    .font(.system(size: 10))
                 }
                 if account.provider == "openai", let observed = routing?.observedAtMs {
                     Text("Quota observed \(Self.relative(Date(timeIntervalSince1970: Double(observed) / 1_000)))")

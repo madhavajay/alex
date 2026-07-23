@@ -69,6 +69,7 @@ pub const CLIPROXYAPI_REVERSE_CAPABILITIES: &[&str] = &[
     "trace-correlation",
 ];
 const ALEX_ROUTE_CHAIN_HEADER: &str = "x-alex-route-chain";
+const ALEX_PING_ACCOUNT_HEADER: &str = "x-alex-ping-account";
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -670,6 +671,7 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
+    pub openrouter_usage: std::sync::Mutex<UsageCache>,
     /// Backoff guard for on-demand Kimi `/usages` probes triggered from the
     /// limits snapshot (the recorded routing-limits act as the value cache).
     pub kimi_usage: std::sync::Mutex<UsageCache>,
@@ -1215,6 +1217,7 @@ pub fn build_state_with_substitution(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
+        openrouter_usage: std::sync::Mutex::new(UsageCache::default()),
         kimi_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
         openrouter_exposed: std::sync::RwLock::new(default_openrouter_exposed_models()),
@@ -1871,11 +1874,10 @@ pub fn parse_kimi_usage_payload(payload: &Value) -> Value {
 
 /// Fetch and record Kimi usage for the active account. Returns a short human
 /// summary for the health line. Degrades gracefully when usage is unavailable.
-async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, String) {
-    let account = match state.vault.account_for(Provider::Kimi, true).await {
-        Ok(account) => account,
-        Err(e) => return (false, None, e.to_string()),
-    };
+async fn kimi_usage_probe_for_account(
+    state: &Arc<AppState>,
+    account: &Account,
+) -> (bool, Option<String>, String) {
     let Some(token) = account.access_token.clone() else {
         return (
             false,
@@ -1933,6 +1935,14 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
             format!("usage endpoint unreachable: {e}"),
         ),
     }
+}
+
+async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, String) {
+    let account = match state.vault.account_for(Provider::Kimi, true).await {
+        Ok(account) => account,
+        Err(e) => return (false, None, e.to_string()),
+    };
+    kimi_usage_probe_for_account(state, &account).await
 }
 
 fn exo_model_enabled(state: &AppState, model: &str) -> bool {
@@ -2211,11 +2221,8 @@ async fn admin_web_password(
     axum::Json(body): axum::Json<WebPasswordRequest>,
 ) -> Response {
     let password = body.password;
-    if password.chars().count() < 10 {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "password must be at least 10 characters",
-        );
+    if password.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "password must not be empty");
     }
     if password.len() > 256 {
         return error_response(StatusCode::BAD_REQUEST, "password is too long");
@@ -4849,6 +4856,87 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     .await
 }
 
+pub fn parse_openrouter_credits_payload(payload: &Value) -> Option<f64> {
+    let data = payload.get("data")?;
+    let total = data.get("total_credits")?.as_f64()?;
+    let used = data.get("total_usage")?.as_f64()?;
+    (total.is_finite() && used.is_finite()).then_some((total - used).max(0.0))
+}
+
+async fn openrouter_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state
+        .vault
+        .account_for(Provider::Openrouter, false)
+        .await
+        .ok()?;
+    let headers = openrouter_auth_headers(&account).ok()?;
+    cached_usage_fetch(
+        &state.openrouter_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let result = state
+                .http
+                .get(format!(
+                    "{}/credits",
+                    upstream_base(state, Provider::Openrouter, OPENROUTER_BASE)
+                ))
+                .headers(headers)
+                .header("accept", "application/json")
+                .header("user-agent", "alex-openrouter-usage")
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(raw) => match parse_openrouter_credits_payload(&raw) {
+                        Some(remaining) => UsageFetchOutcome::Fresh(Some(json!({
+                            "provider": "openrouter",
+                            "account_id": account.id,
+                            "source": "openrouter credits API",
+                            "plan": account.label,
+                            "individual_credits_usd": remaining,
+                        }))),
+                        None => UsageFetchOutcome::Failed {
+                            retry_after_ms: None,
+                            fallback: None,
+                            log: UsageFailureLog::Error {
+                                error: "missing total_credits or total_usage".into(),
+                                message: "openrouter credits parse failed",
+                            },
+                        },
+                    },
+                    Err(e) => UsageFetchOutcome::Failed {
+                        retry_after_ms: None,
+                        fallback: None,
+                        log: UsageFailureLog::Error {
+                            error: e.to_string(),
+                            message: "openrouter credits parse failed",
+                        },
+                    },
+                },
+                Ok(resp) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Status {
+                        status: resp.status().as_u16(),
+                        message: "openrouter credits endpoint unavailable; backing off",
+                    },
+                },
+                Err(e) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Error {
+                        error: e.to_string(),
+                        message: "openrouter credits request failed",
+                    },
+                },
+            }
+        },
+    )
+    .await
+}
+
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
 /// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
 async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
@@ -5043,6 +5131,9 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
         providers.push(entry);
     }
     if let Some(entry) = amp_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = openrouter_usage_entry(state).await {
         providers.push(entry);
     }
     if let Some(entry) = kimi_usage_entry(state).await {
@@ -9061,7 +9152,24 @@ async fn admin_accounts_test(State(state): State<Arc<AppState>>) -> Response {
         .read()
         .map(|models| models.clone())
         .unwrap_or_default();
-    let results = heartbeat_once(&state, &models).await;
+    let accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| {
+            account.status == "active" && !account.paused && heartbeat_provider(account.provider)
+        })
+        .collect();
+    let mut results = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        if state.is_shutting_down() {
+            break;
+        }
+        let result = ping_provider_account(&state, account.provider, &models, Some(&account)).await;
+        record_heartbeat_result(&state, &result).await;
+        results.push(result);
+    }
     let healthy = results.iter().filter(|result| result.ok).count();
     axum::Json(json!({
         "healthy": healthy,
@@ -9075,6 +9183,15 @@ pub async fn ping_provider(
     state: &Arc<AppState>,
     provider: Provider,
     models: &PingModels,
+) -> PingResult {
+    ping_provider_account(state, provider, models, None).await
+}
+
+async fn ping_provider_account(
+    state: &Arc<AppState>,
+    provider: Provider,
+    models: &PingModels,
+    target_account: Option<&Account>,
 ) -> PingResult {
     let start = now_ms();
     let prompt = "Health check: what time is it? If you cannot know, just reply: creds ok";
@@ -9133,7 +9250,10 @@ pub async fn ping_provider(
             }),
         ),
         Provider::Cliproxyapi => {
-            let account = state.vault.account_for(Provider::Cliproxyapi, false).await;
+            let account = match target_account {
+                Some(account) => Ok(account.clone()),
+                None => state.vault.account_for(Provider::Cliproxyapi, false).await,
+            };
             let Ok(account) = account else {
                 return PingResult {
                     provider: "cliproxyapi",
@@ -9189,7 +9309,10 @@ pub async fn ping_provider(
         Provider::Kimi => {
             // Kimi's usage endpoint doubles as a cheap credential check: it needs
             // a valid Bearer token and returns the subscription's quota windows.
-            let (ok, account_id, message) = kimi_usage_probe(state).await;
+            let (ok, account_id, message) = match target_account {
+                Some(account) => kimi_usage_probe_for_account(state, account).await,
+                None => kimi_usage_probe(state).await,
+            };
             return PingResult {
                 provider: "kimi",
                 account_id,
@@ -9200,6 +9323,62 @@ pub async fn ping_provider(
             };
         }
         Provider::Amp => {
+            if let Some(account) = target_account {
+                let account_id = Some(account.id.clone());
+                let Some(token) = account
+                    .api_key
+                    .as_deref()
+                    .or(account.access_token.as_deref())
+                else {
+                    return PingResult {
+                        provider: "amp",
+                        account_id,
+                        ok: false,
+                        status: None,
+                        latency_ms: now_ms() - start,
+                        message: "amp account has no credential".into(),
+                    };
+                };
+                let response = state
+                    .http
+                    .post(format!(
+                        "{}/api/internal?userDisplayBalanceInfo",
+                        upstream_base(state, Provider::Amp, AMP_BASE)
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("accept", "application/json")
+                    .header("content-type", "application/json")
+                    .header("user-agent", "alex-amp-ping")
+                    .json(&json!({ "method": "userDisplayBalanceInfo", "params": {} }))
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await;
+                return match response {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        PingResult {
+                            provider: "amp",
+                            account_id,
+                            ok: (200..300).contains(&status),
+                            status: Some(status),
+                            latency_ms: now_ms() - start,
+                            message: if (200..300).contains(&status) {
+                                "creds ok".into()
+                            } else {
+                                format!("usage HTTP {status}")
+                            },
+                        }
+                    }
+                    Err(error) => PingResult {
+                        provider: "amp",
+                        account_id,
+                        ok: false,
+                        status: None,
+                        latency_ms: now_ms() - start,
+                        message: format!("usage endpoint unreachable: {error}"),
+                    },
+                };
+            }
             let account_id = state
                 .vault
                 .account_for(Provider::Amp, false)
@@ -9230,18 +9409,28 @@ pub async fn ping_provider(
             };
         }
     };
-    let account_id = state
-        .vault
-        .account_for(provider, true)
-        .await
-        .ok()
-        .map(|a| a.id);
+    let account_id = match target_account {
+        Some(account) => Some(account.id.clone()),
+        None => state
+            .vault
+            .account_for(provider, true)
+            .await
+            .ok()
+            .map(|a| a.id),
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-api-key",
         HeaderValue::from_str(&state.local_key.read().unwrap()).expect("key header"),
     );
     headers.insert("user-agent", HeaderValue::from_static("alex-ping"));
+    if let Some(account) = target_account {
+        headers.insert(
+            ALEX_PING_ACCOUNT_HEADER,
+            HeaderValue::from_str(&account.id).expect("account id header"),
+        );
+        headers.insert("x-alex-no-substitute", HeaderValue::from_static("true"));
+    }
     let resp = proxy(
         state.clone(),
         format,
@@ -9376,23 +9565,25 @@ fn snippet(text: &str) -> String {
     t.replace('\n', " ")
 }
 
+fn heartbeat_provider(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Anthropic
+            | Provider::Openai
+            | Provider::Xai
+            | Provider::Gemini
+            | Provider::Openrouter
+            | Provider::Cliproxyapi
+            | Provider::Amp
+            | Provider::Kimi
+    )
+}
+
 pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<PingResult> {
     let providers: Vec<Provider> = {
         let mut seen = Vec::new();
         for a in state.vault.list().await {
-            if a.status == "active"
-                && matches!(
-                    a.provider,
-                    Provider::Anthropic
-                        | Provider::Openai
-                        | Provider::Xai
-                        | Provider::Gemini
-                        | Provider::Openrouter
-                        | Provider::Cliproxyapi
-                        | Provider::Amp
-                        | Provider::Kimi
-                )
-                && !seen.contains(&a.provider)
+            if a.status == "active" && heartbeat_provider(a.provider) && !seen.contains(&a.provider)
             {
                 seen.push(a.provider);
             }
@@ -10079,7 +10270,7 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let (base, account, connection_account, dario_guard, dario_capture, dario_fallback_reason, via_dario, dario_generation) = if genuine_claude_code {
+            let (base, account, connection_account, dario_guard, dario_capture, dario_fallback_reason, via_dario, dario_generation) = if genuine_claude_code || client_headers.contains_key(ALEX_PING_ACCOUNT_HEADER) {
                 let account = state
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
@@ -14135,7 +14326,19 @@ async fn proxy(
     {
         apply_reasoning_effort(format, &mut body_json, &effort);
     }
-    let mut attempted_accounts = HashSet::new();
+    let mut attempted_accounts: HashSet<String> = headers
+        .get(ALEX_PING_ACCOUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|target_id| {
+            state
+                .vault
+                .list_cached()
+                .into_iter()
+                .filter(|account| account.provider == provider && account.id != target_id)
+                .map(|account| account.id)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut attempt_records = Vec::<Value>::new();
     let mut current_provider = provider;
     let mut current_model = routed_model.clone();
@@ -17668,6 +17871,55 @@ mod tests {
         assert!(snap["credits"].is_null());
     }
 
+    #[test]
+    fn openrouter_credits_payload_calculates_remaining_balance() {
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 42.5, "total_usage": 12.25}
+            })),
+            Some(30.25)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 12.25, "total_usage": 12.25}
+            })),
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 10.0}
+            })),
+            None
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 5.0, "total_usage": 8.0}
+            })),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_fakeprov_credits_surface_as_limits_balance() {
+        let server = alex_fakeprov::FakeProv::spawn(alex_fakeprov::Config::default())
+            .await
+            .unwrap();
+        let state = test_state("openrouter-usage-entry");
+        state.vault.upsert(openrouter_account()).await.unwrap();
+        set_upstream_base_override(
+            &state,
+            Provider::Openrouter,
+            format!("{}/openrouter/api/v1", server.base_url()),
+        );
+
+        let entry = openrouter_usage_entry(&state)
+            .await
+            .expect("openrouter usage entry");
+        assert_eq!(entry["provider"], "openrouter");
+        assert_eq!(entry["account_id"], "openrouter-api-key");
+        assert_eq!(entry["individual_credits_usd"], 30.25);
+    }
+
     fn test_kimi_account() -> Account {
         Account {
             id: "kimi-oauth".into(),
@@ -17998,7 +18250,7 @@ mod tests {
         assert_eq!(body["authenticated"], false);
         assert_eq!(body["session_ttl_seconds"], WEB_SESSION_TTL_S);
 
-        for password in ["too-short".to_string(), "x".repeat(257)] {
+        for password in [String::new(), "x".repeat(257)] {
             let response = web_auth_request(
                 state.clone(),
                 axum::http::Method::POST,
@@ -18011,6 +18263,18 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         assert!(!state.web_auth.path.exists());
+
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "x"})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.web_auth.path.exists());
     }
 
     #[tokio::test]
@@ -26684,6 +26948,58 @@ mod tests {
         assert_eq!(body["healthy"], 0);
         assert_eq!(body["total"], 0);
         assert_eq!(body["results"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn credential_test_pings_every_active_account_for_the_same_provider() {
+        use alex_fakeprov::{Config as FakeProvConfig, FakeProv};
+        use tower::ServiceExt;
+
+        let upstream = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
+        let state = test_state("credential-test-multi-account");
+        set_upstream_base_override(
+            &state,
+            Provider::Xai,
+            format!("{}/xai/v1", upstream.base_url()),
+        );
+        for id in ["xai-first", "xai-second"] {
+            state
+                .vault
+                .upsert(test_api_account(id, Provider::Xai))
+                .await
+                .unwrap();
+        }
+
+        let request = axum::http::Request::post("/admin/accounts/test")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = response_json(router(state).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["healthy"], 2);
+        assert_eq!(body["total"], 2);
+        let account_ids: HashSet<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|result| result["account_id"].as_str())
+            .collect();
+        assert_eq!(account_ids, HashSet::from(["xai-first", "xai-second"]));
+
+        let authorizations: HashSet<String> = upstream
+            .requests()
+            .await
+            .into_iter()
+            .filter(|request| request.path.ends_with("/chat/completions"))
+            .filter_map(|request| request.headers.get("authorization").cloned())
+            .collect();
+        assert_eq!(
+            authorizations,
+            HashSet::from([
+                "Bearer secret-xai-first".to_string(),
+                "Bearer secret-xai-second".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]

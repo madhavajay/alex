@@ -10,6 +10,7 @@ test('providers show an upstream-backed CLIProxyAPI error instead of a blank sta
 
   await openUi(page, runtime);
   await page.locator('nav [data-view="providers"]').click();
+  await page.locator('#provider-tabs [data-section-tab="cliproxyapi"]').click();
   const setup = page.locator('[data-provider-setup="cliproxyapi"]');
   await setup.locator('summary').click();
   await setup.getByLabel('Endpoint URL').fill(`${runtime.fakeBaseUrl}/cliproxyapi/v1`);

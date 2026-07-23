@@ -909,6 +909,11 @@ struct LimitsCardView: View {
             if let provider {
                 VStack(alignment: .leading, spacing: 4) {
                     quotaRow(provider.quota)
+                    if !(provider.windows ?? []).contains(where: { $0.window == "credits" }),
+                       let balance = provider.formattedIndividualCredits
+                    {
+                        creditLine("Credit balance", value: balance)
+                    }
                     ForEach(provider.windows ?? [], id: \.window) { window in
                         if shouldHide(window, for: provider.quota) {
                             EmptyView()

@@ -332,11 +332,7 @@ fn account_block(summary: &StatusSummary, account: &StatusAccount, now: i64) -> 
     }
 
     let mut lines = vec![first];
-    // Credit-metered providers (amp, openrouter): a dollar balance says more
-    // than a percent bar with an unknowable reset. Show it and skip the bar.
-    if let Some(balance) = limit_entry.and_then(credit_balance_line) {
-        lines.push(balance);
-    } else if let Some(entry) = limit_entry {
+    if let Some(entry) = limit_entry {
         let windows = limit_windows(entry, now);
         if let Some((tightest_index, tightest)) = windows
             .iter()
@@ -358,6 +354,9 @@ fn account_block(summary: &StatusSummary, account: &StatusAccount, now: i64) -> 
                     ));
                 }
             }
+        }
+        if let Some(balance) = credit_balance_line(entry) {
+            lines.push(balance);
         }
     }
     if account.needs_reauth {
@@ -442,22 +441,52 @@ fn remaining_bar(remaining_pct: f64) -> String {
     blocks.join("")
 }
 
-/// A dollar-balance line for credit-metered providers (`💰 $30.16 credits`).
-/// Reads `individual_credits_usd`, `credits.balance`, or `quota.balance` from
-/// the provider's `/admin/limits` entry; None for window-metered providers.
 fn credit_balance_line(entry: &Value) -> Option<String> {
     if let Some(usd) = entry["individual_credits_usd"].as_f64() {
-        return Some(format!("💰 ${usd:.2} credits"));
+        if usd != 0.0 || credit_metered_without_windows(entry) {
+            return Some(format!("💰 ${usd:.2} credits"));
+        }
+        return None;
     }
-    let balance = entry["credits"]["balance"]
-        .as_str()
-        .or_else(|| entry["quota"]["balance"].as_str())?
-        .trim()
-        .to_string();
+    let balance_value = entry["credits"]
+        .get("balance")
+        .or_else(|| entry["quota"].get("balance"))?;
+    let balance = match balance_value {
+        Value::String(value) => value.trim().to_string(),
+        Value::Number(value) => value.to_string(),
+        _ => return None,
+    };
     if balance.is_empty() {
         return None;
     }
-    Some(format!("💰 {balance} credits"))
+    let has_credits = entry["credits"]["has_credits"]
+        .as_bool()
+        .or_else(|| {
+            entry["credits"]["has_credits"]
+                .as_str()
+                .map(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(false);
+    let numeric_balance = balance
+        .trim_start_matches('$')
+        .replace(',', "")
+        .parse::<f64>()
+        .ok();
+    if has_credits
+        || numeric_balance.is_some_and(|value| value != 0.0)
+        || credit_metered_without_windows(entry)
+    {
+        Some(format!("💰 {balance} credits"))
+    } else {
+        None
+    }
+}
+
+fn credit_metered_without_windows(entry: &Value) -> bool {
+    matches!(entry["provider"].as_str(), Some("amp" | "openrouter"))
+        && entry["windows"]
+            .as_array()
+            .is_none_or(|windows| windows.is_empty())
 }
 
 fn compact_whitespace(value: &str) -> String {
@@ -615,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn credit_metered_providers_show_dollar_balance_not_bars() {
+    fn amp_credit_balance_without_windows_is_unchanged() {
         let now = 1_000_000;
         let mut summary = synthetic_summary(now);
         summary.accounts[0].provider = "amp".into();
@@ -623,13 +652,64 @@ mod tests {
             "providers": [{
                 "provider": "amp",
                 "plan": "amp",
-                "individual_credits_usd": 30.16,
-                "windows": [{"window": "credits", "used_pct": 0.0}]
+                "individual_credits_usd": 30.16
             }]
         }));
         let text = summary.telegram_text_at(now);
         assert!(text.contains("💰 $30.16 credits"), "{text}");
-        assert!(!text.contains("credits resets"), "{text}");
+    }
+
+    #[test]
+    fn codex_windows_with_disabled_zero_credits_show_bars_without_credits() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        set_openai_limits(&mut summary, now);
+        summary.limits.as_mut().unwrap()["providers"][0]["credits"] = serde_json::json!({
+            "has_credits": false,
+            "unlimited": false,
+            "balance": 0
+        });
+
+        let text = summary.telegram_text_at(now);
+        println!("{text}");
+        assert!(text.contains("🟩🟩🟩🟨⬜⬜⬜⬜⬜⬜ 39% left · 7d resets 12h"));
+        assert!(!text.contains("credits"), "{text}");
+    }
+
+    #[test]
+    fn codex_windows_with_enabled_credits_show_bars_and_credits() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        set_openai_limits(&mut summary, now);
+        summary.limits.as_mut().unwrap()["providers"][0]["credits"] = serde_json::json!({
+            "has_credits": true,
+            "unlimited": false,
+            "balance": 12.34
+        });
+
+        let text = summary.telegram_text_at(now);
+        println!("{text}");
+        assert!(text.contains("🟩🟩🟩🟨⬜⬜⬜⬜⬜⬜ 39% left · 7d resets 12h"));
+        assert!(text.contains("💰 12.34 credits"), "{text}");
+    }
+
+    #[test]
+    fn openrouter_account_shows_dollar_balance() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        summary.accounts[0].provider = "openrouter".into();
+        summary.accounts[0].id = "openrouter-api-key".into();
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "openrouter",
+                "account_id": "openrouter-api-key",
+                "individual_credits_usd": 30.25
+            }]
+        }));
+
+        let text = summary.telegram_text_at(now);
+        println!("{text}");
+        assert!(text.contains("💰 $30.25 credits"), "{text}");
     }
 
     #[test]
