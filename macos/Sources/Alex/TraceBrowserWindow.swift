@@ -6,7 +6,15 @@ import AlexCore
 @MainActor
 @Observable
 final class TraceBrowserModel {
+    typealias TranscriptPageFetcher = @Sendable (
+        _ sessionId: String, _ limit: Int, _ cursor: TranscriptCursor?
+    ) async throws -> TranscriptPageResponse
+    typealias TraceTurnFetcher = @Sendable (_ traceId: String) async throws -> TranscriptTurn
+
     private let store: SnapshotStore
+    let renderedArtifacts = RenderedArtifactCache()
+    private let transcriptPageFetcher: TranscriptPageFetcher?
+    private let traceTurnFetcher: TraceTurnFetcher?
 
     private(set) var sessions: [TraceSession] = [] {
         didSet { recomputeSessionSummary(); recomputeTranscriptSummary() }
@@ -106,6 +114,12 @@ final class TraceBrowserModel {
     private(set) var transcriptTotalCount = 0
     private(set) var transcriptTabCounts: TranscriptTabCounts?
     private var transcriptFilterTask: Task<Void, Never>?
+    private var transcriptMetadata: [TranscriptTurnMetadata] = []
+    private var expandedTurns: [String: TranscriptTurn] = [:]
+    private var turnFetchTasks: [String: Task<Void, Never>] = [:]
+    private var turnApplyTask: Task<Void, Never>?
+    private var actionTasks: [UUID: Task<Void, Never>] = [:]
+    private var metadataHiddenTurnCount = 0
 
     /// Recomputes `transcriptEntries`/`transcriptTotalCount` off the main
     /// actor. `debounce` is true for keystrokes (200ms settle) and false for
@@ -248,32 +262,38 @@ final class TraceBrowserModel {
 
     private var bodyCache = TraceBodyCache(capacity: 20)
 
-    func fetchTraceBody(id: String, kind: TraceBodyKind) async throws -> TraceBodyContent {
-        let key = TraceBodyCache.key(id: id, kind: kind)
+    func fetchTraceBody(
+        id: String, kind: TraceBodyKind, loadFull: Bool = false
+    ) async throws -> TraceBodyContent {
+        let key = TraceBodyCache.key(id: id, kind: kind) + (loadFull ? "|full" : "")
         if let cached = bodyCache.value(for: key) { return cached }
         guard let client = client() else {
             throw AlexClient.ClientError.http(0, "daemon unavailable")
         }
-        let content = try await client.traceBody(id: id, kind: kind)
+        let content = try await client.traceBody(
+            id: id, kind: kind, maxBytes: loadFull ? nil : AlexClient.displayBodyByteLimit)
         bodyCache.insert(content, for: key)
         return content
     }
 
-    private var toolBodyCache: [String: TraceBodyContent] = [:]
+    private var toolBodyCache = TraceBodyCache(capacity: 20)
 
     /// Captured args/result body for a tool execution (kind: "args" |
     /// "result"). Used both to backfill the Input/Output tabs when the wire
     /// arguments were empty and to drive `inspectorToolBody`. Cached per
     /// (tool id, kind) since a card can request it more than once (tab
     /// switch, reopening the inspector route).
-    func fetchToolBody(id: String, kind: String) async throws -> TraceBodyContent {
-        let key = "\(id)|\(kind)"
-        if let cached = toolBodyCache[key] { return cached }
+    func fetchToolBody(
+        id: String, kind: String, loadFull: Bool = false
+    ) async throws -> TraceBodyContent {
+        let key = "\(id)|\(kind)" + (loadFull ? "|full" : "")
+        if let cached = toolBodyCache.value(for: key) { return cached }
         guard let client = client() else {
             throw AlexClient.ClientError.http(0, "daemon unavailable")
         }
-        let content = try await client.toolBody(id: id, kind: kind)
-        toolBodyCache[key] = content
+        let content = try await client.toolBody(
+            id: id, kind: kind, maxBytes: loadFull ? nil : AlexClient.displayBodyByteLimit)
+        toolBodyCache.insert(content, for: key)
         return content
     }
 
@@ -378,26 +398,31 @@ final class TraceBrowserModel {
     func detailClient() -> AlexClient? { client() }
 
     func ensureFirstTraceDetail() {
-        guard let sid = selectedSessionId, let first = turns.first else { return }
-        let key = "\(sid)|\(first.traceId)"
+        guard let sid = selectedSessionId,
+            let traceId = transcriptMetadata.first?.traceId ?? turns.first?.traceId
+        else { return }
+        let key = "\(sid)|\(traceId)"
         guard key != firstDetailKey else { return }
         firstDetailKey = key
         firstTraceDetail = nil
         firstDetailTask?.cancel()
         firstDetailTask = Task { [weak self] in
             guard let client = self?.client() else { return }
-            guard let detail = try? await client.traceDetail(id: first.traceId) else { return }
+            guard let detail = try? await client.traceDetail(id: traceId) else { return }
             guard !Task.isCancelled, let self, self.firstDetailKey == key else { return }
             self.firstTraceDetail = detail
         }
     }
 
     func revealSessionBodies(_ session: TraceSession) {
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             var bodyPath: String?
-            if let last = try? await client.traceTranscript(sessionId: session.sessionId).turns.last,
-                let detail = try? await client.traceDetail(id: last.traceId) {
+            if let last = try? await allTranscriptMetadata(
+                client: client, sessionId: session.sessionId).last,
+                let detail = try? await client.traceDetail(id: last.traceId)
+            {
                 bodyPath = detail.trace.reqBodyPath
                     ?? detail.trace.respBodyPath ?? detail.trace.upstreamReqBodyPath
             }
@@ -411,8 +436,14 @@ final class TraceBrowserModel {
         }
     }
 
-    init(store: SnapshotStore, initialHarness: String? = nil, initialQuery: String? = nil) {
+    init(
+        store: SnapshotStore, initialHarness: String? = nil, initialQuery: String? = nil,
+        transcriptPageFetcher: TranscriptPageFetcher? = nil,
+        traceTurnFetcher: TraceTurnFetcher? = nil
+    ) {
         self.store = store
+        self.transcriptPageFetcher = transcriptPageFetcher
+        self.traceTurnFetcher = traceTurnFetcher
         if let initialQuery, !initialQuery.isEmpty {
             queryText = initialQuery
             parsedQuery = OmniQuery.parse(queryText)
@@ -659,12 +690,7 @@ final class TraceBrowserModel {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        transcriptTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.pollTranscript()
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-        }
+        startTranscriptPolling()
         // `stop()` cancels any in-flight search when an existing window is
         // reopened. Re-apply the current query so initial/preset key filters
         // always populate their server-backed session id set.
@@ -676,6 +702,13 @@ final class TraceBrowserModel {
         sessionsTask = nil
         transcriptTask?.cancel()
         transcriptTask = nil
+        turnFetchTasks.values.forEach { $0.cancel() }
+        turnFetchTasks.removeAll()
+        turnApplyTask?.cancel()
+        turnApplyTask = nil
+        actionTasks.values.forEach { $0.cancel() }
+        actionTasks.removeAll()
+        renderedArtifacts.clear()
         searchTask?.cancel()
         searchTask = nil
         renderChain?.cancel()
@@ -710,10 +743,17 @@ final class TraceBrowserModel {
         recomputeTranscriptSummary()
         resetTurns()
         setUserAtBottom(true)
-        Task { await pollTranscript() }
+        startTranscriptPolling()
     }
 
     private func resetTurns() {
+        turnFetchTasks.values.forEach { $0.cancel() }
+        turnFetchTasks.removeAll()
+        turnApplyTask?.cancel()
+        turnApplyTask = nil
+        transcriptMetadata = []
+        expandedTurns = [:]
+        metadataHiddenTurnCount = 0
         allTurns = []
         turns = []
         transcriptLoadedSessionId = nil
@@ -744,6 +784,12 @@ final class TraceBrowserModel {
     }
 
     func loadEarlierTurns() {
+        if let first = transcriptMetadata.firstIndex(where: { expandedTurns[$0.traceId] != nil }),
+            first > 0
+        {
+            requestTurnWindow(indices: max(0, first - 24)..<first)
+            return
+        }
         windowMaxTurns += TranscriptWindow.defaultMaxTurns
         renderState = nil
         scheduleRender()
@@ -785,7 +831,7 @@ final class TraceBrowserModel {
                     .browser, "transcript windowed: showing \(windowed.count)/\(all.count) turns")
             }
         }
-        hiddenTurnCount = windowStart
+        hiddenTurnCount = metadataHiddenTurnCount + windowStart
         guard plan != .unchanged else { return }
         renderState = TranscriptRender.state(for: windowed, rawMode: rawMode)
         let slice: [TranscriptTurn]
@@ -861,6 +907,40 @@ final class TraceBrowserModel {
         return AlexClient(config: cfg)
     }
 
+    private func launchAction(_ operation: @escaping @MainActor () async -> Void) {
+        let id = UUID()
+        actionTasks[id] = Task { [weak self] in
+            await operation()
+            self?.actionTasks[id] = nil
+        }
+    }
+
+    private func allTranscriptMetadata(
+        client: AlexClient, sessionId: String
+    ) async throws -> [TranscriptTurnMetadata] {
+        var output: [TranscriptTurnMetadata] = []
+        var cursor: TranscriptCursor?
+        repeat {
+            let page = try await client.traceTranscriptPage(
+                sessionId: sessionId, limit: 50, cursor: cursor)
+            try Task.checkCancellation()
+            output.append(contentsOf: page.turns)
+            cursor = page.nextCursor
+            if !page.hasMore { break }
+        } while cursor != nil
+        return output
+    }
+
+    private func startTranscriptPolling() {
+        transcriptTask?.cancel()
+        transcriptTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollTranscript()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+    }
+
     private func pollSessions() async {
         guard let client = client() else {
             daemonDown = true
@@ -927,7 +1007,7 @@ final class TraceBrowserModel {
 
     private func pollTranscript() async {
         guard let sid = selectedSessionId else { return }
-        guard let client = client() else {
+        guard transcriptPageFetcher != nil || client() != nil else {
             daemonDown = true
             transcriptLoading = false
             transcriptUnreachable = true
@@ -945,22 +1025,49 @@ final class TraceBrowserModel {
             }
         }
         do {
-            let resp = try await client.traceTranscript(sessionId: sid, limit: 500)
-            daemonDown = false
-            guard resp.sessionId == selectedSessionId else { return }
-            transcriptLoadedSessionId = sid
-            transcriptLoading = false
-            transcriptUnreachable = false
-            transcriptTabCounts = resp.tabCounts
-            let fingerprint = TraceFingerprint.turns(resp.turns)
-            if fingerprint != turnsFingerprint {
-                turnsFingerprint = fingerprint
-                BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
-                    allTurns = resp.turns
+            var fetched: [TranscriptTurnMetadata] = []
+            var cursor: TranscriptCursor?
+            repeat {
+                let page: TranscriptPageResponse
+                if let transcriptPageFetcher {
+                    page = try await transcriptPageFetcher(sid, 50, cursor)
+                } else if let client = client() {
+                    page = try await client.traceTranscriptPage(
+                        sessionId: sid, limit: 50, cursor: cursor)
+                } else {
+                    return
                 }
-                applyTurnFilter()
-                ensureFirstTraceDetail()
+                try Task.checkCancellation()
+                guard page.sessionId == sid, selectedSessionId == sid else { return }
+                fetched.append(contentsOf: page.turns)
+                cursor = page.nextCursor
+                if !page.hasMore { break }
+            } while cursor != nil
+            daemonDown = false
+            guard selectedSessionId == sid else { return }
+            let previous = Dictionary(uniqueKeysWithValues: transcriptMetadata.map {
+                ($0.traceId, $0)
+            })
+            let changed = Set(fetched.compactMap { metadata in
+                previous[metadata.traceId] == metadata ? nil : metadata.traceId
+            })
+            let validIds = Set(fetched.map(\.traceId))
+            expandedTurns = expandedTurns.filter { validIds.contains($0.key) }
+            transcriptMetadata = fetched
+            transcriptLoadedSessionId = sid
+            transcriptLoading = !fetched.isEmpty
+            transcriptUnreachable = false
+            transcriptTabCounts = nil
+            if fetched.isEmpty {
+                rebuildExpandedTurns()
+                return
             }
+            let start = max(0, fetched.count - 24)
+            requestTurnWindow(indices: start..<fetched.count)
+            for traceId in changed where expandedTurns[traceId] != nil {
+                requestTurn(traceId: traceId, sessionId: sid, replacing: true)
+            }
+            ensureFirstTraceDetail()
         } catch {
             guard !(error is CancellationError) else { return }
             daemonDown = true
@@ -969,8 +1076,73 @@ final class TraceBrowserModel {
         }
     }
 
-    func retrySessions() { Task { await pollSessions() } }
-    func retryTranscript() { Task { await pollTranscript() } }
+    func retrySessions() { launchAction { [weak self] in await self?.pollSessions() } }
+    func retryTranscript() { startTranscriptPolling() }
+
+    func transcriptTurnBecameVisible(_ traceId: String) {
+        guard let index = transcriptMetadata.firstIndex(where: { $0.traceId == traceId }) else {
+            return
+        }
+        requestTurnWindow(indices: max(0, index - 6)..<min(transcriptMetadata.count, index + 7))
+    }
+
+    private func requestTurnWindow(indices: Range<Int>) {
+        guard let sid = selectedSessionId else { return }
+        for index in indices where transcriptMetadata.indices.contains(index) {
+            requestTurn(traceId: transcriptMetadata[index].traceId, sessionId: sid)
+        }
+    }
+
+    private func requestTurn(traceId: String, sessionId: String, replacing: Bool = false) {
+        if !replacing, expandedTurns[traceId] != nil { return }
+        turnFetchTasks[traceId]?.cancel()
+        turnFetchTasks[traceId] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let turn: TranscriptTurn
+                if let traceTurnFetcher {
+                    turn = try await traceTurnFetcher(traceId)
+                } else if let client = client() {
+                    turn = try await client.traceTurn(id: traceId)
+                } else {
+                    return
+                }
+                try Task.checkCancellation()
+                guard selectedSessionId == sessionId, turn.traceId == traceId else { return }
+                expandedTurns[traceId] = turn
+                turnFetchTasks[traceId] = nil
+                scheduleExpandedRebuild()
+            } catch is CancellationError {
+                turnFetchTasks[traceId] = nil
+            } catch {
+                turnFetchTasks[traceId] = nil
+                guard selectedSessionId == sessionId else { return }
+                transcriptUnreachable = true
+            }
+        }
+    }
+
+    private func scheduleExpandedRebuild() {
+        turnApplyTask?.cancel()
+        turnApplyTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(15))
+            guard !Task.isCancelled else { return }
+            self?.rebuildExpandedTurns()
+        }
+    }
+
+    private func rebuildExpandedTurns() {
+        let loaded = transcriptMetadata.compactMap { expandedTurns[$0.traceId] }
+        allTurns = loaded
+        if let first = transcriptMetadata.firstIndex(where: { expandedTurns[$0.traceId] != nil }) {
+            metadataHiddenTurnCount = first
+        } else {
+            metadataHiddenTurnCount = transcriptMetadata.count
+        }
+        transcriptLoading = !transcriptMetadata.isEmpty && loaded.isEmpty
+        turnsFingerprint = TraceFingerprint.turns(loaded)
+        applyTurnFilter()
+    }
 
     private func queryChanged() {
         searchTask?.cancel()
@@ -1071,7 +1243,7 @@ final class TraceBrowserModel {
             showSimulationNotice("Cannot simulate: no session id")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Simulation failed: daemon unavailable")
@@ -1094,7 +1266,7 @@ final class TraceBrowserModel {
             showSimulationNotice("Cannot clear: no session id")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Clear failed: daemon unavailable")
@@ -1132,15 +1304,16 @@ final class TraceBrowserModel {
             showSimulationNotice("Fixture name is required")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Save failed: daemon unavailable")
                 return
             }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                guard let errorTrace = transcript.turns.reversed().first(where: {
+                let metadata = try await self.allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                guard let errorTrace = metadata.reversed().first(where: {
                     TraceClassification.isError(
                         status: $0.status, errorKind: $0.errorKind, error: $0.error)
                 }) else {
@@ -1173,7 +1346,7 @@ final class TraceBrowserModel {
             showSimulationNotice("This rejected credential cannot be safely approved")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Approval failed: daemon unavailable")
@@ -1193,11 +1366,13 @@ final class TraceBrowserModel {
     }
 
     func copyLastReply(_ session: TraceSession) {
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                guard let last = transcript.turns.last else { return }
+                let metadata = try await allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                guard let last = metadata.last else { return }
                 let markdown = try await client.traceReplyMarkdown(traceId: last.traceId)
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(markdown, forType: .string)
@@ -1213,12 +1388,19 @@ final class TraceBrowserModel {
         panel.allowedContentTypes = [.init(filenameExtension: "md") ?? .plainText]
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let dest = panel.url else { return }
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                let metadata = try await allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                var turns: [TranscriptTurn] = []
+                for item in metadata {
+                    turns.append(try await client.traceTurn(id: item.traceId))
+                    try Task.checkCancellation()
+                }
                 let markdown = Self.exportMarkdown(
-                    sessionId: session.sessionId, turns: transcript.turns)
+                    sessionId: session.sessionId, turns: turns)
                 try markdown.write(to: dest, atomically: true, encoding: .utf8)
             } catch {
                 NSSound.beep()
@@ -1294,7 +1476,8 @@ final class TraceBrowserModel {
         // scrolls back to row 0 every time.
         let anchorId = Self.nearestSurvivor(deletedIds: deletedIds, in: visibleRows)
 
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             var completedSessionIds = Set<String>()
             var deletionFailures = 0
@@ -1305,9 +1488,9 @@ final class TraceBrowserModel {
                 while true {
                     let ids: Set<String>
                     do {
-                        let transcript = try await client.traceTranscript(
-                            sessionId: session.sessionId)
-                        ids = Set(transcript.turns.map(\.traceId))
+                        let metadata = try await allTranscriptMetadata(
+                            client: client, sessionId: session.sessionId)
+                        ids = Set(metadata.map(\.traceId))
                     } catch {
                         transcriptFailures += 1
                         break

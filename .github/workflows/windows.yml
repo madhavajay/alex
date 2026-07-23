@@ -1,0 +1,113 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-build:
+    name: Windows ${{ matrix.arch_tag }} build and installer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch_tag: x86_64
+            iss_arch: x64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch_tag: arm64
+            iss_arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch_tag }}
+
+      # aws-lc-sys assembles its crypto sources with NASM on x86_64 and
+      # clang on ARM64; hosted images ship LLVM but not NASM.
+      - name: Install NASM (x86_64 only)
+        if: matrix.arch_tag == 'x86_64'
+        run: choco install nasm -y --no-progress
+        shell: pwsh
+
+      - name: Build release CLI
+        run: cargo build --release --locked -p alex --bins --target ${{ matrix.target }}
+        shell: pwsh
+
+      - name: Run Windows-relevant tests
+        run: |
+          cargo test --locked -p alex-core --target ${{ matrix.target }}
+          cargo test --locked -p alex-auth --target ${{ matrix.target }}
+          cargo test --locked -p alex-store --target ${{ matrix.target }}
+          cargo test --locked -p alex-fakeprov --target ${{ matrix.target }}
+          cargo test --locked -p alex --target ${{ matrix.target }}
+        shell: pwsh
+
+      - name: Fakeprov router integration
+        run: cargo test --locked -p alex-proxy --target ${{ matrix.target }} --test fakeprov_router -- --nocapture
+        shell: pwsh
+
+      - name: Parse Windows packaging scripts and verify smoke contracts
+        run: ./packaging/ci-windows/test-smoke-installed.ps1
+        shell: pwsh
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          $exe = "target\${{ matrix.target }}\release\alex.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $dist = "dist\windows-${{ matrix.arch_tag }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $asset = "alex-cli-$version-windows-${{ matrix.arch_tag }}.zip"
+          Compress-Archive -Path $exe -DestinationPath "$dist\$asset" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "$dist\$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline -Path "$dist\$asset.sha256"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "dist=$dist" >> $env:GITHUB_OUTPUT
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile Setup.exe
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc `
+            "/DAppVersion=${{ steps.package.outputs.version }}" `
+            "/DAlexExe=$PWD\target\${{ matrix.target }}\release\alex.exe" `
+            "/DOutputDir=$PWD\${{ steps.package.outputs.dist }}" `
+            "/DArch=${{ matrix.iss_arch }}" `
+            packaging\windows-installer\alex.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          $setup = "${{ steps.package.outputs.dist }}\Alex-Setup-${{ steps.package.outputs.version }}-windows-${{ matrix.arch_tag }}.exe"
+          if (-not (Test-Path $setup)) { throw "missing $setup" }
+          $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $setup)" | Set-Content -NoNewline -Path "$setup.sha256"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alex-windows-${{ matrix.arch_tag }}
+          path: dist/windows-${{ matrix.arch_tag }}/
+          if-no-files-found: error
+          retention-days: 14

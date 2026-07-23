@@ -1356,6 +1356,12 @@ fn write_state_atomic(path: &Path, state: &ImportState) -> Result<()> {
         serde_json::to_writer_pretty(&mut file, state)?;
         file.flush()?;
         file.get_ref().sync_all()?;
+        // Windows refuses the rename when the destination is open (sharing
+        // violation); removing it first keeps the replace reliable.
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
         fs::rename(&temp, path)?;
         // Unix lets us fsync the containing directory so the rename itself is
         // durable. Windows does not allow opening a directory as a regular

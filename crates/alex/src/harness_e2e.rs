@@ -81,6 +81,14 @@ struct CatalogHarness {
     proxy_mode: Option<String>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    source: Option<CatalogSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogSource {
+    #[serde(default)]
+    package: Option<String>,
 }
 
 #[derive(Debug)]
@@ -171,9 +179,15 @@ pub fn list_harnesses(data_dir: &Path) -> Result<Vec<HarnessListRow>> {
         .iter()
         .map(|(name, h)| {
             let runner = runnable_by_name(name).is_some();
-            let default_package = runnable_by_name(name)
-                .and_then(|r| r.default_package)
-                .map(String::from);
+            let default_package = h
+                .source
+                .as_ref()
+                .and_then(|source| source.package.clone())
+                .or_else(|| {
+                    runnable_by_name(name)
+                        .and_then(|r| r.default_package)
+                        .map(String::from)
+                });
             let default_version = h
                 .default_version
                 .clone()
@@ -352,6 +366,9 @@ pub fn run_harness(opts: RunOptions) -> Result<RunSummary> {
         "-e".to_string(),
         format!("ALEX_E2E_SESSION={session_id}"),
     ];
+    if spec.kind == HarnessKind::Codex {
+        command.insert(3, "-t".to_string());
+    }
     if let Some(t) = &tarball {
         let parent = t
             .parent()
@@ -482,10 +499,11 @@ fn package_and_version_for_target(target: &str, version: Option<&str>) -> Result
             ))
         }
     };
-    let runnable = runnable_by_name(&canonical)
-        .ok_or_else(|| anyhow!("{canonical} has no default npm package mapping"))?;
-    let package = runnable
-        .default_package
+    let package = h
+        .source
+        .as_ref()
+        .and_then(|source| source.package.as_deref())
+        .or_else(|| runnable_by_name(&canonical).and_then(|r| r.default_package))
         .ok_or_else(|| anyhow!("{canonical} has no default npm package mapping"))?;
     let version = version
         .filter(|v| !v.trim().is_empty())
@@ -559,7 +577,7 @@ fn docker_env(kind: HarnessKind, base_url: &str, local_key: &str, model: &str) -
             for (key, value) in [
                 ("OPENAI_BASE_URL", openai_base.clone()),
                 ("OPENAI_API_KEY", local_key.to_string()),
-                ("CODEX_HOME", "/tmp/alex-codex-home".to_string()),
+                ("CODEX_HOME", "/workspace/.codex".to_string()),
             ] {
                 env.push("-e".to_string());
                 env.push(format!("{key}={value}"));
@@ -596,6 +614,7 @@ fn docker_script(kind: HarnessKind, model: &str) -> Result<String> {
         HarnessKind::Claude => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs /tmp/alex-claude-config
+touch /workspace/alex-harness-tool-canary
 npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 claude --version > /out/logs/version.txt 2>&1
 export CLAUDE_CONFIG_DIR=/tmp/alex-claude-config
@@ -605,13 +624,17 @@ claude --verbose --output-format=stream-json --print -- "$ALEX_E2E_PROMPT" > /ou
         HarnessKind::Codex => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs "$CODEX_HOME"
+touch /workspace/alex-harness-tool-canary
 npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 codex --version > /out/logs/version.txt 2>&1 || true
+codex debug models --bundled > "$CODEX_HOME/bundled-models.json"
+node -e 'const fs=require("fs");const p=process.env.CODEX_HOME+"/bundled-models.json";const d=JSON.parse(fs.readFileSync(p));if(!d.models.some(x=>x.slug===process.env.ALEX_E2E_MODEL)){{const t=d.models.find(x=>x.slug==="gpt-5.6-sol")||d.models[0];d.models.push({{...t,slug:process.env.ALEX_E2E_MODEL,display_name:process.env.ALEX_E2E_MODEL,description:"Alex harness model"}})}}fs.writeFileSync(process.env.CODEX_HOME+"/alex-models.json",JSON.stringify(d))'
 cat > "$CODEX_HOME/auth.json" <<EOF
 {{"OPENAI_API_KEY":"$OPENAI_API_KEY"}}
 EOF
 cat > "$CODEX_HOME/config.toml" <<EOF
 model_provider = "alex"
+model_catalog_json = "$CODEX_HOME/alex-models.json"
 
 [model_providers.alex]
 name = "Alex Proxy"
@@ -622,12 +645,13 @@ requires_openai_auth = false
 supports_websockets = false
 http_headers = {{ x-alex-harness = "codex" }}
 EOF
-codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model {escaped_model} --json -- "$ALEX_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
+codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model {escaped_model} --json "$ALEX_E2E_PROMPT" > /out/harness.stdout.log 2> /out/harness.stderr.log
 "#
         ),
         HarnessKind::Grok => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs
+touch /workspace/alex-harness-tool-canary
 if [ -n "${{ALEX_E2E_TARBALL:-}}" ]; then
   npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 else
@@ -645,6 +669,7 @@ test -n "$GROK_CLI"
         HarnessKind::Kimi => format!(
             r#"set -euo pipefail
 mkdir -p /workspace /out/logs "$HOME/.kimi-code"
+touch /workspace/alex-harness-tool-canary
 npm install -g "$ALEX_E2E_TARBALL" > /out/logs/npm-install.log 2>&1
 kimi --version > /out/logs/version.txt 2>&1 || true
 cat > "$HOME/.kimi-code/config.toml" <<EOF
@@ -792,7 +817,7 @@ fn verify_capture(
 fn trace_matches_harness(user_agent: Option<&str>, harness: HarnessKind) -> bool {
     let user_agent = user_agent.unwrap_or_default().to_ascii_lowercase();
     match harness {
-        HarnessKind::Claude => user_agent.starts_with("claude-cli/"),
+        HarnessKind::Claude => user_agent == "claude" || user_agent.starts_with("claude-cli/"),
         HarnessKind::Codex => user_agent.contains("codex"),
         HarnessKind::Grok => user_agent.contains("grok") || user_agent.contains("xai"),
         HarnessKind::Kimi => user_agent == "kimi" || user_agent.contains("kimi-code"),
@@ -1028,6 +1053,7 @@ display_name = "alex/$ALEX_E2E_MODEL""#
             Some("claude-cli/2.1.0"),
             HarnessKind::Claude
         ));
+        assert!(trace_matches_harness(Some("claude"), HarnessKind::Claude));
         assert!(!trace_matches_harness(
             Some("codex_cli_rs"),
             HarnessKind::Claude

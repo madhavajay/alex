@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "headers": {
+    "cache-control": "no-cache",
+    "x-codex-plan-type": "plus",
+    "x-codex-active-limit": "primary",
+    "x-codex-primary-used-percent": "20",
+    "x-codex-primary-window-minutes": "300",
+    "x-codex-primary-reset-at": "1700018000",
+    "x-codex-secondary-used-percent": "10",
+    "x-codex-secondary-window-minutes": "10080",
+    "x-codex-secondary-reset-at": "1700604800",
+    "x-codex-credits-balance": "0",
+    "x-codex-credits-has-credits": "false",
+    "x-codex-credits-unlimited": "false"
+  }
+}

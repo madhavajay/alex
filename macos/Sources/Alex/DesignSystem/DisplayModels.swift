@@ -82,6 +82,7 @@ struct MessageDisplay: Identifiable, Equatable, Sendable {
     let role: Role
     var roleLabel: String
     var content = ""
+    var attributedContent: AttributedString?
     var isMonospaced = false
     var model: String?
     /// Extra header metadata (reasoning effort, billing bucket, …).

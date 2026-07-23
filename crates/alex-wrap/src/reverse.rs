@@ -1233,7 +1233,7 @@ fn dump_headers(method: &str, path: &str, head: &[u8]) {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("/tmp/alex-wrap-headers.dump")
+            .open(std::env::temp_dir().join("alex-wrap-headers.dump"))
             .and_then(|mut f| {
                 use std::io::Write;
                 writeln!(f, "===== {method} {path} =====")?;

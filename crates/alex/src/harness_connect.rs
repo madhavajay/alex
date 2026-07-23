@@ -27,9 +27,17 @@ const CODEX_STATE_FILE: &str = "alex-harness-state.json";
 const CODEX_BACKUP_FILE: &str = "alex-original-config.toml";
 const CODEX_OPENAI_PROFILE_FILE: &str = "openai.config.toml";
 pub(crate) const CODEX_ALEX_PROFILE_FILE: &str = "alex.config.toml";
+// Hook scripts are PowerShell on Windows (PowerShell refuses `-File` args
+// without a .ps1 extension) and POSIX shell elsewhere.
+#[cfg(windows)]
+const CODEX_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const CODEX_HOOK_FILE: &str = "alex-session-hook.sh";
 const CODEX_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
 const CODEX_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+#[cfg(windows)]
+const CODEX_TOOL_HOOK_FILE: &str = "alex-tool-hook.ps1";
+#[cfg(not(windows))]
 const CODEX_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
 const CODEX_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
 const CODEX_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
@@ -39,9 +47,15 @@ const CLAUDE_CATALOG_FILE: &str = "alex-models.json";
 const CLAUDE_KEY_FILE: &str = "alex-api-key";
 const CLAUDE_STATE_FILE: &str = "alex-harness-state.json";
 const CLAUDE_BACKUP_FILE: &str = "alex-original-settings.json";
+#[cfg(windows)]
+const CLAUDE_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const CLAUDE_HOOK_FILE: &str = "alex-session-hook.sh";
 const CLAUDE_HOOK_CURL_FILE: &str = "alex-hook-curl.conf";
 const CLAUDE_EVENT_LOG_FILE: &str = "alex-session-events.jsonl";
+#[cfg(windows)]
+const CLAUDE_TOOL_HOOK_FILE: &str = "alex-tool-hook.ps1";
+#[cfg(not(windows))]
 const CLAUDE_TOOL_HOOK_FILE: &str = "alex-tool-hook.sh";
 const CLAUDE_TOOL_HOOK_CURL_FILE: &str = "alex-tool-curl.conf";
 const CLAUDE_TOOL_EVENT_LOG_FILE: &str = "alex-tool-events.jsonl";
@@ -49,6 +63,9 @@ const GROK_CONFIG_FILE: &str = "config.toml";
 const GROK_KEY_FILE: &str = "alex-api-key";
 const GROK_STATE_FILE: &str = "alex-harness-state.json";
 const GROK_BACKUP_FILE: &str = "alex-original-config.toml";
+#[cfg(windows)]
+const GROK_HOOK_FILE: &str = "alex-session-hook.ps1";
+#[cfg(not(windows))]
 const GROK_HOOK_FILE: &str = "alex-session-hook.sh";
 const GROK_HOOK_CONFIG_FILE: &str = "alex-hook-curl.conf";
 const GROK_HOOK_REGISTRATION_FILE: &str = "alex.json";
@@ -201,14 +218,6 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         install: None,
     },
     HarnessSpec {
-        name: "mini-swe-agent",
-        binary: "mini-swe-agent",
-        config_dir: mini_swe_agent_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
         name: "kimi",
         binary: "kimi",
         config_dir: kimi_config_dir_for_home,
@@ -243,25 +252,9 @@ pub(crate) const HARNESSES: &[HarnessSpec] = &[
         install: None,
     },
     HarnessSpec {
-        name: "opensage",
-        binary: "opensage",
-        config_dir: opensage_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
         name: "pydantic-ai",
         binary: "pydantic-ai",
         config_dir: pydantic_ai_config_dir_for_home,
-        version_args: &["--version"],
-        supports_connect: false,
-        install: None,
-    },
-    HarnessSpec {
-        name: "stirrup",
-        binary: "stirrup",
-        config_dir: stirrup_config_dir_for_home,
         version_args: &["--version"],
         supports_connect: false,
         install: None,
@@ -984,7 +977,8 @@ async fn connect_claude(
     let models = fetch_models(config, &client)
         .await
         .unwrap_or_else(|| FALLBACK_MODELS.iter().map(|m| (*m).to_string()).collect());
-    let summary = write_claude_connection_with_capture(
+    let connected_providers = fetch_connected_providers(config, &client).await;
+    let summary = write_claude_connection_full(
         config_dir.clone(),
         normalized_base_url(config),
         minted.id,
@@ -996,6 +990,7 @@ async fn connect_claude(
             .get("claude")
             .copied()
             .unwrap_or(false),
+        connected_providers,
     )?;
 
     if json_out {
@@ -1493,6 +1488,29 @@ pub(crate) fn write_claude_connection_with_capture(
     version: Option<String>,
     capture_enabled: bool,
 ) -> Result<HarnessConnectSummary> {
+    write_claude_connection_full(
+        config_dir,
+        base_url,
+        key_id,
+        api_key,
+        models,
+        version,
+        capture_enabled,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_claude_connection_full(
+    config_dir: PathBuf,
+    base_url: String,
+    key_id: String,
+    api_key: String,
+    models: Vec<String>,
+    version: Option<String>,
+    capture_enabled: bool,
+    connected_providers: Option<HashSet<String>>,
+) -> Result<HarnessConnectSummary> {
     let settings_path = config_dir.join(CLAUDE_SETTINGS_FILE);
     let profile_path = config_dir.join(CLAUDE_PROFILE_FILE);
     let catalog_path = config_dir.join(CLAUDE_CATALOG_FILE);
@@ -1552,10 +1570,24 @@ pub(crate) fn write_claude_connection_with_capture(
         read_json_object(&profile_path)?["model"]
             .as_str()
             .filter(|model| gateway_models.iter().any(|candidate| candidate == model))
+            // A kept model must also still be routable: keeping e.g. sonnet
+            // with no Anthropic account makes every request 502.
+            .filter(|model| match connected_providers.as_ref() {
+                None => true,
+                Some(connected) => alex_core::route_model(model)
+                    .0
+                    .is_some_and(|p| connected.contains(p.as_str())),
+            })
             .map(String::from)
-            .unwrap_or_else(|| preferred_claude_model(&gateway_models).clone())
+            .unwrap_or_else(|| {
+                preferred_claude_model_for_providers(
+                    &gateway_models,
+                    connected_providers.as_ref(),
+                )
+                .clone()
+            })
     } else {
-        preferred_claude_model(&gateway_models).clone()
+        preferred_claude_model_for_providers(&gateway_models, connected_providers.as_ref()).clone()
     };
     let hook_base_url = base_url.replace("://0.0.0.0", "://127.0.0.1");
     let hook_url = format!("{}/harness-events", hook_base_url.trim_end_matches('/'));
@@ -3780,10 +3812,48 @@ pub(crate) fn short_alex_model_ids(models: Vec<String>) -> Vec<String> {
 }
 
 fn preferred_claude_model(models: &[String]) -> &String {
+    preferred_claude_model_for_providers(models, None)
+}
+
+/// Default-model choice for the Claude harness. Family preference alone is
+/// wrong when the preferred (Anthropic) families have no connected account —
+/// Claude Code then starts on a model whose upstream 502s with "no active
+/// anthropic account". When the connected-provider set is known, only models
+/// routable to a connected provider are eligible, with the family preference
+/// applied within that subset first.
+fn preferred_claude_model_for_providers<'m>(
+    models: &'m [String],
+    connected_providers: Option<&HashSet<String>>,
+) -> &'m String {
+    let routable = |model: &String| -> bool {
+        match connected_providers {
+            None => true,
+            Some(connected) => {
+                let (provider, _) = alex_core::route_model(model);
+                provider.is_some_and(|p| connected.contains(p.as_str()))
+            }
+        }
+    };
     for family in ["sonnet-5", "sonnet-4", "haiku-4", "fable-5", "opus-4"] {
-        if let Some(model) = models.iter().find(|model| model.contains(family)) {
+        if let Some(model) = models
+            .iter()
+            .find(|model| model.contains(family) && routable(model))
+        {
             return model;
         }
+    }
+    // No Anthropic account: fall back to the strongest connected-provider
+    // model families before an arbitrary first entry.
+    for family in ["gpt-5.6", "gpt-5", "grok", "gemini", "kimi", "k3"] {
+        if let Some(model) = models
+            .iter()
+            .find(|model| model.contains(family) && routable(model))
+        {
+            return model;
+        }
+    }
+    if let Some(model) = models.iter().find(|model| routable(model)) {
+        return model;
     }
     models
         .first()
@@ -4596,6 +4666,36 @@ async fn revoke_harness_keys(
     Ok(ids.len())
 }
 
+/// The set of providers with at least one active, unpaused account, from the
+/// daemon's /admin/accounts. `None` when the daemon or the endpoint is
+/// unavailable — callers must treat that as "unknown", not "none".
+async fn fetch_connected_providers(
+    config: &Config,
+    client: &reqwest::Client,
+) -> Option<HashSet<String>> {
+    let url = format!("{}/admin/accounts", normalized_base_url(config));
+    let resp = client
+        .get(url)
+        .header("x-api-key", &config.local_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let value: Value = resp.json().await.ok()?;
+    let providers: HashSet<String> = value["accounts"]
+        .as_array()?
+        .iter()
+        .filter(|account| {
+            account["status"].as_str() == Some("active")
+                && !account["paused"].as_bool().unwrap_or(false)
+        })
+        .filter_map(|account| account["provider"].as_str().map(String::from))
+        .collect();
+    (!providers.is_empty()).then_some(providers)
+}
+
 async fn fetch_models(config: &Config, client: &reqwest::Client) -> Option<Vec<String>> {
     let url = format!("{}/v1/models", normalized_base_url(config));
     let resp = client
@@ -4811,12 +4911,16 @@ pub(crate) async fn ensure_installed(spec: &HarnessSpec, version: Option<&str>) 
             spec.name
         )
     })?;
-    if find_on_path(command.program).is_none() {
+    let Some(installer) = find_on_path(command.program) else {
         bail!("{} is missing and requires npm to install it; install Node.js/npm, then rerun `alex up {}`", spec.name, spec.name);
-    }
+    };
     println!("install: {} {}", command.program, command.args.join(" "));
     let status = tokio::task::spawn_blocking(move || {
-        Command::new(command.program).args(&command.args).status()
+        // command_for wraps .cmd/.bat shims (npm on Windows) in `cmd /C`;
+        // CreateProcess cannot run them directly.
+        alex_core::exec::command_for(&installer)
+            .args(&command.args)
+            .status()
     })
     .await
     .context("wait for harness installer")??;
@@ -4884,9 +4988,6 @@ fn opencode_config_dir_for_home(home: &Path) -> PathBuf {
 fn omp_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".omp").join("agent")
 }
-fn mini_swe_agent_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".mini-swe-agent")
-}
 fn kimi_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".kimi-code")
 }
@@ -4896,14 +4997,8 @@ fn qwen_config_dir_for_home(home: &Path) -> PathBuf {
 fn goose_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".config").join("goose")
 }
-fn opensage_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".opensage")
-}
 fn pydantic_ai_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".pydantic-ai")
-}
-fn stirrup_config_dir_for_home(home: &Path) -> PathBuf {
-    home.join(".stirrup")
 }
 fn jcode_config_dir_for_home(home: &Path) -> PathBuf {
     home.join(".jcode")
@@ -5016,23 +5111,14 @@ pub(crate) fn resolve_harness_binary(config: &Config, spec: &HarnessSpec) -> Opt
 /// pointing at a key the preceding disconnect had already revoked.
 fn harness_home_binary(spec: &HarnessSpec) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let candidate = (spec.config_dir)(&home).join("bin").join(spec.binary);
-    is_executable_file(&candidate).then_some(candidate)
+    let bin_dir = (spec.config_dir)(&home).join("bin");
+    executable_candidates(&bin_dir, spec.binary)
+        .into_iter()
+        .find(|candidate| is_executable_file(candidate))
 }
 
 pub(crate) fn find_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if !probe_safe_dir(&dir) {
-            continue;
-        }
-        for candidate in executable_candidates(&dir, bin) {
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    alex_core::exec::find_on_path_filtered(bin, probe_safe_dir)
 }
 
 /// Never probe network volumes or TCC-protected user folders for harness
@@ -5053,39 +5139,7 @@ pub(crate) fn probe_safe_dir(dir: &Path) -> bool {
     true
 }
 
-fn executable_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        let pathext =
-            std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".EXE;.CMD;.BAT"));
-        let mut out = vec![dir.join(bin)];
-        for ext in pathext.to_string_lossy().split(';') {
-            out.push(dir.join(format!("{bin}{ext}")));
-        }
-        out
-    }
-    #[cfg(not(windows))]
-    {
-        vec![dir.join(bin)]
-    }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
+pub(crate) use alex_core::exec::{executable_candidates, is_executable_file};
 
 async fn command_version(binary: &Path, args: &[&str], timeout: Duration) -> VersionOutput {
     let cache_key = binary_detection_cache_key(binary);
@@ -5477,6 +5531,65 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn claude_default_model_prefers_anthropic_when_connected() {
+        let models: Vec<String> = ["claude-alex/claude-sonnet-5", "claude-alex/gpt-5.6-sol"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let connected: HashSet<String> =
+            ["anthropic", "openai"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            preferred_claude_model_for_providers(&models, Some(&connected)),
+            "claude-alex/claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn claude_default_model_skips_unconnected_anthropic() {
+        // GPT authed, no Anthropic account: sonnet must NOT be the default,
+        // else every request 502s with "no active anthropic account".
+        let models: Vec<String> = [
+            "claude-alex/claude-sonnet-5",
+            "claude-alex/claude-haiku-4-5",
+            "claude-alex/gpt-5.6-sol",
+            "claude-alex/gemini-2.5-flash",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let connected: HashSet<String> = ["openai"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            preferred_claude_model_for_providers(&models, Some(&connected)),
+            "claude-alex/gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn claude_default_model_unknown_providers_keeps_family_preference() {
+        let models: Vec<String> = ["claude-alex/gpt-5.5", "claude-alex/claude-sonnet-5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            preferred_claude_model_for_providers(&models, None),
+            "claude-alex/claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn claude_default_model_falls_back_to_any_routable() {
+        let models: Vec<String> = ["claude-alex/kimi-for-coding"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let connected: HashSet<String> = ["kimi"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            preferred_claude_model_for_providers(&models, Some(&connected)),
+            "claude-alex/kimi-for-coding"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn version_probe_timeout_is_not_cached() {
@@ -5739,7 +5852,7 @@ mod tests {
         );
 
         let statuses = harness_statuses(&config, None, true).await.unwrap();
-        assert_eq!(statuses.len(), 19);
+        assert_eq!(statuses.len(), 16);
         assert!(statuses.iter().any(|s| s.name == "opencode"));
         assert!(statuses.iter().any(|s| s.name == "amp"));
     }

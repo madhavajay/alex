@@ -1,0 +1,41 @@
+{
+  "per_conversation": true,
+  "endpoints": {
+    "POST /anthropic/v1/messages": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Anthropic response.", "repeat": true}
+    ],
+    "POST /openai/v1/responses": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake OpenAI Responses response.", "repeat": true}
+    ],
+    "POST /openai/v1/chat/completions": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake OpenAI Responses response.", "repeat": true}
+    ],
+    "POST /openai/backend-api/codex/responses": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Codex response.", "repeat": true}
+    ],
+    "POST /gemini/v1beta/models/gemini-fake-1:streamGenerateContent": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Gemini response.", "repeat": true}
+    ],
+    "POST /xai/v1/chat/completions": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Grok response.", "repeat": true}
+    ],
+    "POST /kimi/coding/v1/chat/completions": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Kimi response.", "repeat": true}
+    ],
+    "POST /openrouter/api/v1/chat/completions": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake OpenRouter response.", "repeat": true}
+    ],
+    "POST /exo/v1/chat/completions": [
+      {"directory_tool_call": true},
+      {"tool_final": "alex-harness-tool-ok Fake Exo response.", "repeat": true}
+    ]
+  }
+}

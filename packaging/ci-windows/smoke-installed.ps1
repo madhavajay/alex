@@ -7,12 +7,24 @@ param(
     [string]$InstallDirectory = "$env:LOCALAPPDATA\Alex\bin",
     [string]$EvidencePath = "",
     [string]$SmokeRoot = "",
+    [string]$LocalArchive = "",
     [switch]$KeepArtifacts,
     [switch]$PlanOnly
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$MachineArch = $env:PROCESSOR_ARCHITEW6432
+if ([string]::IsNullOrWhiteSpace($MachineArch)) {
+    $MachineArch = $env:PROCESSOR_ARCHITECTURE
+}
+$PlatformArch = switch ($MachineArch) {
+    "AMD64" { "x86_64" }
+    "ARM64" { "arm64" }
+    default { $null }
+}
+$PlatformCheck = "windows-11-$(if ($PlatformArch) { $PlatformArch } else { 'x86_64' })"
 
 $TaskName = "AlexDaemon"
 $BaseUrl = "http://127.0.0.1:4100"
@@ -21,7 +33,7 @@ $Model = "ci-smoke-model"
 $Harness = "clean-machine-ci-windows"
 $ExpectedResponse = "installed route ok"
 $PlanChecks = @(
-    "windows-11-x86_64",
+    $PlatformCheck,
     "release-installer-sha256",
     "packaged-alex-binary",
     "task-scheduler-action-and-health",
@@ -37,7 +49,7 @@ if ($PlanOnly) {
     [ordered]@{
         schema_version = 1
         kind = "alex-windows-installed-smoke-plan"
-        platform = "windows-11-x86_64"
+        platform = $PlatformCheck
         checks = $PlanChecks
         external_provider_network = $false
         provider_secrets = $false
@@ -92,7 +104,7 @@ function Invoke-JsonRequest(
         TimeoutSec = 10
         UseBasicParsing = $true
     }
-    if ($null -ne $Body) {
+    if (-not [string]::IsNullOrEmpty($Body)) {
         $arguments["Body"] = $Body
         $arguments["ContentType"] = "application/json"
     }
@@ -323,7 +335,7 @@ $Result = [ordered]@{
     passed = $false
     platform = [ordered]@{
         os = "windows-11"
-        arch = "x86_64"
+        arch = $PlatformArch
         build = $null
     }
     package = [ordered]@{
@@ -376,17 +388,12 @@ $Result = [ordered]@{
 }
 
 try {
-    Write-Step "checking for a clean Windows 11 x86-64 user environment"
+    Write-Step "checking for a clean Windows 11 64-bit user environment"
     Assert-Condition ($env:OS -eq "Windows_NT") "This smoke requires Windows."
     Assert-Condition ([Environment]::Is64BitOperatingSystem) `
         "This smoke requires 64-bit Windows."
-    $architecture = if ([string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITEW6432)) {
-        $env:PROCESSOR_ARCHITECTURE
-    } else {
-        $env:PROCESSOR_ARCHITEW6432
-    }
-    Assert-Condition ($architecture -eq "AMD64") `
-        "This smoke requires Windows x86-64; found '$architecture'."
+    Assert-Condition ($null -ne $PlatformArch) `
+        "This smoke requires Windows x86-64 or ARM64; found '$MachineArch'."
     $operatingSystem = Get-CimInstance Win32_OperatingSystem
     $build = [int]$operatingSystem.BuildNumber
     Assert-Condition ($build -ge 22000) `
@@ -418,7 +425,7 @@ try {
     $CleanupAllowed = $true
     New-Item -ItemType Directory -Path $SmokeRoot -Force | Out-Null
     $SmokeRootOwned = $true
-    $Checks["windows-11-x86_64"] = $true
+    $Checks[$PlatformCheck] = $true
 
     Write-Step "starting the deterministic loopback OpenAI-compatible mock"
     $MockJob = Start-LoopbackMock $ReadyFile $MockLog $Model $ExpectedResponse
@@ -431,8 +438,13 @@ try {
     $MockUrl = "http://127.0.0.1:$MockPort"
 
     Write-Step "installing and checksum-verifying Alex $Version"
-    & $InstallerPath -Version $Version -Repository $Repository `
-        -InstallDirectory $InstallDirectory
+    if ([string]::IsNullOrWhiteSpace($LocalArchive)) {
+        & $InstallerPath -Version $Version -Repository $Repository `
+            -InstallDirectory $InstallDirectory
+    } else {
+        & $InstallerPath -Version $Version -Repository $Repository `
+            -InstallDirectory $InstallDirectory -LocalArchive $LocalArchive
+    }
     Assert-Condition (Test-Path -LiteralPath $AlexBin -PathType Leaf) `
         "Installer did not install alex.exe."
     $AlexVersion = (& $AlexBin --version | Out-String).Trim()

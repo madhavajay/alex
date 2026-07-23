@@ -29,6 +29,8 @@ mod telegram;
 mod tray;
 mod tui;
 mod ui;
+#[cfg(windows)]
+mod windows_tray;
 
 #[derive(Parser)]
 #[command(
@@ -120,6 +122,8 @@ enum Command {
     Ping {
         #[arg(default_value = "all")]
         target: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Run frozen CLI harnesses in Docker against this proxy and verify traces
     Harness {
@@ -528,6 +532,26 @@ enum FixturesCommand {
     List,
     Show {
         name: String,
+    },
+    /// Export sanitized wire transactions from captured traces
+    Record {
+        /// Provider captured in the selected traces
+        #[arg(long)]
+        provider: String,
+        /// Exact trace id to export; repeat for multiple transactions
+        #[arg(long = "trace-id", conflicts_with_all = ["since", "limit"])]
+        trace_ids: Vec<String>,
+        #[command(flatten)]
+        filter: TraceSelectionArgs,
+        /// Fixture root directory
+        #[arg(long, default_value = "crates/alex-fakeprov/fixtures")]
+        out: PathBuf,
+    },
+    /// Generate the fixture provenance ledger
+    Inventory {
+        /// Fixture root directory
+        #[arg(long, default_value = "crates/alex-fakeprov/fixtures")]
+        dir: PathBuf,
     },
     Save {
         #[arg(long)]
@@ -1055,11 +1079,19 @@ enum TracesCommand {
     },
 }
 
-#[derive(clap::Args)]
-struct TraceFilterArgs {
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
+struct TraceSelectionArgs {
     /// RFC3339 timestamp or relative (30m, 2h, 7d, 45s)
     #[arg(long)]
     since: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(clap::Args)]
+struct TraceFilterArgs {
+    #[command(flatten)]
+    selection: TraceSelectionArgs,
     #[arg(long)]
     until: Option<String>,
     #[arg(long)]
@@ -1083,8 +1115,6 @@ struct TraceFilterArgs {
     errors: bool,
     #[arg(long)]
     key_fingerprint: Option<String>,
-    #[arg(long)]
-    limit: Option<usize>,
     /// Skip this many matching trace summaries (bounded by the daemon)
     #[arg(long)]
     offset: Option<usize>,
@@ -1094,7 +1124,7 @@ impl TraceFilterArgs {
     fn query_params(&self) -> Vec<(&'static str, String)> {
         let mut params: Vec<(&'static str, String)> = Vec::new();
         let opts = [
-            ("since", &self.since),
+            ("since", &self.selection.since),
             ("until", &self.until),
             ("run_id", &self.run_id),
             ("session", &self.session),
@@ -1116,7 +1146,7 @@ impl TraceFilterArgs {
         if self.errors {
             params.push(("errors", "1".into()));
         }
-        if let Some(l) = self.limit {
+        if let Some(l) = self.selection.limit {
             params.push(("limit", l.to_string()));
         }
         if let Some(offset) = self.offset {
@@ -1460,10 +1490,16 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         candidates.push(PathBuf::from(path));
     }
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("claude")));
+        candidates.extend(
+            std::env::split_paths(&path)
+                .flat_map(|dir| alex_core::exec::executable_candidates(&dir, "claude")),
+        );
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/bin/claude"));
+        candidates.extend(alex_core::exec::executable_candidates(
+            &home.join(".local/bin"),
+            "claude",
+        ));
         // Claude Code is commonly installed adjacent to a version-manager
         // Node installation, not just in ~/.local/bin.
         for root in [
@@ -1475,7 +1511,19 @@ fn resolve_dario_claude_bin(override_bin: Option<&Path>) -> Option<PathBuf> {
         ] {
             candidates.extend(dario::newest_versioned_bins_for_cli(&root, "claude"));
         }
-        candidates.push(home.join(".volta/bin/claude"));
+        candidates.extend(alex_core::exec::executable_candidates(
+            &home.join(".volta/bin"),
+            "claude",
+        ));
+        #[cfg(windows)]
+        {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                candidates.extend(alex_core::exec::executable_candidates(
+                    &PathBuf::from(appdata).join("npm"),
+                    "claude",
+                ));
+            }
+        }
     }
     candidates.extend([
         PathBuf::from("/opt/homebrew/bin/claude"),
@@ -3613,7 +3661,17 @@ async fn main() -> Result<()> {
                 eprintln!("generated dario_api_key and saved it to config.toml");
             }
             let has_active_anthropic_oauth = has_active_anthropic_oauth(&vault).await;
-            let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth);
+            let testing_anthropic_override = alex_core::resolve_endpoint_override(
+                "ALEX_UPSTREAM_ANTHROPIC_URL",
+                "https://api.anthropic.com",
+            )
+            .is_some();
+            let testing_dario_override = alex_core::resolve_endpoint_override(
+                "ALEX_DARIO_UPSTREAM_URL",
+                "https://api.anthropic.com",
+            );
+            let dario_route_enabled = config.dario_route_should_enable(has_active_anthropic_oauth)
+                && (!testing_anthropic_override || testing_dario_override.is_some());
             let dario_routing_reason = config.dario_routing_reason(has_active_anthropic_oauth);
             let dario_routing_mode = config.anthropic_upstream.clone();
             // Dario normally installs on demand when its supervisor creates a
@@ -3654,10 +3712,17 @@ async fn main() -> Result<()> {
                 probe_failures: config.dario_probe_failures,
                 probe_model: config.dario_probe_model.clone(),
                 validate_subscription: dario_route_enabled,
+                upstream_base: testing_dario_override.clone(),
                 claude_bin: resolve_dario_claude_bin(config.dario_claude_bin.as_deref()),
                 node_bin: dario::resolve_dario_node_bin(config.dario_node_path.as_deref()),
             };
-            let initial_start = dario::DarioSupervisor::start(settings.clone()).await;
+            let initial_start = if testing_anthropic_override && testing_dario_override.is_none() {
+                Err(anyhow::anyhow!(
+                    "Dario disabled while a testing Anthropic upstream is active"
+                ))
+            } else {
+                dario::DarioSupervisor::start(settings.clone()).await
+            };
             let initial_error = initial_start.as_ref().err().map(ToString::to_string);
             let initial_supervisor = initial_start.ok();
             let glue = Arc::new(DarioGlue {
@@ -3670,7 +3735,7 @@ async fn main() -> Result<()> {
                 last_error: Arc::new(std::sync::Mutex::new(initial_error.clone())),
                 notification_state: Arc::new(std::sync::Mutex::new(None)),
             });
-            let (dario_router, supervisor) = match initial_supervisor {
+            let (mut dario_router, supervisor) = match initial_supervisor {
                 Some(sup) => {
                     eprintln!(
                         "dario: ready generation {} (routing {})",
@@ -3700,7 +3765,12 @@ async fn main() -> Result<()> {
                     (Some(glue.clone() as Arc<dyn alex_proxy::DarioRouter>), None)
                 }
             };
-            if supervisor.is_none() {
+            if testing_anthropic_override && testing_dario_override.is_none() {
+                dario_router = None;
+            }
+            if supervisor.is_none()
+                && (!testing_anthropic_override || testing_dario_override.is_some())
+            {
                 glue.spawn_initial_retry();
             }
             let state = alex_proxy::build_state_with_substitution(
@@ -3713,6 +3783,7 @@ async fn main() -> Result<()> {
                 config.substitution.clone(),
             );
             alex_proxy::set_ping_models(&state, config.ping_models());
+            alex_proxy::apply_upstream_env_overrides(&state);
             alex_proxy::set_notifications(&state, config.notification_settings());
             glue.set_notification_state(state.clone());
             alex_proxy::set_protection_policy(&state, config.protection.clone());
@@ -4019,6 +4090,8 @@ async fn main() -> Result<()> {
                     .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(shutdown());
+            #[cfg(windows)]
+            windows_tray::spawn(format!("http://127.0.0.1:{port}/ui/"));
             let serve_result = if let Some(local_listener) = local_listener {
                 let local = axum::serve(
                     local_listener,
@@ -4645,7 +4718,7 @@ async fn main() -> Result<()> {
         } => {
             harness_connect::disconnect_cmd(&config, harness, config_dir).await?;
         }
-        Command::Ping { target } => {
+        Command::Ping { target, json } => {
             let store = Arc::new(Store::open(config.data_dir.clone())?);
             let vault = Arc::new(open_vault(&config)?);
             let state = alex_proxy::build_state(
@@ -4656,6 +4729,7 @@ async fn main() -> Result<()> {
                 config.base_url(),
                 config.upstream_stream_idle_timeout(),
             );
+            alex_proxy::apply_upstream_env_overrides(&state);
             let models = config.ping_models();
             let wants_dario = target == "all" || target == "dario";
             let providers: Vec<alex_core::Provider> = if target == "all" {
@@ -4688,22 +4762,44 @@ async fn main() -> Result<()> {
                 ]
             };
             if providers.is_empty() && !wants_dario {
-                println!("no pingable accounts — run `alex auth import`");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": false,
+                            "summary": "no pingable accounts",
+                            "results": [],
+                        }))?
+                    );
+                } else {
+                    println!("no pingable accounts — run `alex auth import`");
+                }
                 return Ok(());
             }
             let mut results = if providers.is_empty() {
                 vec![]
             } else {
-                run_pings(&state, &models, &providers).await
+                run_pings(&state, &models, &providers, !json).await
             };
             if wants_dario {
                 let dario = ping_dario_daemon(&config).await;
-                println!("{}", ping_done_line(&dario));
+                if !json {
+                    println!("{}", ping_done_line(&dario));
+                }
                 results.push(dario);
             }
             let ok = results.iter().filter(|r| r.ok).count();
             let summary = format!("{ok}/{} providers healthy", results.len());
-            if ok == results.len() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": ok == results.len(),
+                        "summary": summary,
+                        "results": results,
+                    }))?
+                );
+            } else if ok == results.len() {
                 println!("{} {}", ui::gold(ui::diamond()), ui::bold(&summary));
             } else {
                 println!("{} {}", ui::red("✗"), ui::red(&ui::bold(&summary)));
@@ -5252,6 +5348,41 @@ async fn main() -> Result<()> {
                 if !status.is_success() {
                     anyhow::bail!("fixture delete failed: {body}");
                 }
+            }
+            FixturesCommand::Record {
+                provider,
+                trace_ids,
+                filter,
+                out,
+            } => {
+                let limit = filter.limit.unwrap_or(20);
+                if limit == 0 {
+                    anyhow::bail!("--limit must be positive");
+                }
+                let since_ms = filter
+                    .since
+                    .as_deref()
+                    .map(|value| {
+                        alex_core::parse_since(value, now_ms())
+                            .with_context(|| format!("invalid --since value '{value}'"))
+                    })
+                    .transpose()?;
+                let store = Store::open(config.data_dir.clone())?;
+                let report = alex_store::recording::record_fixtures(
+                    &store,
+                    &alex_store::recording::RecordFixturesOptions {
+                        provider,
+                        trace_ids,
+                        since_ms,
+                        limit,
+                        out_dir: out,
+                    },
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            FixturesCommand::Inventory { dir } => {
+                let inventory = alex_store::recording::write_inventory(&dir)?;
+                println!("{}", inventory.display());
             }
             FixturesCommand::Save {
                 name,
@@ -6624,15 +6755,22 @@ async fn start_agent_trace_import(
 
 fn cursor_agent_transcript_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
-    let key = cwd
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .replace('/', "-");
+    let key = cursor_project_key(&cwd);
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not found"))?;
     Ok(home
         .join(".cursor/projects")
         .join(key)
         .join("agent-transcripts"))
+}
+
+/// Cursor's per-project directory key: the absolute cwd with separators
+/// flattened to dashes. Handles Windows drive letters and backslashes so
+/// `C:\Users\x\proj` becomes `C--Users-x-proj` instead of an invalid name.
+fn cursor_project_key(cwd: &std::path::Path) -> String {
+    cwd.to_string_lossy()
+        .trim_start_matches('/')
+        .replace(':', "-")
+        .replace(['/', '\\'], "-")
 }
 
 fn import_agent_transcripts(
@@ -7058,7 +7196,7 @@ fn write_gzip_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> 
         encoder.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
         let file = encoder.finish()?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path).with_context(|| {
+        alex_core::exec::atomic_replace(&tmp, path).with_context(|| {
             format!(
                 "replace compressed trace body {} with {}",
                 path.display(),
@@ -9337,6 +9475,7 @@ async fn run_pings(
     state: &Arc<alex_proxy::AppState>,
     models: &alex_proxy::PingModels,
     providers: &[alex_core::Provider],
+    display: bool,
 ) -> Vec<alex_proxy::PingResult> {
     use std::io::{IsTerminal, Write};
     let n = providers.len();
@@ -9373,7 +9512,7 @@ async fn run_pings(
         alex_core::Provider::Amp => "amp".to_string(),
         alex_core::Provider::Kimi => models.kimi.clone(),
     };
-    if std::io::stdout().is_terminal() {
+    if display && std::io::stdout().is_terminal() {
         println!("{}", ui::section("provider health"));
         print!("\x1b[?25l");
         let start = std::time::Instant::now();
@@ -9416,7 +9555,7 @@ async fn run_pings(
     }
     let results: Vec<alex_proxy::PingResult> =
         slots.lock().unwrap().iter().flatten().cloned().collect();
-    if !std::io::stdout().is_terminal() {
+    if display && !std::io::stdout().is_terminal() {
         for r in &results {
             println!("{}", ping_done_line(r));
         }
@@ -11199,6 +11338,22 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn cursor_project_key_flattens_unix_paths() {
+        assert_eq!(
+            cursor_project_key(std::path::Path::new("/Users/x/dev/proj")),
+            "Users-x-dev-proj"
+        );
+    }
+
+    #[test]
+    fn cursor_project_key_flattens_windows_paths() {
+        assert_eq!(
+            cursor_project_key(std::path::Path::new(r"C:\Users\x\dev\proj")),
+            "C--Users-x-dev-proj"
+        );
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "alex-main-{name}-{}-{}",
@@ -11277,6 +11432,65 @@ mod tests {
             }
             _ => panic!("unexpected CLIProxyAPI reverse export parse"),
         }
+    }
+
+    #[test]
+    fn fixture_recording_cli_supports_ids_or_shared_trace_filters() {
+        let cli = Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--trace-id",
+            "trace-a",
+            "--trace-id",
+            "trace-b",
+            "--out",
+            "fixtures",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Fixtures {
+                command:
+                    FixturesCommand::Record {
+                        provider,
+                        trace_ids,
+                        filter,
+                        out,
+                    },
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(trace_ids, ["trace-a", "trace-b"]);
+                assert_eq!(filter, TraceSelectionArgs::default());
+                assert_eq!(out, PathBuf::from("fixtures"));
+            }
+            _ => panic!("unexpected fixture record parse"),
+        }
+        assert!(Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--trace-id",
+            "trace-a",
+            "--since",
+            "2h",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "alex",
+            "fixtures",
+            "record",
+            "--provider",
+            "anthropic",
+            "--since",
+            "2h",
+            "--limit",
+            "10",
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -12896,6 +13110,22 @@ continue = true
     }
 
     #[test]
+    fn dario_upstream_override_uses_loopback_gate() {
+        let resolve = |value: &str| {
+            alex_core::testing_overrides::resolve_endpoint_override_with(
+                "ALEX_DARIO_UPSTREAM_URL",
+                "https://api.anthropic.com",
+                |name| (name == "ALEX_DARIO_UPSTREAM_URL").then(|| value.to_string()),
+            )
+        };
+        assert_eq!(
+            resolve("http://127.0.0.1:4200/anthropic"),
+            Some("http://127.0.0.1:4200/anthropic".into())
+        );
+        assert_eq!(resolve("https://example.com/anthropic"), None);
+    }
+
+    #[test]
     fn config_heal_migrates_legacy_dario_default_once() {
         let mut config = test_config(tmpdir("dario-heal-legacy"));
         config.anthropic_upstream = "direct".into();
@@ -13883,7 +14113,7 @@ local_key = "alx-test"
         assert_eq!(status, StatusCode::OK);
         let harnesses = body["harnesses"].as_array().unwrap();
         assert!(body["checked_ms"].as_i64().unwrap() > 0);
-        assert_eq!(harnesses.len(), 19);
+        assert_eq!(harnesses.len(), 16);
         assert!(harnesses.iter().all(|h| h["daemon_reachable"] == true));
         assert!(harnesses.iter().all(|h| h.get("name").is_some()));
         assert!(harnesses.iter().all(|h| h.get("override").is_some()));

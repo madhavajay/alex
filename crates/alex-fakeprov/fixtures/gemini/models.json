@@ -1,0 +1,5 @@
+{
+  "models": [
+    {"name": "models/gemini-fake-1", "displayName": "Gemini Fake 1", "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+  ]
+}

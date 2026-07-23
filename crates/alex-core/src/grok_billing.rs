@@ -9,6 +9,10 @@ use std::borrow::Cow;
 pub const GROK_CREDITS_ENDPOINT: &str =
     "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 
+pub fn grok_credits_endpoint() -> String {
+    crate::resolve_endpoint_url("ALEX_UPSTREAM_XAI_URL", GROK_CREDITS_ENDPOINT)
+}
+
 /// Empty gRPC-web frame body (flags=0, length=0) sent for the no-arg RPC.
 pub const GROK_CREDITS_REQUEST_BODY: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00];
 
@@ -452,6 +456,41 @@ mod tests {
         let snap = parse_grpc_web_response(&data, 1_799_000_000).unwrap();
         assert!((snap.used_percent - 42.5).abs() < 1e-5);
         assert_eq!(snap.resets_at_s, Some(reset as i64));
+    }
+
+    #[test]
+    fn rejects_empty_truncated_and_garbage_grpc_web_responses() {
+        let cases: &[(&str, &[u8], GrokWebBillingError)] = &[
+            ("empty", &[], GrokWebBillingError::EmptyResponse),
+            (
+                "header shorter than five bytes",
+                &[0x00, 0x00, 0x00, 0x00],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "declared payload is truncated",
+                &[0x00, 0x00, 0x00, 0x00, 0x04, 0x0D, 0x00],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "garbage wire type",
+                &[0xFF, 0xFF, 0xFF],
+                GrokWebBillingError::EmptyResponse,
+            ),
+            (
+                "protobuf-shaped garbage",
+                &[0x08, 0x80],
+                GrokWebBillingError::ParseFailed,
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            assert_eq!(
+                parse_grpc_web_response(body, 1_800_000_000),
+                Err(expected.clone()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

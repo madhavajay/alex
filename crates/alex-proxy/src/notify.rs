@@ -91,7 +91,7 @@ impl NotificationMessageLog {
             if let Ok(bytes) = serde_json::to_vec(&*entries) {
                 let temporary = path.with_extension("json.tmp");
                 if std::fs::write(&temporary, bytes).is_ok() {
-                    let _ = std::fs::rename(temporary, path);
+                    let _ = alex_core::exec::atomic_replace(&temporary, path);
                 }
             }
         }

@@ -1,0 +1,5 @@
+# SSE fixtures encode frame boundaries as exact \n\n byte sequences;
+# CRLF conversion on Windows checkouts corrupts them.
+*.sse -text
+crates/alex-fakeprov/fixtures/** -text
+crates/alex-proxy/tests/fixtures/** -text

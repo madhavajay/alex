@@ -1,0 +1,5 @@
+{
+  "endpoints": {
+    "POST /kimi/coding/v1/chat/completions": [{"failure": "quota", "repeat": true}]
+  }
+}

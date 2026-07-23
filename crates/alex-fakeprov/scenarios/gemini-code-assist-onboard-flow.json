@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "POST /gemini/v1internal:loadCodeAssist": [{"fixture": "gemini/load-code-assist.json"}],
+    "POST /gemini/v1internal:onboardUser": [{"fixture": "gemini/onboard-user.json"}],
+    "POST /gemini/v1internal:generateContent": [{"fixture": "gemini/code-assist-generate.json", "repeat": true}],
+    "POST /gemini/v1internal:streamGenerateContent": [{"fixture": "gemini/code-assist-generate-stream.sse", "repeat": true}]
+  }
+}

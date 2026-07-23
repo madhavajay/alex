@@ -8,6 +8,7 @@ members = [
   "crates/alex-auth",
   "crates/alex-store",
   "crates/alex-proxy",
+  "crates/alex-fakeprov",
   "crates/alex-wrap",
   "crates/alex",
 ]

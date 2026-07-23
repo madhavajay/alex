@@ -160,6 +160,13 @@ struct MessageBubble: View {
         return harnessLines.prefix(4).joined(separator: "\n")
     }
 
+    private var displayedAttributedContent: AttributedString {
+        guard !isLongHarnessBody || expandedHarnessBody else {
+            return AttributedString(displayedContent)
+        }
+        return message.attributedContent ?? AttributedString(displayedContent)
+    }
+
     @ViewBuilder private var expandToggle: some View {
         if isLongHarnessBody {
             Button {
@@ -180,7 +187,7 @@ struct MessageBubble: View {
     }
 
     private var bubble: some View {
-        Text(displayedContent)
+        Text(displayedAttributedContent)
             .font(message.isMonospaced ? AlexTheme.Fonts.mono(11.5) : AlexTheme.Fonts.bubbleBody)
             .lineSpacing(3)
             .foregroundStyle(

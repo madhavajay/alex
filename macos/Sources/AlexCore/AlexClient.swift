@@ -131,10 +131,17 @@ public enum TraceBodyKind: String, Sendable, CaseIterable {
 public struct TraceBodyContent: Sendable, Equatable {
     public let text: String
     public let diskPath: String?
+    public let isTruncated: Bool
+    public let fullByteCount: Int
 
-    public init(text: String, diskPath: String?) {
+    public init(
+        text: String, diskPath: String?, isTruncated: Bool = false,
+        fullByteCount: Int? = nil
+    ) {
         self.text = text
         self.diskPath = diskPath
+        self.isTruncated = isTruncated
+        self.fullByteCount = fullByteCount ?? text.utf8.count
     }
 }
 
@@ -142,6 +149,7 @@ public struct AlexClient: Sendable {
     public let config: DaemonConfig
     private let session: URLSession
     private static let harnessConfigurationTimeout: TimeInterval = 60
+    public static let displayBodyByteLimit = 2 * 1024 * 1024
 
     public init(config: DaemonConfig) {
         self.config = config
@@ -161,13 +169,23 @@ public struct AlexClient: Sendable {
 
     public enum ClientError: Error, LocalizedError {
         case http(Int, String)
+        case transport(String)
         case daemonUpdateRejected(String)
         public var errorDescription: String? {
             switch self {
-            case let .http(code, body): "HTTP \(code): \(body.prefix(200))"
+            case let .http(code, body): "HTTP \(code): \(body)"
+            case let .transport(message): "Transport error: \(message)"
             case let .daemonUpdateRejected(reason): reason
             }
         }
+    }
+
+    private static func httpError(status: Int, data: Data) -> ClientError {
+        .http(status, String((String(data: data, encoding: .utf8) ?? "").prefix(200)))
+    }
+
+    private static func transportError(_ error: Error) -> ClientError {
+        .transport(error.localizedDescription)
     }
 
     private func url(_ path: String, query: [URLQueryItem] = []) -> URL {
@@ -197,12 +215,12 @@ public struct AlexClient: Sendable {
             (data, resp) = try await session.data(for: req)
         } catch {
             BarLog.error(.net, "\(method) /\(path) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
-            throw error
+            throw Self.transportError(error)
         }
         let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
         if status >= 400 {
             BarLog.error(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
-            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: status, data: data)
         }
         BarLog.info(.net, "\(method) /\(path) \(status) \(Self.ms(since: start))ms")
         return data
@@ -906,6 +924,23 @@ public struct AlexClient: Sendable {
             as: TranscriptResponse.self)
     }
 
+    public func traceTranscriptPage(
+        sessionId: String, limit: Int = 50, cursor: TranscriptCursor? = nil
+    ) async throws -> TranscriptPageResponse {
+        try await get(
+            "traces/sessions/\(sessionId)/transcript/page",
+            query: [
+                URLQueryItem(name: "limit", value: "\(limit)"),
+                URLQueryItem(name: "after_ms", value: cursor.map { "\($0.afterMs)" }),
+                URLQueryItem(name: "after_id", value: cursor?.afterId),
+            ],
+            as: TranscriptPageResponse.self)
+    }
+
+    public func traceTurn(id: String) async throws -> TranscriptTurn {
+        try await get("traces/\(id)/turn", as: TraceTurnResponse.self).turn
+    }
+
     public func searchTraces(text: String, since: String = "24h", filters: OmniQuery = OmniQuery()) async throws -> TraceSearchResponse {
         try await get(
             "traces/search",
@@ -929,7 +964,9 @@ public struct AlexClient: Sendable {
         try await get("traces/\(id)", as: TraceDetailResponse.self)
     }
 
-    public func traceBody(id: String, kind: TraceBodyKind) async throws -> TraceBodyContent {
+    public func traceBody(
+        id: String, kind: TraceBodyKind, maxBytes: Int? = displayBodyByteLimit
+    ) async throws -> TraceBodyContent {
         var req = URLRequest(url: url("traces/\(id)/body/\(kind.rawValue)"))
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
         let start = ContinuousClock.now
@@ -941,29 +978,53 @@ public struct AlexClient: Sendable {
             BarLog.error(
                 .net,
                 "GET /traces/\(id)/body/\(kind.rawValue) error \(Self.ms(since: start))ms: \(error.localizedDescription)")
-            throw error
+            throw Self.transportError(error)
         }
         let http = resp as? HTTPURLResponse
         let status = http?.statusCode ?? -1
         if status >= 400 {
             BarLog.error(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
-            throw ClientError.http(status, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: status, data: data)
         }
         BarLog.info(.net, "GET /traces/\(id)/body/\(kind.rawValue) \(status) \(Self.ms(since: start))ms")
-        return TraceBodyContent(
-            text: String(data: data, encoding: .utf8) ?? "",
-            diskPath: http?.value(forHTTPHeaderField: "x-alex-body-path"))
+        return Self.bodyContent(
+            data: data, diskPath: http?.value(forHTTPHeaderField: "x-alex-body-path"),
+            maxBytes: maxBytes)
     }
 
-    public func toolBody(id: String, kind: String) async throws -> TraceBodyContent {
+    public func toolBody(
+        id: String, kind: String, maxBytes: Int? = displayBodyByteLimit
+    ) async throws -> TraceBodyContent {
         var req = URLRequest(url: url("tools/\(id)/body/\(kind)"))
         req.setValue(config.localKey, forHTTPHeaderField: "x-api-key")
-        let (data, response) = try await session.data(for: req)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch {
+            throw Self.transportError(error)
+        }
         let http = response as? HTTPURLResponse
         guard (http?.statusCode ?? -1) < 400 else {
-            throw ClientError.http(http?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
+            throw Self.httpError(status: http?.statusCode ?? -1, data: data)
         }
-        return TraceBodyContent(text: String(data: data, encoding: .utf8) ?? "", diskPath: nil)
+        return Self.bodyContent(data: data, diskPath: nil, maxBytes: maxBytes)
+    }
+
+    private static func bodyContent(
+        data: Data, diskPath: String?, maxBytes: Int?
+    ) -> TraceBodyContent {
+        let limit = maxBytes.map { max(0, $0) }
+        let truncated = limit.map { data.count > $0 } ?? false
+        let displayed: Data
+        if let limit {
+            displayed = data.subdata(in: 0..<min(limit, data.count))
+        } else {
+            displayed = data
+        }
+        return TraceBodyContent(
+            text: String(decoding: displayed, as: UTF8.self), diskPath: diskPath,
+            isTruncated: truncated, fullByteCount: data.count)
     }
 
     public func traceReplyMarkdown(traceId: String) async throws -> String {

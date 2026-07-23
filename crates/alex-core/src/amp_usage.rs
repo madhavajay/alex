@@ -378,6 +378,99 @@ Workspace Team A: $100.00 remaining
     }
 
     #[test]
+    fn parses_recorded_balance_text_variants() {
+        let cases = [
+            (
+                "individual balance",
+                "Signed in as me@example.com\nIndividual credits: $20.95 remaining (set up automatic top-up)",
+                Some("me@example.com"),
+                None,
+                Some(20.95),
+                Vec::new(),
+            ),
+            (
+                "free balance with ansi and commas",
+                "\u{1b}[32mSigned in as Dev@Example.com (Acme)\u{1b}[0m\nAmp Free: $1,250.50 / $2,000.00 remaining (replenishes +$4.25 / hour)",
+                Some("Dev@Example.com"),
+                Some((2_000.0, 749.5, 1_250.5, 4.25)),
+                None,
+                Vec::new(),
+            ),
+            (
+                "workspace balances",
+                "Signed in as work@example.com\nWorkspace Platform: $100.00 remaining\nWorkspace Research: $0.50 remaining",
+                Some("work@example.com"),
+                None,
+                None,
+                vec![("Platform", 100.0), ("Research", 0.5)],
+            ),
+        ];
+
+        for (name, text, email, free, individual, workspaces) in cases {
+            let parsed =
+                parse_usage_display_text(text).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(parsed.account_email.as_deref(), email, "{name}");
+            assert_eq!(parsed.individual_credits, individual, "{name}");
+            if let Some((quota, used, remaining, hourly)) = free {
+                assert_eq!(parsed.free_quota, Some(quota), "{name}");
+                assert_eq!(parsed.free_used, Some(used), "{name}");
+                assert_eq!(parsed.free_remaining, Some(remaining), "{name}");
+                assert_eq!(parsed.hourly_replenishment, Some(hourly), "{name}");
+            }
+            assert_eq!(
+                parsed
+                    .workspace_balances
+                    .iter()
+                    .map(|workspace| (workspace.name.as_str(), workspace.remaining))
+                    .collect::<Vec<_>>(),
+                workspaces,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_balance_text_and_api_envelopes() {
+        let display_cases = [
+            ("empty", ""),
+            ("signed in without balances", "Signed in as a@b.com"),
+            ("signed out", "You are not logged in. Please log in."),
+            ("malformed money", "Individual credits: $nope remaining"),
+        ];
+        for (name, text) in display_cases {
+            assert!(parse_usage_display_text(text).is_err(), "{name}");
+        }
+
+        let api_cases = [
+            ("invalid json", "not-json", "invalid Amp usage API JSON"),
+            (
+                "auth required",
+                r#"{"ok":false,"error":{"code":"auth-required","message":"login"}}"#,
+                "invalid or expired",
+            ),
+            (
+                "provider error",
+                r#"{"ok":false,"error":{"message":"billing unavailable"}}"#,
+                "billing unavailable",
+            ),
+            (
+                "missing result",
+                r#"{"ok":true,"result":{}}"#,
+                "missing Amp usage display text",
+            ),
+            (
+                "blank result",
+                r#"{"ok":true,"result":{"displayText":"  "}}"#,
+                "missing Amp usage display text",
+            ),
+        ];
+        for (name, body, expected) in api_cases {
+            let error = parse_usage_api_response(body).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
     fn free_window_used_pct() {
         let text = "Signed in as a@b.com\nAmp Free: $2.00 / $10.00 remaining\n";
         let snap = parse_usage_display_text(text).unwrap();

@@ -1,0 +1,5 @@
+{
+  "usage": {"limit": 1000, "used": 250, "remaining": 750, "name": "Weekly", "reset_at": "2026-08-01T00:00:00Z"},
+  "limits": [{"detail": {"limit": 40, "remaining": 10, "title": "5h", "reset_at": "2026-07-23T00:00:00Z"}}],
+  "boosterWallet": {"balance": {"type": "BOOSTER", "amount": 5}, "currency": "USD"}
+}

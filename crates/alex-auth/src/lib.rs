@@ -41,6 +41,14 @@ const ANTHROPIC_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile
 const XAI_USERINFO_URL: &str = "https://auth.x.ai/oauth2/userinfo";
 const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
 
+pub fn resolve_external_url(provider_env: &str, default: &str) -> String {
+    alex_core::resolve_endpoint_url(provider_env, default)
+}
+
+pub fn resolve_external_url_override(provider_env: &str, default: &str) -> Option<String> {
+    alex_core::resolve_endpoint_override(provider_env, default)
+}
+
 // The gemini-cli OAuth client is a public "installed app" credential embedded
 // in Google's open-source CLI (not a confidential secret). Assembled from
 // fragments so repo secret-scanners don't false-positive on the literal.
@@ -275,8 +283,14 @@ pub(crate) async fn fetch_provider_email(
     access_token: &str,
 ) -> Option<String> {
     let mut request = match provider {
-        Provider::Anthropic => http.get(ANTHROPIC_PROFILE_URL),
-        Provider::Xai => http.get(XAI_USERINFO_URL),
+        Provider::Anthropic => http.get(resolve_external_url(
+            "ALEX_UPSTREAM_ANTHROPIC_URL",
+            ANTHROPIC_PROFILE_URL,
+        )),
+        Provider::Xai => http.get(resolve_external_url(
+            "ALEX_UPSTREAM_XAI_URL",
+            XAI_USERINFO_URL,
+        )),
         _ => return None,
     }
     .bearer_auth(access_token)
@@ -847,7 +861,7 @@ impl Vault {
         let tombstone_path = tombstone_dir.join(format!("{id}.json"));
         let temporary = tombstone_path.with_extension("json.tmp");
         std::fs::write(&temporary, serde_json::to_vec_pretty(&tombstone)?)?;
-        std::fs::rename(&temporary, &tombstone_path)?;
+        alex_core::exec::atomic_replace(&temporary, &tombstone_path)?;
         self.accounts.write().await.remove(id);
         let path = self.dir.join(format!("{id}.json"));
         if path.exists() {
@@ -1313,7 +1327,7 @@ impl Vault {
     async fn refresh_anthropic(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(ANTHROPIC_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_ANTHROPIC_URL", ANTHROPIC_TOKEN_URL))
             .json(&json!({
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -1327,7 +1341,7 @@ impl Vault {
     async fn refresh_openai(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(OPENAI_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_CODEX_URL", OPENAI_TOKEN_URL))
             .json(&json!({
                 "client_id": OPENAI_CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -1342,7 +1356,7 @@ impl Vault {
     async fn refresh_xai(&self, refresh_token: &str, client_id: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(XAI_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_XAI_URL", XAI_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1356,7 +1370,7 @@ impl Vault {
     async fn refresh_gemini(&self, refresh_token: &str) -> Result<RefreshedTokens> {
         let resp = self
             .http
-            .post(self.refresh_endpoint(GOOGLE_TOKEN_URL))
+            .post(self.refresh_endpoint("ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL", GOOGLE_TOKEN_URL))
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
@@ -1369,12 +1383,12 @@ impl Vault {
     }
 
     /// Resolve the OAuth token endpoint, honouring a test/diagnostic override.
-    fn refresh_endpoint(&self, default: &str) -> String {
+    fn refresh_endpoint(&self, provider_env: &str, default: &str) -> String {
         self.refresh_endpoint_override
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| default.to_string())
+            .unwrap_or_else(|| resolve_external_url(provider_env, default))
     }
 
     /// Point every provider's token-refresh POST at `url` (or clear with
@@ -1539,7 +1553,7 @@ pub(crate) fn atomic_write_private(path: &Path, data: &[u8]) -> Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary_path, path)?;
+        alex_core::exec::atomic_replace(&temporary_path, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1568,7 +1582,7 @@ fn write_routing_policies(dir: &Path, policies: &[(Provider, AccountPolicy)]) ->
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&temp, &path)?;
+    alex_core::exec::atomic_replace(&temp, &path)?;
     Ok(())
 }
 
@@ -2246,7 +2260,7 @@ pub async fn fetch_amp_account_email(api_key: &str) -> Option<String> {
         .build()
         .ok()?;
     let response = client
-        .post(AMP_USAGE_URL)
+        .post(resolve_external_url("ALEX_UPSTREAM_AMP_URL", AMP_USAGE_URL))
         .bearer_auth(key)
         .header("accept", "application/json")
         .header("content-type", "application/json")
@@ -2609,6 +2623,107 @@ mod tests {
             None,
         );
         assert!(expired.needs_refresh());
+    }
+
+    #[test]
+    fn account_refresh_eligibility_covers_credential_kind_and_expiry_state() {
+        let now = now_ms();
+        let mut fresh = oauth_account(
+            "openai-oauth-fresh",
+            Provider::Openai,
+            "fresh@example.com",
+            now + REFRESH_MARGIN_MS + 300_000,
+        );
+        let mut inside_margin = fresh.clone();
+        inside_margin.id = "openai-oauth-margin".into();
+        inside_margin.expires_at_ms = Some(now + REFRESH_MARGIN_MS / 2);
+        let mut expired = fresh.clone();
+        expired.id = "openai-oauth-expired".into();
+        expired.expires_at_ms = Some(now - 1);
+        let mut unknown_expiry = fresh.clone();
+        unknown_expiry.id = "openai-oauth-no-expiry".into();
+        unknown_expiry.expires_at_ms = None;
+        let api_key = api_key_account("openai-api_key", Provider::Openai);
+        fresh.refresh_token = None;
+
+        let cases = [
+            ("fresh oauth", fresh, false),
+            ("inside refresh margin", inside_margin, true),
+            ("expired oauth", expired, true),
+            ("oauth without expiry", unknown_expiry, true),
+            ("api key", api_key, false),
+        ];
+
+        for (name, account, expected) in cases {
+            assert_eq!(account.needs_refresh(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn jwt_expiry_parsing_accepts_valid_claims_and_rejects_malformed_tokens() {
+        let cases = [
+            (
+                "integer expiry",
+                json!({"exp": 1_800_000_000_i64}),
+                Some(1_800_000_000_000_i64),
+            ),
+            ("missing expiry", json!({"sub": "user"}), None),
+            ("string expiry", json!({"exp": "1800000000"}), None),
+            ("null expiry", json!({"exp": null}), None),
+        ];
+
+        for (name, payload, expected) in cases {
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap());
+            assert_eq!(
+                jwt_exp_ms(&format!("header.{encoded}.signature")),
+                expected,
+                "{name}"
+            );
+        }
+
+        for malformed in ["", "header", "header.***.signature", "header.e30"] {
+            assert_eq!(jwt_exp_ms(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn pure_account_state_flags_cover_reauth_policy_and_credential_freshness() {
+        let now = now_ms();
+        let mut account = oauth_account(
+            "openai-oauth-work",
+            Provider::Openai,
+            "work@example.com",
+            now + 600_000,
+        );
+        account.name = "work".into();
+        assert!(!account.needs_reauth());
+        account.account_meta["needs_reauth"] = json!(true);
+        assert!(account.needs_reauth());
+        account.account_meta["needs_reauth"] = json!("true");
+        assert!(!account.needs_reauth());
+
+        let enabled = AccountPolicy::default();
+        assert!(account_proxy_eligible(&account, &enabled));
+        for disabled in [vec!["work".into()], vec![account.id.clone()]] {
+            let policy = AccountPolicy {
+                disabled,
+                ..AccountPolicy::default()
+            };
+            assert!(!account_proxy_eligible(&account, &policy));
+        }
+
+        account.account_meta = json!({"email": "work@example.com"});
+        let valid_rank = credential_rank(&account);
+        account.expires_at_ms = Some(now - 1);
+        let expired_rank = credential_rank(&account);
+        account.expires_at_ms = Some(now + 600_000);
+        account.access_token = None;
+        account.refresh_token = None;
+        let missing_rank = credential_rank(&account);
+        assert!(valid_rank.0);
+        assert!(!expired_rank.0);
+        assert!(!missing_rank.0);
     }
 
     fn temp_dir(name: &str) -> PathBuf {

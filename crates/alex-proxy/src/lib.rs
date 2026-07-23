@@ -17,10 +17,11 @@ use alex_auth::{
     BundleSelection, RemovedAccount, Vault,
 };
 use alex_core::{
-    compute_cost, conversation_root, parse_grpc_web_response, parse_since, parse_sse_usage,
-    parse_trace_tags, parse_usage_api_response, quota_state, route_model, usage_from_json,
+    allowed_override_url, compute_cost, conversation_root, grok_credits_endpoint,
+    parse_grpc_web_response, parse_since, parse_sse_usage, parse_trace_tags,
+    parse_usage_api_response, quota_state, resolve_endpoint_override, route_model, usage_from_json,
     usage_to_limits_entry, validate_grpc_status_headers, window_label, ClientFormat, Provider,
-    TraceIngestPayload, TraceRecord, GROK_CREDITS_ENDPOINT, GROK_CREDITS_REQUEST_BODY,
+    TraceIngestPayload, TraceRecord, GROK_CREDITS_REQUEST_BODY,
 };
 use alex_store::{KnownAccount, Store, ToolCallRecord, TraceBodyKind, TraceFilter};
 use anyhow::Result;
@@ -51,6 +52,7 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 const GEMINI_CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CODE_ASSIST_VERSION: &str = "v1internal";
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+const AMP_BASE: &str = "https://ampcode.com";
 const CODEX_AFFINITY_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CODEX_AFFINITY_MAX_ENTRIES: usize = 10_000;
 const UPSTREAM_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -646,6 +648,8 @@ pub struct AppState {
     /// seam exists so local integrations can exercise the complete dispatch,
     /// retry, and translation path without contacting a live provider.
     upstream_base_overrides: std::sync::RwLock<HashMap<Provider, String>>,
+    codex_base_override: std::sync::RwLock<Option<String>>,
+    gemini_code_assist_base_override: std::sync::RwLock<Option<String>>,
     pub dario: Option<Arc<dyn DarioRouter>>,
     pub in_flight: std::sync::atomic::AtomicI64,
     /// Set before graceful shutdown begins. Background provider probes use it
@@ -703,6 +707,7 @@ pub struct AppState {
     middleware_leases: std::sync::Mutex<HashMap<String, middleware::MiddlewareRouteLease>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
+    transcript_cache: std::sync::Mutex<TranscriptCache>,
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
@@ -1193,6 +1198,8 @@ pub fn build_state_with_substitution(
         store: store.clone(),
         http,
         upstream_base_overrides: std::sync::RwLock::new(HashMap::new()),
+        codex_base_override: std::sync::RwLock::new(None),
+        gemini_code_assist_base_override: std::sync::RwLock::new(None),
         dario,
         in_flight: std::sync::atomic::AtomicI64::new(0),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1243,6 +1250,7 @@ pub fn build_state_with_substitution(
         middleware_leases: std::sync::Mutex::new(middleware_leases),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
+        transcript_cache: std::sync::Mutex::new(TranscriptCache::new(512)),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
         ping_models: std::sync::RwLock::new(PingModels::default()),
         credential_test_lock: tokio::sync::Mutex::new(()),
@@ -1261,16 +1269,96 @@ fn upstream_base(state: &AppState, provider: Provider, default: &str) -> String 
         .to_string()
 }
 
-/// Overrides one provider's dispatch base. This deliberately changes only
-/// model traffic; usage/auth endpoints retain their provider-owned URLs.
-/// Primarily used by deterministic middleware and wire integration tests.
+fn dedicated_upstream_base(
+    override_slot: &std::sync::RwLock<Option<String>>,
+    default: &str,
+) -> String {
+    override_slot
+        .read()
+        .ok()
+        .and_then(|override_url| override_url.clone())
+        .unwrap_or_else(|| default.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn codex_upstream_base(state: &AppState) -> String {
+    dedicated_upstream_base(&state.codex_base_override, CODEX_BASE)
+}
+
+fn gemini_code_assist_upstream_base(state: &AppState) -> String {
+    dedicated_upstream_base(
+        &state.gemini_code_assist_base_override,
+        GEMINI_CODE_ASSIST_BASE,
+    )
+}
+
 pub fn set_upstream_base_override(
     state: &Arc<AppState>,
     provider: Provider,
     base_url: impl Into<String>,
 ) {
+    let base_url = base_url.into();
+    if !allowed_override_url(&base_url) {
+        return;
+    }
     if let Ok(mut overrides) = state.upstream_base_overrides.write() {
-        overrides.insert(provider, base_url.into());
+        overrides.insert(provider, base_url);
+    }
+}
+
+pub fn set_codex_base_override(state: &Arc<AppState>, base_url: impl Into<String>) {
+    let base_url = base_url.into();
+    if allowed_override_url(&base_url) {
+        if let Ok(mut slot) = state.codex_base_override.write() {
+            *slot = Some(base_url);
+        }
+    }
+}
+
+pub fn set_gemini_code_assist_base_override(state: &Arc<AppState>, base_url: impl Into<String>) {
+    let base_url = base_url.into();
+    if allowed_override_url(&base_url) {
+        if let Ok(mut slot) = state.gemini_code_assist_base_override.write() {
+            *slot = Some(base_url);
+        }
+    }
+}
+
+pub fn apply_upstream_env_overrides(state: &Arc<AppState>) {
+    for (provider, env, default) in [
+        (
+            Provider::Anthropic,
+            "ALEX_UPSTREAM_ANTHROPIC_URL",
+            ANTHROPIC_BASE,
+        ),
+        (Provider::Openai, "ALEX_UPSTREAM_OPENAI_URL", OPENAI_BASE),
+        (Provider::Xai, "ALEX_UPSTREAM_XAI_URL", XAI_BASE),
+        (
+            Provider::Gemini,
+            "ALEX_UPSTREAM_GEMINI_URL",
+            GEMINI_API_BASE,
+        ),
+        (
+            Provider::Openrouter,
+            "ALEX_UPSTREAM_OPENROUTER_URL",
+            OPENROUTER_BASE,
+        ),
+        (Provider::Kimi, "ALEX_UPSTREAM_KIMI_URL", KIMI_BASE),
+        (Provider::Amp, "ALEX_UPSTREAM_AMP_URL", AMP_BASE),
+    ] {
+        if let Some(url) = resolve_endpoint_override(env, default) {
+            set_upstream_base_override(state, provider, url);
+        }
+    }
+    if let Some(url) = resolve_endpoint_override("ALEX_UPSTREAM_CODEX_URL", CODEX_BASE) {
+        set_codex_base_override(state, url);
+    }
+    if let Some(url) = resolve_endpoint_override(
+        "ALEX_UPSTREAM_GEMINI_CODE_ASSIST_URL",
+        GEMINI_CODE_ASSIST_BASE,
+    ) {
+        set_gemini_code_assist_base_override(state, url);
     }
 }
 
@@ -1672,8 +1760,8 @@ pub async fn kimi_catalog_models(state: &AppState) -> Vec<String> {
 
 /// Kimi's usage/quota endpoint (discovered in the kimi node binary:
 /// `managedUsageUrl` -> `${base}/usages`, GET with a Bearer token).
-fn kimi_usage_url() -> String {
-    format!("{KIMI_BASE}/usages")
+fn kimi_usage_url(state: &AppState) -> String {
+    format!("{}/usages", upstream_base(state, Provider::Kimi, KIMI_BASE))
 }
 
 fn kimi_usage_num(raw: &Value, key: &str) -> Option<i64> {
@@ -1797,7 +1885,7 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
     };
     let resp = state
         .http
-        .get(kimi_usage_url())
+        .get(kimi_usage_url(state))
         .header("authorization", format!("Bearer {token}"))
         .header("accept", "application/json")
         .timeout(Duration::from_secs(15))
@@ -4007,7 +4095,10 @@ pub async fn refresh_openrouter_models(state: &AppState) {
     };
     let Ok(response) = state
         .http
-        .get(format!("{OPENROUTER_BASE}/models"))
+        .get(format!(
+            "{}/models",
+            upstream_base(state, Provider::Openrouter, OPENROUTER_BASE)
+        ))
         .headers(headers)
         .timeout(Duration::from_secs(5))
         .send()
@@ -4608,7 +4699,10 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         || async move {
             let result = state
                 .http
-                .get(format!("{ANTHROPIC_BASE}/api/oauth/usage"))
+                .get(format!(
+                    "{}/api/oauth/usage",
+                    upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE)
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
                 .header("accept", "application/json")
@@ -4671,8 +4765,6 @@ async fn anthropic_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     .await
 }
 
-const AMP_USAGE_URL: &str = "https://ampcode.com/api/internal?userDisplayBalanceInfo";
-
 /// Amp Free / individual / workspace credits via the same API CodexBar uses.
 async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     let account = state.vault.account_for(Provider::Amp, false).await.ok()?;
@@ -4689,7 +4781,10 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
             let body = json!({ "method": "userDisplayBalanceInfo", "params": {} });
             let result = state
                 .http
-                .post(AMP_USAGE_URL)
+                .post(format!(
+                    "{}/api/internal?userDisplayBalanceInfo",
+                    upstream_base(state, Provider::Amp, AMP_BASE)
+                ))
                 .header("authorization", format!("Bearer {token}"))
                 .header("accept", "application/json")
                 .header("content-type", "application/json")
@@ -4769,7 +4864,7 @@ async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
         || async move {
             let result = state
                 .http
-                .post(GROK_CREDITS_ENDPOINT)
+                .post(grok_credits_endpoint())
                 .header("authorization", format!("Bearer {token}"))
                 .header("origin", "https://grok.com")
                 .header("referer", "https://grok.com/?_s=usage")
@@ -5333,7 +5428,12 @@ async fn admin_storage_prune(
     let report =
         tokio::task::spawn_blocking(move || store.prune(cutoff, bodies_only, dry_run)).await;
     match report {
-        Ok(Ok(r)) => axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response(),
+        Ok(Ok(r)) => {
+            if !dry_run {
+                state.transcript_cache.lock().unwrap().clear();
+            }
+            axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response()
+        }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -5784,6 +5884,10 @@ static TEST_BODY_FILE_READS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> 
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
+static TEST_STORED_TRACE_BODY_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 fn test_body_file_reads_under(root: &std::path::Path) -> Vec<String> {
     TEST_BODY_FILE_READS
         .lock()
@@ -6023,6 +6127,10 @@ fn stored_trace_body(
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
     let trace_id = row["id"].as_str()?;
+    #[cfg(test)]
+    if trace_id.starts_with("trace-browser-long-") {
+        TEST_STORED_TRACE_BODY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     match store.read_trace_body(trace_id, kind, max_bytes) {
         Ok(Some(body)) => Some(body.bytes),
         Ok(None) => {
@@ -6743,24 +6851,138 @@ fn codex_user_history_signature(store: &Store, row: &Value) -> Option<String> {
     openai_responses_user_history_signature(&stored_trace_json(store, row, TraceBodyKind::Request)?)
 }
 
-fn build_session_transcript(
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TranscriptCacheKey {
+    trace_id: String,
+    completed_ms: i64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TranscriptCacheValue {
+    inherited: Option<Vec<Value>>,
+    signature: Option<String>,
+    turn: Value,
+}
+
+struct TranscriptCache {
+    entries: HashMap<TranscriptCacheKey, (TranscriptCacheValue, u64)>,
+    capacity: usize,
+    tick: u64,
+}
+
+impl TranscriptCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, key: &TranscriptCacheKey) -> Option<TranscriptCacheValue> {
+        self.tick = self.tick.wrapping_add(1);
+        let (value, used) = self.entries.get_mut(key)?;
+        *used = self.tick;
+        Some(value.clone())
+    }
+
+    fn insert(&mut self, key: TranscriptCacheKey, value: TranscriptCacheValue) {
+        self.tick = self.tick.wrapping_add(1);
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, self.tick));
+    }
+
+    fn remove_trace(&mut self, trace_id: &str) {
+        self.entries.retain(|key, _| key.trace_id != trace_id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|(value, _)| serde_json::to_vec(value).map_or(0, |bytes| bytes.len()))
+            .sum()
+    }
+}
+
+struct TranscriptCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TranscriptCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn transcript_cache_value(
+    store: &Store,
+    row: &Value,
+    include_inherited: bool,
+) -> TranscriptCacheValue {
+    TranscriptCacheValue {
+        inherited: include_inherited.then(|| transcript_inherited_turns(store, row)),
+        signature: codex_user_history_signature(store, row),
+        turn: transcript_turn(store, row),
+    }
+}
+
+fn build_session_transcript_cached(
     store: &Store,
     rows: &[Value],
     tools: &[Value],
     limit: usize,
+    cache: Option<&std::sync::Mutex<TranscriptCache>>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Vec<Value> {
     let mut previous_codex_user_history: Option<String> = None;
     let mut turns = Vec::new();
     for (index, row) in rows.iter().take(limit).enumerate() {
-        if index == 0 {
-            turns.extend(transcript_inherited_turns(store, row));
+        if cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed)) {
+            break;
         }
-        let signature = codex_user_history_signature(store, row);
+        let key = row["id"].as_str().zip(row["ts_response_ms"].as_i64()).map(
+            |(trace_id, completed_ms)| TranscriptCacheKey {
+                trace_id: trace_id.to_string(),
+                completed_ms,
+            },
+        );
+        let cached = key
+            .as_ref()
+            .and_then(|key| cache.and_then(|cache| cache.lock().unwrap().get(key)));
+        let mut value = cached.unwrap_or_else(|| {
+            let value = transcript_cache_value(store, row, index == 0);
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+            value
+        });
+        if index == 0 && value.inherited.is_none() {
+            value.inherited = Some(transcript_inherited_turns(store, row));
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+        }
+        if index == 0 {
+            turns.extend(value.inherited.unwrap_or_default());
+        }
+        let signature = value.signature;
         let replayed_user = signature.is_some() && signature == previous_codex_user_history;
         if signature.is_some() {
             previous_codex_user_history = signature;
         }
-        let mut turn = transcript_turn(store, row);
+        let mut turn = value.turn;
         // Pi emits a tool start after the model response that requested it
         // and before the next provider request. Associate by explicit
         // trace_id when available, otherwise by that session-local time
@@ -6790,6 +7012,16 @@ fn build_session_transcript(
     turns
 }
 
+#[cfg(test)]
+fn build_session_transcript(
+    store: &Store,
+    rows: &[Value],
+    tools: &[Value],
+    limit: usize,
+) -> Vec<Value> {
+    build_session_transcript_cached(store, rows, tools, limit, None, None)
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -6800,18 +7032,36 @@ async fn traces_session_transcript(
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(500);
-    let rows = match state.store.session_traces(&session_id, since) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let tools = match state.store.session_tool_calls(&session_id) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let turns = build_session_transcript(&state.store, &rows, &tools, limit);
-    let tab_counts = transcript_tab_counts(&turns);
-    axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
-        .into_response()
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = TranscriptCancellation(cancelled.clone());
+    let response = spawn_blocking_response(move || {
+        let rows = match state.store.session_traces(&session_id, since) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let tools = match state.store.session_tool_calls(&session_id) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let turns = build_session_transcript_cached(
+            &state.store,
+            &rows,
+            &tools,
+            limit,
+            Some(&state.transcript_cache),
+            Some(&cancelled),
+        );
+        let tab_counts = transcript_tab_counts(&turns);
+        axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
+            .into_response()
+    })
+    .await;
+    drop(guard);
+    response
 }
 
 const TRANSCRIPT_PAGE_DEFAULT: usize = 20;
@@ -6932,6 +7182,10 @@ fn expanded_turn_tool(mut tool: Value) -> Value {
 /// bodies and explicitly trace-linked tool bodies are read here—and nowhere in
 /// the page endpoint—so an unrelated turn can never be pulled into the read.
 async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_turn_blocking(state, id)).await
+}
+
+fn trace_turn_blocking(state: Arc<AppState>, id: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -7042,6 +7296,10 @@ async fn trace_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || trace_body_blocking(state, id, kind)).await
+}
+
+fn trace_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -7124,6 +7382,10 @@ async fn tool_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || tool_body_blocking(state, id, kind)).await
+}
+
+fn tool_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_tool_call(&id) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -7150,6 +7412,10 @@ async fn tool_body(
 }
 
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_reply_md_blocking(state, id)).await
+}
+
+fn trace_reply_md_blocking(state: Arc<AppState>, id: String) -> Response {
     use alex_core::translate;
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
@@ -7183,6 +7449,7 @@ async fn trace_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>
     }
     match state.store.delete_trace(&id) {
         Ok(paths) => {
+            state.transcript_cache.lock().unwrap().remove_trace(&id);
             let removed = paths
                 .iter()
                 .filter(|p| std::fs::remove_file(p).is_ok())
@@ -7381,6 +7648,8 @@ async fn admin_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "health": account_health(&a, last_heartbeat),
                 "last_probe": a.account_meta.get("last_probe").cloned().unwrap_or(Value::Null),
                 "needs_reauth": a.needs_reauth(),
+                "cooldown_until_ms": a.cooldown_until_ms,
+                "cooling_down": a.cooldown_until_ms.is_some_and(|until| until > now_ms()),
                 "expires_at_ms": a.expires_at_ms,
                 "expires_in_s": a.expires_at_ms.map(|e| (e - now_ms()) / 1000),
                 "routing": routing,
@@ -9486,6 +9755,15 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+async fn spawn_blocking_response(
+    operation: impl FnOnce() -> Response + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(response) => response,
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
 fn client_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
@@ -9671,7 +9949,8 @@ async fn ensure_gemini_project(
             "gemini account has no access token".into(),
         )
     })?;
-    let load_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
+    let code_assist_base = gemini_code_assist_upstream_base(state);
+    let load_url = format!("{code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:loadCodeAssist");
     let load_body = json!({
         "cloudaicompanionProject": null,
         "metadata": {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"},
@@ -9735,7 +10014,7 @@ async fn ensure_gemini_project(
         .and_then(|t| t["id"].as_str())
         .unwrap_or("free-tier")
         .to_string();
-    let onboard_url = format!("{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
+    let onboard_url = format!("{code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:onboardUser");
     let onboard_body = json!({
         "tierId": tier,
         "cloudaicompanionProject": load["cloudaicompanionProject"],
@@ -9962,11 +10241,11 @@ async fn plan_upstream(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
             let oauth = account.kind == "oauth";
-            let openai_base = upstream_base(
-                state,
-                Provider::Openai,
-                if oauth { CODEX_BASE } else { OPENAI_BASE },
-            );
+            let openai_base = if oauth {
+                codex_upstream_base(state)
+            } else {
+                upstream_base(state, Provider::Openai, OPENAI_BASE)
+            };
             bind_codex_account(state, affinity_session, &account);
             match format {
                 ClientFormat::OpenaiChat if !oauth => {
@@ -10102,6 +10381,7 @@ async fn plan_upstream(
             }
         }
         Provider::Xai => {
+            let xai_base = upstream_base(state, Provider::Xai, XAI_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
@@ -10117,7 +10397,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{XAI_BASE}/chat/completions"),
+                        url: format!("{xai_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10141,7 +10421,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{XAI_BASE}/chat/completions"),
+                        url: format!("{xai_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10252,6 +10532,7 @@ async fn plan_upstream(
             }
         }
         Provider::Openrouter => {
+            let openrouter_base = upstream_base(state, Provider::Openrouter, OPENROUTER_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
@@ -10263,7 +10544,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        url: format!("{openrouter_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10285,7 +10566,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{OPENROUTER_BASE}/chat/completions"),
+                        url: format!("{openrouter_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10334,6 +10615,7 @@ async fn plan_upstream(
             }
         }
         Provider::Kimi => {
+            let kimi_base = upstream_base(state, Provider::Kimi, KIMI_BASE);
             let account = state
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
@@ -10345,7 +10627,7 @@ async fn plan_upstream(
                     let body =
                         serde_json::to_vec(body_json).unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{KIMI_BASE}/chat/completions"),
+                        url: format!("{kimi_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10367,7 +10649,7 @@ async fn plan_upstream(
                     let body = serde_json::to_vec(&converted)
                         .unwrap_or_else(|_| original_body.to_vec());
                     Ok(UpstreamPlan {
-                        url: format!("{KIMI_BASE}/chat/completions"),
+                        url: format!("{kimi_base}/chat/completions"),
                         account,
                         connection_account: None,
                         body,
@@ -10393,6 +10675,8 @@ async fn plan_upstream(
             "amp is wrap/billing-only (no /v1 upstream). Use `alex wrap amp` for harness capture and `alex limits` for credits.".into(),
         )),
         Provider::Gemini => {
+            let gemini_api_base = upstream_base(state, Provider::Gemini, GEMINI_API_BASE);
+            let gemini_code_assist_base = gemini_code_assist_upstream_base(state);
             // Prefer an AI Studio API key over the OAuth/Code-Assist path.
             let account = state
                 .vault
@@ -10432,9 +10716,8 @@ async fn plan_upstream(
             };
             let (url, body) = if account.kind == "api_key" {
                 // AI Studio: plain request, model in the path, x-goog-api-key header.
-                let mut url = format!(
-                    "{GEMINI_API_BASE}/v1beta/models/{routed_model}:{method}"
-                );
+                let mut url =
+                    format!("{gemini_api_base}/v1beta/models/{routed_model}:{method}");
                 if client_stream {
                     url.push_str("?alt=sse");
                 }
@@ -10445,7 +10728,7 @@ async fn plan_upstream(
                 // Code Assist (OAuth): wrapped envelope + project.
                 let project = ensure_gemini_project(state, &account).await?;
                 let mut url = format!(
-                    "{GEMINI_CODE_ASSIST_BASE}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
+                    "{gemini_code_assist_base}/{GEMINI_CODE_ASSIST_VERSION}:{method}"
                 );
                 if client_stream {
                     url.push_str("?alt=sse");
@@ -12293,7 +12576,6 @@ fn reroutable_error_class(class: ErrorClass) -> bool {
     matches!(class, ErrorClass::Capacity | ErrorClass::Server)
 }
 
-#[cfg(test)]
 fn retryable_failover_status(status: reqwest::StatusCode) -> bool {
     reroutable_error_class(classify_error("unknown", Some(status.as_u16()), None))
 }
@@ -13943,6 +14225,12 @@ async fn proxy(
                     return error_response(status, &msg);
                 }
             };
+            if let Some(value) = headers
+                .get("x-mock-fail")
+                .filter(|_| allowed_override_url(&plan.url))
+            {
+                up_headers.insert("x-mock-fail", value.clone());
+            }
             if current_provider == Provider::Cliproxyapi {
                 let route_chain = upstream_route_chain(&headers, "alex");
                 if let Ok(value) = HeaderValue::from_str(&route_chain) {
@@ -14500,6 +14788,18 @@ async fn proxy(
                             }
                             None
                         }
+                    }
+                    alex_middleware::AttemptDecision::Continue
+                        if retryable_failover_status(resp.status()) =>
+                    {
+                        same_route_plan.map(|next_plan| {
+                            (
+                                current_provider,
+                                current_model.clone(),
+                                next_plan,
+                                format!("retryable upstream status {}", status),
+                            )
+                        })
                     }
                     alex_middleware::AttemptDecision::Continue
                     | alex_middleware::AttemptDecision::ReturnOriginal { .. } => None,
@@ -19057,74 +19357,63 @@ mod tests {
     /// middleware rerouting/provenance, and durable recovery after restart.
     #[tokio::test]
     async fn deterministic_platform_smoke_daemon_route_trace_and_restart_recovery() {
-        use axum::routing::post;
+        use alex_fakeprov::{Config as FakeProvConfig, FakeProv, ResponseSpec};
 
-        let received_models = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let captured_models = received_models.clone();
-        let upstream = Router::new().route(
-            "/v1/chat/completions",
-            post(move |axum::Json(body): axum::Json<Value>| {
-                let captured_models = captured_models.clone();
-                async move {
-                    let model = body["model"].as_str().unwrap_or_default().to_string();
-                    captured_models.lock().await.push(model.clone());
-                    match model.as_str() {
-                        "smoke/stream" => {
-                            assert_eq!(body["stream"], true);
-                            let chunks = [
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
-                                json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
-                            ];
-                            let mut sse = chunks
-                                .into_iter()
-                                .map(|chunk| format!("data: {chunk}\n\n"))
-                                .collect::<String>();
-                            sse.push_str("data: [DONE]\n\n");
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "text/event-stream")
-                                .body(Body::from(sse))
-                                .unwrap()
-                        }
-                        "smoke/fail" => (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}})),
-                        )
-                            .into_response(),
-                        "smoke/fallback" => axum::Json(json!({
-                            "id": "mock-fallback",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "fallback ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-                        }))
-                        .into_response(),
-                        "smoke/model" => axum::Json(json!({
-                            "id": "mock-completion",
-                            "object": "chat.completion",
-                            "choices": [{
-                                "index": 0,
-                                "message": {"role": "assistant", "content": "mock ok"},
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                        }))
-                        .into_response(),
-                        other => panic!("unexpected smoke model {other}"),
-                    }
-                }
-            }),
-        );
-        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_server = tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream).await.unwrap();
-        });
+        let upstream = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
+        let chunks = [
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-smoke-1","type":"function","function":{"name":"smoke_weather","arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Brisbane\"}"}}]},"finish_reason":null}]}),
+            json!({"id":"mock-stream","object":"chat.completion.chunk","model":"smoke/stream","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}),
+        ];
+        let mut stream = chunks
+            .into_iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        stream.push_str("data: [DONE]\n\n");
+        for response in [
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-completion",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "mock ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                })),
+                ..Default::default()
+            },
+            ResponseSpec {
+                raw_body: Some(stream),
+                content_type: Some("text/event-stream".into()),
+                ..Default::default()
+            },
+            ResponseSpec {
+                status: Some(503),
+                body: Some(
+                    json!({"error":{"type":"overloaded_error","message":"deterministic reroute"}}),
+                ),
+                ..Default::default()
+            },
+            ResponseSpec {
+                body: Some(json!({
+                    "id": "mock-fallback",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "fallback ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                })),
+                ..Default::default()
+            },
+        ] {
+            upstream.queue("POST /v1/chat/completions", response).await;
+        }
+        let upstream_base = upstream.base_url().to_string();
 
         let root = tmpdir("deterministic-platform-smoke");
         let store_root = root.join("store");
@@ -19141,7 +19430,7 @@ mod tests {
             set_exo_config(
                 &state,
                 ExoConfig {
-                    url: format!("http://{upstream_addr}"),
+                    url: upstream_base.clone(),
                     enabled_models: vec![
                         "smoke/model".into(),
                         "smoke/stream".into(),
@@ -19149,7 +19438,7 @@ mod tests {
                     ],
                 },
             );
-            set_upstream_base_override(&state, Provider::Openai, format!("http://{upstream_addr}"));
+            set_upstream_base_override(&state, Provider::Openai, upstream_base.clone());
             state
         };
         let serve = |state: Arc<AppState>| async move {
@@ -19353,8 +19642,18 @@ mod tests {
         assert_eq!(attempts[1]["provider"], "exo");
         assert_eq!(attempts[1]["model"], "smoke/fallback");
         assert_eq!(attempts[1]["status"], 200);
+        let requests = upstream.requests().await;
+        let request_bodies = requests
+            .iter()
+            .filter(|request| request.path == "/v1/chat/completions")
+            .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(request_bodies[1]["stream"], true);
         assert_eq!(
-            *received_models.lock().await,
+            request_bodies
+                .iter()
+                .map(|body| body["model"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec![
                 "smoke/model",
                 "smoke/stream",
@@ -19463,7 +19762,7 @@ mod tests {
             .any(|rule| rule["id"] == middleware_id && rule["enabled"] == true));
 
         restarted_server.abort();
-        upstream_server.abort();
+        upstream.shutdown().await;
     }
 
     #[tokio::test]
@@ -19772,6 +20071,278 @@ mod tests {
         selected_legacy_paths.sort();
         assert_eq!(reads, selected_legacy_paths);
         assert!(unrelated_paths.iter().all(|path| !reads.contains(path)));
+    }
+
+    fn transcript_perf_state(root: &std::path::Path) -> Arc<AppState> {
+        let store = Arc::new(Store::open(root.to_path_buf()).unwrap());
+        let vault = Arc::new(Vault::open(root.join("vault")).unwrap());
+        build_state(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
+        )
+    }
+
+    async fn measured_transcript_poll(state: Arc<AppState>) -> u64 {
+        let started = std::time::Instant::now();
+        let response = traces_session_transcript(
+            State(state),
+            Path(alex_lar_scale::BROWSER_SESSION_ID.into()),
+            Query(HashMap::from([("limit".into(), "500".into())])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn test_peak_rss_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(status, 0);
+        let value = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            value
+        } else {
+            value.saturating_mul(1024)
+        }
+    }
+
+    fn transcript_cache_entry_count(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().entries.len()
+    }
+
+    fn transcript_cache_retained_bytes(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().retained_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_browser_transcript_perf_budgets() {
+        const WARM_P95_BUDGET_MS: u64 = 750;
+        const ABORT_BUDGET_MS: u64 = 250;
+        const STORE_WAIT_BUDGET_MS: u64 = 100;
+        const CACHE_ENTRY_CEILING: usize = 512;
+        const CACHE_BYTES_CEILING: usize = 16 * 1024 * 1024;
+        const RSS_GROWTH_CEILING: u64 = 128 * 1024 * 1024;
+
+        let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/trace-browser-perf-corpus-v1");
+        let manifest_path = corpus_root.join(alex_lar_scale::BROWSER_MANIFEST_FILE);
+        let (manifest, generation) = if manifest_path.is_file() {
+            (
+                serde_json::from_reader(std::fs::File::open(manifest_path).unwrap()).unwrap(),
+                Duration::ZERO,
+            )
+        } else {
+            if corpus_root.exists() {
+                std::fs::remove_dir_all(&corpus_root).unwrap();
+            }
+            alex_lar_scale::generate_browser_corpus(&corpus_root).unwrap()
+        };
+        assert_eq!(manifest.long_turns, 500);
+        let state = transcript_perf_state(&corpus_root);
+        let cold_ms = measured_transcript_poll(state.clone()).await;
+        let mut warm_samples = Vec::new();
+        for _ in 0..3 {
+            warm_samples.push(measured_transcript_poll(state.clone()).await);
+        }
+        warm_samples.sort_unstable();
+        let warm_p95_ms = *warm_samples.last().unwrap();
+
+        state.transcript_cache.lock().unwrap().clear();
+        TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let abandoned_state = state.clone();
+        let abandoned = tokio::spawn(async move {
+            measured_transcript_poll(abandoned_state).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let abort_started = std::time::Instant::now();
+        abandoned.abort();
+        let store_started = std::time::Instant::now();
+        let session_count = state.store.sessions(None, 100).unwrap().len();
+        let store_wait_ms = store_started.elapsed().as_millis() as u64;
+        let _ = abandoned.await;
+        let abort_ms = abort_started.elapsed().as_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let abandoned_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(session_count, 51);
+
+        let mut rss_growth = u64::MAX;
+        let mut cache_entries = transcript_cache_entry_count(&state);
+        let mut cache_bytes_before = usize::MAX;
+        let mut cache_bytes_after = usize::MAX;
+        if warm_p95_ms <= WARM_P95_BUDGET_MS {
+            measured_transcript_poll(state.clone()).await;
+            TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..20 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            cache_bytes_before = transcript_cache_retained_bytes(&state);
+            let rss_before = test_peak_rss_bytes();
+            for _ in 0..100 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            let rss_after = test_peak_rss_bytes();
+            rss_growth = rss_after.saturating_sub(rss_before);
+            cache_entries = transcript_cache_entry_count(&state);
+            cache_bytes_after = transcript_cache_retained_bytes(&state);
+        }
+        let warm_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "T2 trace-browser generation_ms={} cold_ms={cold_ms} warm_p95_ms={warm_p95_ms} abort_ms={abort_ms} abandoned_body_reads={abandoned_body_reads} store_wait_ms={store_wait_ms} rss_growth_bytes={rss_growth} cache_entries={cache_entries} cache_bytes_before={cache_bytes_before} cache_bytes_after={cache_bytes_after} warm_body_reads={warm_body_reads}",
+            generation.as_millis()
+        );
+
+        assert!(
+            warm_p95_ms <= WARM_P95_BUDGET_MS,
+            "warm transcript p95 {warm_p95_ms}ms exceeds {WARM_P95_BUDGET_MS}ms"
+        );
+        assert!(abort_ms <= ABORT_BUDGET_MS, "abort took {abort_ms}ms");
+        assert!(
+            abandoned_body_reads <= 3,
+            "abandoned transcript read {abandoned_body_reads} bodies"
+        );
+        assert!(
+            store_wait_ms <= STORE_WAIT_BUDGET_MS,
+            "concurrent store query waited {store_wait_ms}ms"
+        );
+        assert!(
+            cache_entries > 0 && cache_entries <= CACHE_ENTRY_CEILING,
+            "cache entries {cache_entries} exceed bounded range"
+        );
+        assert_eq!(
+            cache_bytes_after, cache_bytes_before,
+            "cache retained bytes grew"
+        );
+        assert!(
+            cache_bytes_after <= CACHE_BYTES_CEILING,
+            "cache retains {cache_bytes_after} bytes"
+        );
+        assert_eq!(warm_body_reads, 0, "warm polls reopened trace bodies");
+        // Peak RSS in the shared cargo-test process is polluted by concurrently
+        // running tests; boundedness is asserted via the deterministic cache
+        // metrics above, and RSS stays logged for humans.
+        if rss_growth > RSS_GROWTH_CEILING {
+            eprintln!(
+                "T2 advisory: 100 warm polls grew peak RSS by {rss_growth} bytes (ceiling {RSS_GROWTH_CEILING})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_cache_refreshes_and_invalidates_on_delete_and_prune() {
+        let state = test_state("transcript-cache-invalidation");
+        let session_id = "cache-session";
+        for (id, completed_ms, assistant) in [("cached-a", 2, "first"), ("cached-b", 4, "second")] {
+            let request_path = state
+                .store
+                .write_body(
+                    id,
+                    "request.json",
+                    br#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                )
+                .unwrap();
+            let response_path = state
+                .store
+                .write_body(
+                    id,
+                    "response.json",
+                    json!({"choices": [{"message": {"content": assistant}}]})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: completed_ms - 1,
+                    ts_response_ms: Some(completed_ms),
+                    session_id: Some(session_id.into()),
+                    client_format: Some("openai-chat".into()),
+                    upstream_format: Some("openai-chat".into()),
+                    req_body_path: Some(request_path),
+                    resp_body_path: Some(response_path),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let (_, first) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["turns"][0]["assistant"], "first");
+        assert_eq!(transcript_cache_entry_count(&state), 2);
+
+        let response_path = state
+            .store
+            .write_body(
+                "cached-a",
+                "response.json",
+                br#"{"choices":[{"message":{"content":"updated"}}]}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "cached-a".into(),
+                ts_request_ms: 1,
+                ts_response_ms: Some(5),
+                session_id: Some(session_id.into()),
+                client_format: Some("openai-chat".into()),
+                upstream_format: Some("openai-chat".into()),
+                resp_body_path: Some(response_path),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, refreshed) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(refreshed["turns"][0]["assistant"], "updated");
+        assert_eq!(refreshed["turns"][1]["assistant"], "second");
+
+        assert_eq!(
+            trace_delete(State(state.clone()), Path("cached-a".into()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(state
+            .transcript_cache
+            .lock()
+            .unwrap()
+            .entries
+            .keys()
+            .all(|key| key.trace_id != "cached-a"));
+        assert_eq!(
+            admin_storage_prune(
+                State(state.clone()),
+                axum::Json(json!({
+                    "older_than_ms": now_ms(),
+                    "bodies_only": true,
+                })),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(transcript_cache_entry_count(&state), 0);
     }
 
     #[tokio::test]
@@ -21491,6 +22062,179 @@ mod tests {
             status: "active".into(),
             path: None,
         }
+    }
+
+    async fn override_path_listener(
+        response: Value,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = paths.clone();
+        let app = Router::new().fallback(axum::routing::any(
+            move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                let seen = seen.clone();
+                let response = response.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    axum::Json(response)
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), paths, server)
+    }
+
+    #[tokio::test]
+    async fn provider_dispatch_overrides_reach_each_local_upstream_path() {
+        let state = test_state("provider-dispatch-overrides");
+        let cases = [
+            (
+                Provider::Anthropic,
+                ClientFormat::AnthropicMessages,
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5",
+                "/v1/messages",
+                "",
+                "/v1/messages",
+            ),
+            (
+                Provider::Xai,
+                ClientFormat::OpenaiChat,
+                "grok-4",
+                "grok-4",
+                "/v1/chat/completions",
+                "/v1",
+                "/v1/chat/completions",
+            ),
+            (
+                Provider::Kimi,
+                ClientFormat::OpenaiChat,
+                "kimi/k3",
+                "k3",
+                "/v1/chat/completions",
+                "/coding/v1",
+                "/coding/v1/chat/completions",
+            ),
+            (
+                Provider::Openrouter,
+                ClientFormat::OpenaiChat,
+                "openrouter/anthropic/claude-sonnet-4",
+                "anthropic/claude-sonnet-4",
+                "/v1/chat/completions",
+                "/api/v1",
+                "/api/v1/chat/completions",
+            ),
+            (
+                Provider::Gemini,
+                ClientFormat::GeminiGenerate,
+                "gemini/gemini-2.5-pro",
+                "gemini-2.5-pro",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                "",
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+            ),
+        ];
+        let mut servers = Vec::new();
+
+        for (
+            provider,
+            format,
+            requested_model,
+            routed_model,
+            client_path,
+            base_path,
+            expected_path,
+        ) in cases
+        {
+            state
+                .vault
+                .upsert(test_api_account(
+                    &format!("{}-override", provider.as_str()),
+                    provider,
+                ))
+                .await
+                .unwrap();
+            let upstream_response = match provider {
+                Provider::Anthropic => json!({
+                    "id": "msg_override",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": routed_model,
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }),
+                Provider::Gemini => json!({
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "ok"}]},
+                        "finishReason": "STOP",
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2,
+                    },
+                }),
+                _ => json!({
+                    "id": "chat_override",
+                    "object": "chat.completion",
+                    "model": routed_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }),
+            };
+            let (base, paths, server) = override_path_listener(upstream_response).await;
+            servers.push(server);
+            set_upstream_base_override(&state, provider, format!("{base}{base_path}"));
+
+            let request = json!({
+                "model": requested_model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false,
+            });
+            let response = proxy(
+                state.clone(),
+                format,
+                client_path,
+                local_proxy_headers(),
+                Bytes::from(serde_json::to_vec(&request).unwrap()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(paths.lock().unwrap().as_slice(), [expected_path]);
+        }
+
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn override_urls_are_absent_from_connect_and_credentials_payloads() {
+        let state = test_state("override-redaction");
+        let marker = "http://127.0.0.1:43210/override-marker";
+        set_upstream_base_override(&state, Provider::Anthropic, marker);
+        set_codex_base_override(&state, marker);
+        set_gemini_code_assist_base_override(&state, marker);
+
+        let (connect, exports) = connect_payload(&state.base_url, "alx-local");
+        assert!(!connect.to_string().contains("override-marker"));
+        assert!(!exports.contains("override-marker"));
+
+        let (_, credentials) = response_json(admin_credentials(State(state)).await).await;
+        assert!(!credentials.to_string().contains("override-marker"));
     }
 
     #[test]
