@@ -728,6 +728,10 @@ struct WebAuthConfig {
     password_hash: Option<String>,
     #[serde(default)]
     onboarding_completed: bool,
+    /// SHA-256(session token) -> expiry ms. Persisted so browser sessions
+    /// survive daemon restarts; raw tokens are never stored.
+    #[serde(default)]
+    sessions: HashMap<String, i64>,
 }
 
 #[derive(Debug, Default)]
@@ -758,9 +762,37 @@ impl WebAuthState {
         };
         Self {
             path,
+            sessions: std::sync::Mutex::new(
+                config
+                    .sessions
+                    .iter()
+                    .filter(|(_, expires_at_ms)| **expires_at_ms > now_ms())
+                    .map(|(hash, expires_at_ms)| (hash.clone(), *expires_at_ms))
+                    .collect(),
+            ),
             config: std::sync::RwLock::new(config),
-            sessions: std::sync::Mutex::new(HashMap::new()),
             failed_logins: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Write the current in-memory session hashes into the persisted config.
+    /// Best-effort: cookie sessions still work in memory if the write fails.
+    fn persist_sessions(&self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let config = {
+            let mut guard = self
+                .config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.sessions = sessions;
+            guard.clone()
+        };
+        if let Err(error) = self.persist(&config) {
+            tracing::warn!("could not persist web sessions: {error}");
         }
     }
 
@@ -814,6 +846,7 @@ impl WebAuthState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key_hash_hex(&token), now_ms() + WEB_SESSION_TTL_S * 1_000);
+        self.persist_sessions();
         token
     }
 
@@ -823,6 +856,7 @@ impl WebAuthState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&key_hash_hex(token));
+            self.persist_sessions();
         }
     }
 }
@@ -2132,6 +2166,8 @@ async fn admin_web_password(
         WebAuthConfig {
             password_hash: Some(password_hash),
             onboarding_completed: current.onboarding_completed,
+            // Replacing the password revokes every existing session.
+            sessions: HashMap::new(),
         }
     };
     if let Err(error) = state.web_auth.persist(&next) {
@@ -2177,6 +2213,7 @@ async fn admin_web_onboarding(
         WebAuthConfig {
             password_hash: current.password_hash.clone(),
             onboarding_completed: body.completed,
+            sessions: current.sessions.clone(),
         }
     };
     if let Err(error) = state.web_auth.persist(&next) {

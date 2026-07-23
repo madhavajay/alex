@@ -207,8 +207,29 @@
         </section>
 
         <section id="traces-view" class="panel trace-panel" data-panel hidden>
-          <div class="trace-toolbar"><form id="trace-filters" class="trace-filters"><input name="model" placeholder="Model"><input name="provider" placeholder="Provider"><input name="harness" placeholder="Harness"><input name="status" inputmode="numeric" placeholder="Status"><label><input name="errors" type="checkbox"> Errors</label><button>Filter</button><button type="reset">Clear</button></form><button id="refresh-traces">Refresh</button></div>
-          <div class="trace-browser"><aside><div class="trace-column-head"><strong>Sessions & traces</strong><small>Body-free summaries</small></div><div id="trace-list" class="trace-list"></div><button id="more-traces" class="wide" hidden>Load older</button></aside><article id="trace-detail" class="trace-detail"><div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect routing, attempts, middleware, bodies, and conversation turns.</p></div></article></div>
+          <div id="trace-browser" class="trace-browser">
+            <aside class="trace-sessions" aria-label="Sessions and traces">
+              <header class="trace-panel-head"><div><strong>Sessions</strong><span id="trace-count" class="count-chip">0</span></div><button id="refresh-traces" class="trace-icon-button" aria-label="Refresh traces" title="Refresh traces">↻</button></header>
+              <form id="trace-filters" class="trace-filters">
+                <label class="trace-model-filter"><span>Model</span><input name="model" placeholder="Filter model…" autocomplete="off"></label>
+                <label><span>Provider</span><select name="provider"><option value="">Any provider</option></select></label>
+                <label><span>Harness</span><select name="harness"><option value="">Any harness</option></select></label>
+                <label><span>Status</span><select name="status"><option value="">Any status</option><option value="200">2xx success</option><option value="400">4xx client</option><option value="500">5xx server</option></select></label>
+                <label class="trace-toggle-chip"><input name="errors" type="checkbox"><span>Errors only</span></label>
+                <button class="trace-filter-apply">Apply</button><button class="trace-clear-chip" type="reset">Clear all</button>
+              </form>
+              <div class="trace-list-labels"><span>Session / trace</span><span>Status</span><span>Time</span></div>
+              <div id="trace-list" class="trace-list"></div>
+              <footer class="trace-list-footer"><span id="trace-list-status">Body-free summaries</span><button id="more-traces" hidden>Load older</button></footer>
+            </aside>
+            <section id="trace-conversation" class="trace-conversation" aria-label="Session conversation">
+              <header class="trace-panel-head"><div><strong>Chat flow</strong><small>Select a session or trace</small></div></header>
+              <div class="empty-state"><span>◇</span><h2>No session selected</h2><p>Choose a trace to browse its bounded conversation pages.</p></div>
+            </section>
+            <article id="trace-detail" class="trace-detail" aria-label="Trace detail">
+              <div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect metadata, attempts, middleware, and explicitly loaded bodies.</p></div>
+            </article>
+          </div>
         </section>
       </div>
     </main>

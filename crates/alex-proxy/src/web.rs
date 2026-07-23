@@ -255,11 +255,32 @@ mod tests {
             "middleware-activity",
             "notification-channels",
             "notification-log",
+            "trace-browser",
             "trace-list",
+            "trace-list-status",
+            "trace-conversation",
             "trace-detail",
         ] {
             assert_html_id(id);
         }
+        for class in [
+            "trace-sessions",
+            "trace-filters",
+            "trace-list-labels",
+            "trace-conversation",
+            "trace-detail",
+        ] {
+            assert!(
+                INDEX.contains(&format!("class=\"{class}")),
+                "trace browser is missing .{class}"
+            );
+        }
+        assert!(INDEX.contains("<select name=\"provider\""));
+        assert!(INDEX.contains("<select name=\"harness\""));
+        assert!(INDEX.contains("2xx success"));
+        assert!(INDEX.contains("4xx client"));
+        assert!(INDEX.contains("5xx server"));
+        assert!(INDEX.contains("Errors only"));
         assert_local_script_and_style_assets();
         assert!(INDEX.contains("src=\"/ui/assets/alex-icon.png\""));
         assert!(INDEX.contains("src=\"/ui/assets/onboarding-header.jpg\""));
@@ -362,27 +383,47 @@ mod tests {
         assert!(open_trace.contains("/metadata"));
         assert!(!open_trace.contains("/body/"));
         assert!(!open_trace.contains("/transcript"));
+        assert!(!open_trace.contains("/turn"));
         let load_traces = javascript_function(APP_JS, "loadTraces");
         assert!(load_traces.contains("/traces/summaries?"));
         assert!(!load_traces.contains("/body/"));
         assert!(!load_traces.contains("/transcript"));
+        assert!(!load_traces.contains("/metadata"));
+        assert!(!load_traces.contains("/turn"));
 
         let render_detail = javascript_function(APP_JS, "renderTraceDetail");
         assert!(render_detail.contains("loadTraceBody"));
-        assert!(render_detail.contains("loadTranscript"));
+        assert!(render_detail.contains("addEventListener(\"toggle\""));
+        assert!(!render_detail.contains("loadTranscript"));
+        assert!(!render_detail.contains("/turn"));
         assert!(javascript_function(APP_JS, "loadTraceBody").contains("/body/"));
         assert!(javascript_function(APP_JS, "loadTranscript").contains("loadTranscriptPage"));
+
+        // Selecting a summary composes two independent, bounded paths: the
+        // metadata-only detail request and the middle-column conversation.
+        // Keeping the transcript call out of openTrace makes that boundary
+        // reviewable instead of hiding it behind metadata rendering.
+        let select_trace = javascript_function(APP_JS, "selectTraceSummary");
+        assert!(select_trace.contains("showTraceConversation"));
+        assert!(select_trace.contains("openTrace"));
+        let conversation = javascript_function(APP_JS, "showTraceConversation");
+        assert!(conversation.contains("loadTranscript"));
+        assert!(!conversation.contains("/body/"));
+        assert!(!conversation.contains("/turn"));
 
         // Large-session contract: the transcript loader replaces one bounded
         // DOM page at a time, while opening one turn is the only path that
         // reaches the turn-body endpoint.
         let turn_loader = javascript_function(APP_JS, "loadTranscriptTurn");
         assert!(turn_loader.contains("/turn`"));
+        assert!(!turn_loader.contains("/body/"));
+        assert!(!turn_loader.contains("/transcript/page"));
         let page_loader = javascript_function(APP_JS, "loadTranscriptPage");
         assert!(page_loader.contains("TURN_PAGE_SIZE"));
         assert!(page_loader.contains("/transcript/page?"));
         assert!(page_loader.contains("replaceTranscriptPage"));
         assert!(!page_loader.contains("/turn`"));
+        assert!(!page_loader.contains("/body/"));
         assert!(javascript_function(APP_JS, "replaceTranscriptPage").contains("replaceChildren"));
     }
 

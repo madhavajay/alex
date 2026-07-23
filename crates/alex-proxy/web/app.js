@@ -82,6 +82,7 @@ const state = {
   refreshSeconds: 60,
   health: null,
   accounts: [],
+  providers: [],
   harnesses: [],
   analytics: null,
   limits: null,
@@ -94,6 +95,10 @@ const state = {
   openrouter: null,
   traceCursor: null,
   traceFilters: {},
+  traceRows: [],
+  selectedTraceId: null,
+  selectedSessionId: null,
+  traceDetailRequest: null,
   loginPoll: null,
   networkFailures: 0,
   sessionRecovery: false,
@@ -881,13 +886,19 @@ async function loadHarnessesData(refresh = false) {
   return state.harnesses;
 }
 
+async function loadProvidersData() {
+  const data = await api("/admin/providers");
+  state.providers = data.providers || [];
+  return state.providers;
+}
+
 async function refreshSharedData() {
   const results = await Promise.allSettled([
-    loadHealth(), loadAccounts(), loadHarnessesData(false),
+    loadHealth(), loadAccounts(), loadHarnessesData(false), loadProvidersData(),
     api("/admin/middleware"), api("/admin/analytics?since_minutes=60"), loadSidebarUpdate(),
   ]);
-  if (results[3].status === "fulfilled") state.middleware = results[3].value;
-  if (results[4].status === "fulfilled") state.analytics = results[4].value;
+  if (results[4].status === "fulfilled") state.middleware = results[4].value;
+  if (results[5].status === "fulfilled") state.analytics = results[5].value;
   renderOnboardingData();
   const failed = results.find((result) => result.status === "rejected");
   if (failed && !state.health) throw failed.reason;
@@ -1840,54 +1851,208 @@ function traceQuery(append) {
   return params;
 }
 
-async function loadTraces(append = false) {
-  const data = await api(`/traces/summaries?${traceQuery(append)}`);
-  state.traceCursor = data.next_cursor;
-  const list = $("#trace-list");
-  if (!append) list.replaceChildren();
-  (data.traces || []).forEach((trace) => {
-    const button = document.createElement("button");
-    button.className = `trace-row ${finite(trace.status) >= 400 || trace.error ? "error" : ""}`;
-    button.innerHTML = `<code>${escapeHtml(trace.model || trace.id)}</code><span>${escapeHtml(trace.provider || "unrouted")} · ${escapeHtml(trace.harness || "unknown harness")}<small>${escapeHtml(formatTime(trace.ts_request_ms))}</small></span><span>${escapeHtml(trace.status ?? "—")}</span>`;
-    button.addEventListener("click", () => openTrace(trace.id));
-    list.append(button);
+function traceShortId(value) {
+  const text = String(value || "");
+  return text.length > 10 ? text.slice(0, 8) : text || "—";
+}
+
+function traceMetaValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function formatDurationMs(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const milliseconds = Number(value);
+  return milliseconds < 1000 ? `${Math.round(milliseconds)}ms` : `${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+function traceRelativeTime(value) {
+  if (!value) return "—";
+  const seconds = Math.max(0, (Date.now() - finite(value)) / 1000);
+  return seconds < 10 ? "now" : `${formatAge(seconds)} ago`;
+}
+
+function traceStatusKind(status, error = null) {
+  const code = Number(status);
+  if (error || code >= 500) return "error";
+  if (code >= 400) return "client-error";
+  if (code >= 200 && code < 300) return "success";
+  return "neutral";
+}
+
+function traceStatusChip(status, error = null) {
+  const label = status === null || status === undefined ? (error ? "Error" : "Pending") : String(status);
+  return `<span class="trace-status-chip ${traceStatusKind(status, error)}"><i></i>${escapeHtml(label)}</span>`;
+}
+
+function traceModelChip(model) {
+  return `<span class="trace-model-chip">${escapeHtml(model || "unknown model")}</span>`;
+}
+
+function traceMetricChip(label, value, tone = "") {
+  return `<span class="trace-metric-chip ${escapeHtml(tone)}"><small>${escapeHtml(label)}</small><b>${escapeHtml(traceMetaValue(value))}</b></span>`;
+}
+
+function traceTokenCount(value) {
+  return value === null || value === undefined ? "— tok" : `${formatInteger(value)} tok`;
+}
+
+function setTraceSelectOptions(name, values, placeholder) {
+  const select = $(`#trace-filters [name="${name}"]`);
+  const current = select.value || state.traceFilters[name] || "";
+  const options = [...new Set(values.filter(Boolean).map(String))].sort((left, right) => left.localeCompare(right));
+  if (current && !options.includes(current)) options.unshift(current);
+  select.innerHTML = `<option value="">${escapeHtml(placeholder)}</option>${options.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+  select.value = current;
+}
+
+function populateTraceFilterOptions() {
+  const providerValues = [
+    ...state.providers.map((entry) => entry.provider),
+    ...state.accounts.map((entry) => entry.provider),
+    ...state.traceRows.map((entry) => entry.provider),
+  ];
+  const harnessValues = [
+    ...state.harnesses.map((entry) => entry.name),
+    ...state.traceRows.map((entry) => entry.harness),
+  ];
+  setTraceSelectOptions("provider", providerValues, "Any provider");
+  setTraceSelectOptions("harness", harnessValues, "Any harness");
+}
+
+function groupTraceRows(rows) {
+  const groups = [];
+  const sessions = new Map();
+  rows.forEach((trace) => {
+    if (!trace.session_id) {
+      groups.push({ type: "trace", trace });
+      return;
+    }
+    let group = sessions.get(trace.session_id);
+    if (!group) {
+      group = { type: "session", id: trace.session_id, traces: [] };
+      sessions.set(trace.session_id, group);
+      groups.push(group);
+    }
+    group.traces.push(trace);
   });
-  if (!list.children.length) list.innerHTML = '<div class="empty-state"><p>No matching body-free trace summaries. Route a request or change the metadata filters.</p></div>';
+  return groups;
+}
+
+function traceRowMarkup(trace, nested = false) {
+  const error = traceStatusKind(trace.status, trace.error) === "error";
+  const active = state.selectedTraceId === trace.id;
+  return `<button class="trace-row ${nested ? "nested" : ""} ${active ? "active" : ""} ${error ? "error" : ""}" data-trace-id="${escapeHtml(trace.id)}">
+    <span class="trace-row-main"><span class="trace-row-brands">${providerLogoTile(trace.provider, trace.provider, "trace-mini-brand")}${harnessLogoTile(trace.harness, trace.harness, "trace-mini-brand")}</span><span class="trace-row-copy"><code>${escapeHtml(trace.model || trace.served_model || traceShortId(trace.id))}</code><small>${escapeHtml(`${trace.provider || "unrouted"} · ${trace.harness || "unknown harness"}`)}</small></span></span>
+    ${traceStatusChip(trace.status, trace.error)}<time>${escapeHtml(traceRelativeTime(trace.ts_request_ms))}</time>
+  </button>`;
+}
+
+function renderTraceList() {
+  const list = $("#trace-list");
+  const groups = groupTraceRows(state.traceRows);
+  list.innerHTML = groups.map((group) => {
+    if (group.type === "trace") return traceRowMarkup(group.trace);
+    const latest = group.traces[0];
+    const error = group.traces.some((trace) => traceStatusKind(trace.status, trace.error) === "error");
+    const active = state.selectedSessionId === group.id;
+    const status = error ? traceStatusChip(500, "Session contains errors") : traceStatusChip(latest.status, latest.error);
+    return `<section class="trace-session-group ${active ? "active" : ""} ${error ? "error" : ""}">
+      <button class="trace-session-row" data-session-id="${escapeHtml(group.id)}"><span class="trace-session-identity">${harnessLogoTile(latest.harness, latest.harness, "trace-session-brand")}<span><code>${escapeHtml(traceShortId(group.id))}</code><small>${escapeHtml(`${group.traces.length} turn${group.traces.length === 1 ? "" : "s"} loaded · ${latest.harness || "unknown harness"}`)}</small></span></span>${status}<time>${escapeHtml(traceRelativeTime(latest.ts_request_ms))}</time></button>
+      <div class="trace-session-children">${group.traces.map((trace) => traceRowMarkup(trace, true)).join("")}</div>
+    </section>`;
+  }).join("");
+  if (!groups.length) list.innerHTML = '<div class="empty-state compact"><p>No matching body-free trace summaries.</p><small>Route a request or change the metadata filters.</small></div>';
+  bindActions(list, "[data-trace-id]", (event) => selectTraceSummary(event.currentTarget.dataset.traceId));
+  bindActions(list, "[data-session-id]", (event) => selectSessionSummary(event.currentTarget.dataset.sessionId));
+  $("#trace-count").textContent = String(state.traceRows.length);
+  $("#trace-list-status").textContent = `${state.traceRows.length} body-free summar${state.traceRows.length === 1 ? "y" : "ies"}`;
+}
+
+async function loadTraces(append = false) {
+  const supportData = [];
+  if (!state.providers.length) supportData.push(loadProvidersData().catch(() => []));
+  if (!state.harnesses.length) supportData.push(loadHarnessesData(false).catch(() => []));
+  const [data] = await Promise.all([api(`/traces/summaries?${traceQuery(append)}`), ...supportData]);
+  state.traceCursor = data.next_cursor;
+  const incoming = data.traces || [];
+  state.traceRows = append ? [...state.traceRows, ...incoming.filter((trace) => !state.traceRows.some((current) => current.id === trace.id))] : incoming;
+  populateTraceFilterOptions();
+  renderTraceList();
   $("#more-traces").hidden = !data.has_more;
 }
 
 function middlewareRecords(attempt) {
   const records = parseList(attempt.middleware_decisions);
   if (!records.length) return '<p class="muted">No middleware decisions recorded.</p>';
-  return `<ul class="decision-list">${records.map((record) => `<li><code>${escapeHtml(record.rule_name || record.rule_id || "unknown rule")}</code><span class="pill ${record.state === "matched" ? "success" : "neutral"}">${escapeHtml(record.state || "unknown")}</span>${record.action ? `<span>${escapeHtml(record.action)}</span>` : ""}${record.suppressed ? '<span class="danger">suppressed</span>' : ""}${record.explanation ? `<span>${escapeHtml(record.explanation)}</span>` : ""}</li>`).join("")}</ul>`;
+  return `<ul class="trace-decision-list">${records.map((record) => `<li><span class="trace-decision-mark ${record.state === "matched" ? "matched" : ""}"></span><span><code>${escapeHtml(record.rule_name || record.rule_id || "unknown rule")}</code><small>${escapeHtml(record.explanation || record.action || "Evaluated")}</small></span><span class="trace-decision-state">${escapeHtml(record.suppressed ? "suppressed" : record.state || "unknown")}</span></li>`).join("")}</ul>`;
 }
 
 function renderAttempt(attempt, index) {
-  return `<article class="attempt"><h4>Attempt ${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</h4>${facts([["Provider", attempt.provider || attempt.upstream_provider], ["Model", attempt.model || attempt.routed_model], ["Account", attempt.account_id], ["Status", attempt.status], ["Error", attempt.error?.message || attempt.error || attempt.error_kind], ["Latency", attempt.latency_ms === undefined ? null : `${attempt.latency_ms} ms`]])}<h5>Middleware decisions</h5>${middlewareRecords(attempt)}<details><summary>Attempt metadata</summary><pre>${escapeHtml(JSON.stringify(attempt, null, 2))}</pre></details></article>`;
+  const error = attempt.error?.message || attempt.error || attempt.error_kind;
+  return `<article class="trace-attempt"><header><span class="attempt-number">${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</span><div><strong>Attempt ${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</strong><small>${escapeHtml(attempt.provider || attempt.upstream_provider || "unrouted")}</small></div>${traceStatusChip(attempt.status, error)}</header><div class="trace-chip-row">${traceModelChip(attempt.model || attempt.routed_model)}${attempt.latency_ms === undefined ? "" : traceMetricChip("Latency", formatDurationMs(attempt.latency_ms))}${attempt.account_id ? traceMetricChip("Account", attempt.account_id) : ""}</div>${error ? `<p class="trace-error-copy">${escapeHtml(traceMetaValue(error))}</p>` : ""}<details class="trace-attempt-decisions" open><summary>Middleware decisions <span>${escapeHtml(parseList(attempt.middleware_decisions).length)}</span></summary>${middlewareRecords(attempt)}</details><details class="trace-json-card"><summary>Attempt metadata</summary><pre>${escapeHtml(JSON.stringify(attempt, null, 2))}</pre></details></article>`;
 }
 
 function bodyDetails(trace) {
   const bodies = [["request", "Client request", trace.req_body_path], ["upstream-request", "Upstream request", trace.upstream_req_body_path], ["response", "Client response", trace.resp_body_path]];
   if (trace.via_dario) bodies.push(["dario-upstream-request", "Dario upstream request", true], ["dario-upstream-response", "Dario upstream response", true]);
-  return bodies.filter(([, , available]) => available).map(([kind, label]) => `<details class="lazy-data" data-body-kind="${kind}"><summary>${escapeHtml(label)}</summary><pre>Open to load only this body.</pre></details>`).join("") || '<p class="muted">No stored bodies are available for this trace.</p>';
+  return bodies.filter(([, , available]) => available).map(([kind, label]) => `<details class="lazy-data trace-body-card" data-body-kind="${escapeHtml(kind)}"><summary><span>${escapeHtml(label)}</span><small>Load one body</small></summary><pre>Open to load only this body.</pre></details>`).join("") || '<p class="muted">No stored bodies are available for this trace.</p>';
+}
+
+function traceDetailGrid(items) {
+  return `<dl class="trace-detail-grid">${items.map(([label, value, html = false]) => `<div><dt>${escapeHtml(label)}</dt><dd>${html ? value : escapeHtml(traceMetaValue(value))}</dd></div>`).join("")}</dl>`;
+}
+
+function traceDetailSection(title, body, badge = "", open = false) {
+  return `<details class="trace-detail-section" ${open ? "open" : ""}><summary><span>${escapeHtml(title)}</span>${badge !== "" ? `<small>${escapeHtml(badge)}</small>` : ""}</summary><div class="trace-section-body">${body}</div></details>`;
 }
 
 function renderTraceDetail(id, data) {
   const trace = data.trace || data;
   const attempts = parseList(trace.attempts);
   const detail = $("#trace-detail");
-  detail.classList.add("open");
-  detail.innerHTML = `<div class="card-heading"><div><h3>Trace ${escapeHtml(id)}</h3><span class="muted">${escapeHtml(formatTime(trace.ts_request_ms))}</span></div><button data-close-detail>Close</button></div><h4>Summary</h4>${facts([["Status", trace.status], ["Latency", trace.latency_ms === null || trace.latency_ms === undefined ? null : `${trace.latency_ms} ms`], ["Input tokens", trace.input_tokens], ["Output tokens", trace.output_tokens], ["Error", trace.error || trace.error_kind], ["Session", trace.session_id], ["Run", trace.run_id]])}<h4>Provenance</h4>${facts([["Harness", trace.harness], ["Client format", trace.client_format], ["Provider", trace.upstream_provider], ["Upstream format", trace.upstream_format], ["Requested model", trace.requested_model], ["Routed model", trace.routed_model], ["Original model", trace.original_model], ["Served model", trace.served_model], ["Account", trace.account_id], ["Original account", trace.original_account_id], ["Served account", trace.served_account_id], ["Via Dario", trace.via_dario], ["Dario generation", trace.dario_generation], ["Routing explanation", trace.substitution_reason]])}<h4>Attempts and middleware</h4><div class="attempt-list">${attempts.length ? attempts.map(renderAttempt).join("") : '<p class="muted">No attempt records stored.</p>'}</div><h4>Stored bodies</h4><div class="lazy-list">${bodyDetails(trace)}</div>${trace.session_id ? `<h4>Session</h4><details class="lazy-data" data-transcript="${escapeHtml(trace.session_id)}"><summary>Conversation turns</summary><div>Open to load one bounded page of turn summaries.</div></details>` : ""}`;
-  $('[data-close-detail]', detail).addEventListener("click", () => { detail.classList.remove("open"); detail.innerHTML = '<div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect routing, attempts, middleware, bodies, and conversation turns.</p></div>'; });
+  const summary = traceDetailGrid([
+    ["Method / path", [trace.method, trace.path].filter(Boolean).join(" ")], ["Error", trace.error || trace.error_kind],
+    ["Session", trace.session_id], ["Run", trace.run_id], ["Streamed", trace.streamed], ["Billing bucket", trace.billing_bucket],
+  ]);
+  const provenance = traceDetailGrid([
+    ["Harness", `${harnessLogoTile(trace.harness, trace.harness, "trace-detail-brand")}<span>${escapeHtml(traceMetaValue(trace.harness))}</span>`, true],
+    ["Client format", trace.client_format],
+    ["Provider", `${providerLogoTile(trace.upstream_provider, trace.upstream_provider, "trace-detail-brand")}<span>${escapeHtml(traceMetaValue(trace.upstream_provider))}</span>`, true],
+    ["Upstream format", trace.upstream_format], ["Requested model", trace.requested_model], ["Routed model", trace.routed_model],
+    ["Original model", trace.original_model], ["Served model", trace.served_model], ["Account", trace.account_id],
+    ["Original account", trace.original_account_id], ["Served account", trace.served_account_id], ["Via Dario", trace.via_dario],
+    ["Dario generation", trace.dario_generation], ["Routing explanation", trace.substitution_reason],
+  ]);
+  detail.innerHTML = `<header class="trace-detail-head"><div><div class="trace-detail-eyebrow">TRACE <code>${escapeHtml(traceShortId(id))}</code></div><div class="trace-detail-title">${traceStatusChip(trace.status, trace.error)}<time>${escapeHtml(formatTime(trace.ts_request_ms))}</time></div></div><button data-close-detail>Close</button></header>
+    <div class="trace-detail-scroll"><div class="trace-chip-row trace-quick-stats">${traceMetricChip("Latency", formatDurationMs(trace.latency_ms))}${traceMetricChip("Input", traceTokenCount(trace.input_tokens))}${traceMetricChip("Output", traceTokenCount(trace.output_tokens))}${trace.cost_usd === null || trace.cost_usd === undefined ? "" : traceMetricChip("Cost", formatMoney(trace.cost_usd), "cost")}</div>
+    ${traceDetailSection("Summary", summary, "", true)}${traceDetailSection("Provenance", provenance, "", true)}${traceDetailSection("Attempts", `<div class="attempt-list">${attempts.length ? attempts.map(renderAttempt).join("") : '<p class="muted">No attempt records stored.</p>'}</div>`, attempts.length, true)}${traceDetailSection("Stored bodies", `<div class="lazy-list">${bodyDetails(trace)}</div>`, "explicit load", true)}${trace.session_id ? traceDetailSection("Session link", `<button class="trace-session-link" data-session-link="${escapeHtml(trace.session_id)}">Open chat flow <code>${escapeHtml(traceShortId(trace.session_id))}</code><span>→</span></button>`, "", true) : ""}</div>`;
+  $('[data-close-detail]', detail).addEventListener("click", closeTraceDetail);
   $$('[data-body-kind]', detail).forEach((node) => node.addEventListener("toggle", () => { if (node.open && !node.dataset.loaded) loadTraceBody(id, node); }));
-  $$('[data-transcript]', detail).forEach((node) => node.addEventListener("toggle", () => { if (node.open && !node.dataset.loaded) loadTranscript(node); }));
-  detail.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  $('[data-session-link]', detail)?.addEventListener("click", () => {
+    const summaryTrace = state.traceRows.find((row) => row.id === id) || { ...trace, id, provider: trace.upstream_provider, model: trace.routed_model };
+    showTraceConversation(summaryTrace);
+    detail.classList.remove("open");
+  });
+  detail.scrollTop = 0;
+}
+
+function closeTraceDetail() {
+  const detail = $("#trace-detail");
+  detail.classList.remove("open");
+  detail.innerHTML = '<div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect metadata, attempts, middleware, and explicitly loaded bodies.</p></div>';
 }
 
 // This is deliberately metadata-only. It must never fetch trace body bytes or a
 // full transcript; explicit disclosure toggles below own those requests.
 async function openTrace(id) {
-  try { renderTraceDetail(id, await api(`/traces/${encodeURIComponent(id)}/metadata`)); }
+  state.traceDetailRequest = id;
+  try {
+    const data = await api(`/traces/${encodeURIComponent(id)}/metadata`);
+    if (state.traceDetailRequest === id) renderTraceDetail(id, data);
+  }
   catch (error) { toast(error.message, "danger"); }
 }
 
@@ -1901,19 +2066,28 @@ async function loadTraceBody(id, node) {
 
 function renderExecutedTools(tools) {
   if (!tools?.length) return "";
-  return `<div class="executed-tools"><h6>Executed tools</h6>${tools.map((tool) => {
-    const args = typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments, null, 2);
-    return `<details><summary>${escapeHtml(tool.tool_name || "tool")} ${tool.is_error ? '<span class="danger">error</span>' : ""}</summary>${args ? `<strong>Arguments</strong><pre>${escapeHtml(args)}</pre>` : ""}${tool.result ? `<strong>Result</strong><pre>${escapeHtml(tool.result)}</pre>` : ""}</details>`;
+  return `<div class="executed-tools"><div class="tool-stack-label">${escapeHtml(`${tools.length} executed tool${tools.length === 1 ? "" : "s"}`)}</div>${tools.map((tool) => {
+    const args = tool.arguments === null || tool.arguments === undefined ? "" : (typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments, null, 2));
+    const duration = tool.ts_end_ms === null || tool.ts_end_ms === undefined ? "" : formatDurationMs(finite(tool.ts_end_ms) - finite(tool.ts_start_ms));
+    return `<details class="trace-tool-card"><summary><span class="tool-icon">⌘</span><code>${escapeHtml(tool.tool_name || "tool")}</code><span class="tool-summary">${escapeHtml(args.split("\n")[0].slice(0, 60))}</span>${duration ? `<small>${escapeHtml(duration)}</small>` : ""}${traceStatusChip(tool.is_error ? 500 : 200, tool.is_error ? "tool error" : null)}</summary><div class="trace-tool-detail">${args ? `<strong>Arguments</strong><pre>${escapeHtml(args)}</pre>` : ""}${tool.result ? `<strong>Result</strong><pre>${escapeHtml(tool.result)}</pre>` : ""}</div></details>`;
   }).join("")}</div>`;
+}
+
+function renderTurnMessage(role, text, turn) {
+  if (!text) return "";
+  const user = role === "user";
+  const tokenValue = user ? turn.input_tokens : turn.output_tokens;
+  return `<section class="turn-message ${user ? "user" : "assistant"}"><div class="turn-avatar">${user ? "U" : "A"}</div><div class="turn-message-copy"><header><strong>${user ? "User / Harness" : "Assistant"}</strong>${user ? (turn.harness ? `<span>${escapeHtml(turn.harness)}</span>` : "") : traceModelChip(turn.model || turn.served_model)}${tokenValue === null || tokenValue === undefined ? "" : `<small>${escapeHtml(`${formatInteger(tokenValue)} tok`)}</small>`}<time>${escapeHtml(formatTime(turn.ts_request_ms))}</time></header><div class="turn-bubble">${escapeHtml(text)}</div></div></section>`;
 }
 
 function renderTurn(turn) {
   const assistant = turn.assistant || parseList(turn.assistant_blocks).filter((block) => block.type === "text").map((block) => block.text).join("\n\n");
-  return `<article class="turn">${turn.user ? `<div><strong>User</strong><pre>${escapeHtml(turn.user)}</pre></div>` : ""}${assistant ? `<div><strong>Assistant</strong><pre>${escapeHtml(assistant)}</pre></div>` : ""}${renderExecutedTools(turn.executed_tools)}${facts([["Trace", turn.trace_id], ["Model", turn.model || turn.served_model], ["Status", turn.status], ["Input tokens", turn.input_tokens], ["Output tokens", turn.output_tokens]])}</article>`;
+  return `<article class="turn-expanded">${renderTurnMessage("user", turn.user, turn)}${renderTurnMessage("assistant", assistant || turn.error || "No assistant text was stored.", turn)}${renderExecutedTools(turn.executed_tools)}<footer class="turn-meta-footer"><code>${escapeHtml(traceShortId(turn.trace_id))}</code>${traceStatusChip(turn.status, turn.error)}${turn.cost_usd === null || turn.cost_usd === undefined ? "" : traceMetricChip("Cost", formatMoney(turn.cost_usd))}</footer></article>`;
 }
 
 function renderTurnSummary(turn) {
-  return `<details class="turn-summary" data-turn-trace="${escapeHtml(turn.trace_id)}"><summary><span><code>${escapeHtml(turn.model || turn.trace_id)}</code> · ${escapeHtml(turn.provider || "unrouted")}</span><span>${escapeHtml(turn.status ?? "—")} · ${escapeHtml(formatTime(turn.ts_request_ms))}</span></summary><div class="turn-detail muted">Open to load only this turn.</div></details>`;
+  const traceId = turn.trace_id || turn.id;
+  return `<details class="turn-summary" data-turn-trace="${escapeHtml(traceId)}"><summary><div class="turn-summary-conversation"><div class="turn-summary-message user"><span class="turn-avatar">U</span><span><strong>User / Harness</strong><small>Open to load user text</small></span><time>${escapeHtml(traceRelativeTime(turn.ts_request_ms))}</time></div><div class="turn-thread-line"></div><div class="turn-summary-message assistant"><span class="turn-avatar">A</span><span><strong>Assistant</strong><small>${escapeHtml(turn.provider || "unrouted")}</small></span>${traceModelChip(turn.model || traceId)}${traceStatusChip(turn.status, turn.error)}<small class="turn-token-total">${escapeHtml(`${formatInteger(finite(turn.input_tokens) + finite(turn.output_tokens))} tok · ${traceRelativeTime(turn.ts_request_ms)}`)}</small></div></div></summary><div class="turn-detail muted">Open to load only this turn.</div></details>`;
 }
 
 function replaceTranscriptPage(target, html) {
@@ -1940,7 +2114,7 @@ async function loadTranscriptPage(node, cursor) {
   try {
     const data = await api(`/traces/sessions/${encodeURIComponent(node.dataset.transcript)}/transcript/page?${params}`);
     const turns = (data.turns || []).map(renderTurnSummary).join("") || '<p class="muted">No turns found.</p>';
-    const controls = `<div class="turn-page-controls"><button data-turn-previous ${node._pageIndex ? "" : "disabled"}>Previous page</button><span>Page ${node._pageIndex + 1} · up to ${TURN_PAGE_SIZE} turns</span><button data-turn-next ${data.has_more ? "" : "disabled"}>Next page</button></div>`;
+    const controls = `<div class="turn-page-controls"><button data-turn-previous ${node._pageIndex ? "" : "disabled"}>← Previous</button><span>Page ${node._pageIndex + 1} · up to ${TURN_PAGE_SIZE} turns</span><button data-turn-next ${data.has_more ? "" : "disabled"}>Next →</button></div>`;
     replaceTranscriptPage(target, `${turns}${controls}`);
     $$('[data-turn-trace]', target).forEach((turn) => turn.addEventListener("toggle", () => { if (turn.open && !turn.dataset.loaded) loadTranscriptTurn(turn); }));
     $('[data-turn-previous]', target).addEventListener("click", () => { if (node._pageIndex > 0) { node._pageIndex -= 1; loadTranscriptPage(node, node._pageStarts[node._pageIndex]); } });
@@ -1952,9 +2126,45 @@ async function loadTranscript(node) {
   node.dataset.loaded = "true";
   node._pageStarts = [null];
   node._pageIndex = 0;
-  const holder = $("div", node);
-  holder.className = "session-turns";
   await loadTranscriptPage(node, null);
+}
+
+function conversationShell(trace) {
+  const session = trace.session_id;
+  const title = session ? traceShortId(session) : `Trace ${traceShortId(trace.id)}`;
+  const subtitle = session ? "Bounded session transcript" : "Standalone trace";
+  return `<header class="trace-panel-head accent"><div class="conversation-identity"><span class="conversation-mark">⌁</span><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small></span>${traceModelChip(trace.model || trace.served_model)}</div><div class="conversation-actions"><button data-inspect-trace>Inspect trace</button><button class="mobile-only-action" data-close-conversation aria-label="Close conversation">Close</button></div></header><div class="trace-conversation-scroll">${session ? `<div class="session-transcript" data-transcript="${escapeHtml(session)}"><div class="session-turns">Loading a bounded page…</div></div>` : renderTurnSummary(trace)}</div>`;
+}
+
+function showTraceConversation(trace) {
+  const conversation = $("#trace-conversation");
+  conversation.classList.add("open");
+  conversation.innerHTML = conversationShell(trace);
+  $('[data-inspect-trace]', conversation).addEventListener("click", () => $("#trace-detail").classList.add("open"));
+  $('[data-close-conversation]', conversation).addEventListener("click", () => conversation.classList.remove("open"));
+  const transcript = $('[data-transcript]', conversation);
+  if (transcript) loadTranscript(transcript);
+  else $$('[data-turn-trace]', conversation).forEach((turn) => turn.addEventListener("toggle", () => { if (turn.open && !turn.dataset.loaded) loadTranscriptTurn(turn); }));
+}
+
+function selectTraceSummary(id) {
+  const trace = state.traceRows.find((row) => row.id === id);
+  if (!trace) return;
+  state.selectedTraceId = trace.id;
+  state.selectedSessionId = trace.session_id || null;
+  renderTraceList();
+  showTraceConversation(trace);
+  openTrace(trace.id);
+}
+
+function selectSessionSummary(sessionId) {
+  const trace = state.traceRows.find((row) => row.session_id === sessionId);
+  if (!trace) return;
+  state.selectedSessionId = sessionId;
+  state.selectedTraceId = trace.id;
+  renderTraceList();
+  showTraceConversation(trace);
+  openTrace(trace.id);
 }
 
 function applyTraceFilters(event) {
