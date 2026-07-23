@@ -1,6 +1,27 @@
 /* 1. State, escaping, formatting, API, and toast helpers. */
 const TURN_PAGE_SIZE = 20;
 const TRACE_PAGE_SIZE = 25;
+const TRACE_COLUMN_STORAGE_KEY = "alex.web.trace-columns";
+const TRACE_COLUMN_DEFAULTS = Object.freeze({
+  left: 420,
+  right: 350,
+  visible: ["turns", "cost", "duration", "status", "time"],
+  showSubagents: true,
+});
+function readTraceColumnPreferences() {
+  try {
+    const value = JSON.parse(localStorage.getItem(TRACE_COLUMN_STORAGE_KEY) || "{}");
+    const bounded = (candidate, minimum, maximum, fallback) => Number.isFinite(Number(candidate)) ? Math.min(maximum, Math.max(minimum, Number(candidate))) : fallback;
+    return {
+      left: bounded(value.left, 200, 560, TRACE_COLUMN_DEFAULTS.left),
+      right: bounded(value.right, 280, 720, TRACE_COLUMN_DEFAULTS.right),
+      visible: Array.isArray(value.visible) ? value.visible.filter((column) => TRACE_COLUMN_DEFAULTS.visible.includes(column)) : [...TRACE_COLUMN_DEFAULTS.visible],
+      showSubagents: value.showSubagents !== false,
+    };
+  } catch {
+    return { ...TRACE_COLUMN_DEFAULTS, visible: [...TRACE_COLUMN_DEFAULTS.visible] };
+  }
+}
 const ONBOARDING_STEP_TITLES = [
   "Web access", "Meet Alex", "Pick a provider", "Connect and test",
   "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
@@ -35,21 +56,33 @@ const PROVIDER_LOGOS = Object.freeze({
 });
 const HARNESS_LOGOS = Object.freeze({
   pi: "pi.svg",
+  omp: "oh-my-pi.png",
+  "oh-my-pi": "oh-my-pi.png",
   claude: "claude-code.png",
+  "claude-code": "claude-code.png",
   codex: "codex.png",
   gemini: "gemini-cli.png",
   kimi: "kimi-code.png",
   cursor: "cursor-cli.png",
+  "cursor-cli": "cursor-cli.png",
   amp: "amp-code.svg",
   droid: "droid-cli.svg",
   grok: "grok-build.png",
   opencode: "opencode.png",
+  "mini-swe-agent": "mini-swe-agent.png",
   qwen: "qwen-code.png",
+  "qwen-code": "qwen-code.png",
   goose: "goose.jpg",
+  opensage: "opensage-adk.png",
+  "opensage-adk": "opensage-adk.png",
+  "pydantic-ai": "pydantic-ai-harness.png",
+  jcode: "jcode.png",
+  hermes: "hermes.png",
 });
 const HARNESS_ORDER = Object.freeze([
   "pi", "claude", "codex", "grok", "amp", "gemini", "opencode",
-  "kimi", "cursor", "droid", "qwen", "goose",
+  "kimi", "cursor", "droid", "qwen", "goose", "omp", "mini-swe-agent",
+  "opensage", "pydantic-ai", "stirrup", "jcode", "hermes",
 ]);
 const LOGIN_PROVIDERS = {
   claude: ["Claude Code", "Anthropic", "A", "claude"],
@@ -76,6 +109,7 @@ const VIEW_COPY = {
   notifications: ["Notifications", "Telegram alerts and daemon messages"],
 };
 const CHART_COLORS = ["#0a84ff", "#30d158", "#ff9f0a", "#bf5af2", "#64d2ff", "#ff453a"];
+const traceColumnPreferences = readTraceColumnPreferences();
 const state = {
   adminKey: null,
   sessionAuthenticated: false,
@@ -104,9 +138,17 @@ const state = {
   traceCursor: null,
   traceFilters: {},
   traceRows: [],
+  traceSessions: [],
+  traceSort: { key: "time", direction: "desc" },
+  traceVisibleColumns: new Set(traceColumnPreferences.visible),
+  traceShowSubagents: traceColumnPreferences.showSubagents,
+  traceExpandedSessions: new Set(),
+  traceColumnWidths: { left: traceColumnPreferences.left, right: traceColumnPreferences.right },
   selectedTraceId: null,
   selectedSessionId: null,
   traceDetailRequest: null,
+  sessionMenu: null,
+  sessionFixturesLoaded: false,
   loginPoll: null,
   networkFailures: 0,
   sessionRecovery: false,
@@ -131,15 +173,26 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 })[character]);
+const stableHueClass = (value) => {
+  let hash = 0;
+  for (const character of String(value || "?")) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return `brand-hue-${Math.abs(hash) % 8}`;
+};
 const logoTile = (logos, name, label, className) => {
   const key = String(name || "").toLowerCase();
   const file = logos[key];
   if (file) return `<span class="${escapeHtml(className)} brand-logo-tile" aria-hidden="true"><img src="/ui/assets/${escapeHtml(file)}" alt=""></span>`;
   const monogram = key === "cliproxyapi" ? "⚙" : String(label || name || "?").trim().charAt(0).toUpperCase() || "?";
-  return `<span class="${escapeHtml(className)} brand-monogram-tile" aria-hidden="true">${escapeHtml(monogram)}</span>`;
+  return `<span class="${escapeHtml(className)} brand-monogram-tile ${stableHueClass(key)}" aria-hidden="true">${escapeHtml(monogram)}</span>`;
 };
 const providerLogoTile = (name, label, className = "provider-monogram") => logoTile(PROVIDER_LOGOS, name, label, className);
 const harnessLogoTile = (name, label, className = "harness-logo") => logoTile(HARNESS_LOGOS, name, label, className);
+const providerDisplayName = (name) => ({
+  anthropic: "Anthropic", claude: "Anthropic", openai: "OpenAI", codex: "OpenAI",
+  google: "Google", gemini: "Google", xai: "xAI", grok: "xAI",
+  moonshot: "Moonshot AI", kimi: "Moonshot AI", openrouter: "OpenRouter",
+  exo: "Exo", amp: "Amp",
+})[String(name || "").toLowerCase()] || String(name || "Unrouted");
 const display = (value) => value === null || value === undefined || value === "" ? "—" : String(value);
 const parseList = (value) => {
   if (Array.isArray(value)) return value;
@@ -2098,61 +2151,199 @@ function populateTraceFilterOptions() {
   setTraceSelectOptions("harness", harnessValues, "Any harness");
 }
 
-function groupTraceRows(rows) {
-  const groups = [];
-  const sessions = new Map();
-  rows.forEach((trace) => {
-    if (!trace.session_id) {
-      groups.push({ type: "trace", trace });
-      return;
-    }
-    let group = sessions.get(trace.session_id);
-    if (!group) {
-      group = { type: "session", id: trace.session_id, traces: [] };
-      sessions.set(trace.session_id, group);
-      groups.push(group);
-    }
-    group.traces.push(trace);
+function traceSessionRows() {
+  const aggregates = new Map(state.traceSessions.map((session) => [session.session_id, session]));
+  const rows = new Map();
+  state.traceRows.forEach((trace) => {
+    const id = trace.session_id || `trace:${trace.id}`;
+    if (!rows.has(id)) rows.set(id, {
+      id,
+      sessionId: trace.session_id || null,
+      traces: [],
+      aggregate: trace.session_id ? aggregates.get(trace.session_id) || null : null,
+      parentId: null,
+      children: [],
+      nestedBy: null,
+    });
+    rows.get(id).traces.push(trace);
   });
-  return groups;
+  rows.forEach((row) => {
+    row.latest = row.traces.slice().sort((left, right) => finite(right.ts_request_ms) - finite(left.ts_request_ms))[0];
+    row.runId = row.aggregate?.run_id || row.latest.run_id || null;
+    const verifiedParent = row.aggregate?.parent_session_id;
+    if (verifiedParent && rows.has(verifiedParent)) {
+      row.parentId = verifiedParent;
+      row.nestedBy = "lineage";
+    }
+  });
+
+  const byRun = new Map();
+  rows.forEach((row) => {
+    if (!row.sessionId || !row.runId) return;
+    if (!byRun.has(row.runId)) byRun.set(row.runId, []);
+    byRun.get(row.runId).push(row);
+  });
+  byRun.forEach((runRows) => {
+    if (runRows.length < 2) return;
+    const possibleRoots = runRows.filter((row) => !row.parentId);
+    if (possibleRoots.length < 2) return;
+    possibleRoots.sort((left, right) => sessionSortValue(left, "time", true) - sessionSortValue(right, "time", true) || left.id.localeCompare(right.id));
+    const root = possibleRoots[0];
+    possibleRoots.slice(1).forEach((row) => {
+      row.parentId = root.id;
+      row.nestedBy = "run";
+    });
+  });
+
+  rows.forEach((row) => {
+    if (row.parentId && rows.has(row.parentId) && row.parentId !== row.id) rows.get(row.parentId).children.push(row);
+  });
+  return [...rows.values()].filter((row) => !row.parentId || !rows.has(row.parentId));
 }
 
-function traceRowMarkup(trace, nested = false) {
-  const error = traceStatusKind(trace.status, trace.error) === "error";
-  const active = state.selectedTraceId === trace.id;
-  return `<button class="trace-row ${nested ? "nested" : ""} ${active ? "active" : ""} ${error ? "error" : ""}" data-trace-id="${escapeHtml(trace.id)}">
-    <span class="trace-row-main"><span class="trace-row-brands">${providerLogoTile(trace.provider, trace.provider, "trace-mini-brand")}${harnessLogoTile(trace.harness, trace.harness, "trace-mini-brand")}</span><span class="trace-row-copy"><code>${escapeHtml(trace.model || trace.served_model || traceShortId(trace.id))}</code><small>${escapeHtml(`${trace.provider || "unrouted"} · ${trace.harness || "unknown harness"}`)}</small></span></span>
-    ${traceStatusChip(trace.status, trace.error)}<time>${escapeHtml(traceRelativeTime(trace.ts_request_ms))}</time>
-  </button>`;
+function sessionSortValue(row, key, ascendingTime = false) {
+  const aggregate = row.aggregate || {};
+  if (key === "session") return row.sessionId || row.latest.id;
+  if (key === "turns") return aggregate.trace_count ?? row.traces.length;
+  if (key === "cost") return aggregate.total_cost_usd ?? -1;
+  if (key === "duration") return aggregate.duration_ms ?? row.latest.latency_ms ?? -1;
+  if (key === "status") return aggregate.status_label || traceStatusKind(row.latest.status, row.latest.error);
+  const time = aggregate.last_ts_ms ?? row.latest.ts_request_ms ?? 0;
+  return ascendingTime ? finite(aggregate.first_ts_ms ?? time) : finite(time);
+}
+
+function sortedSessionRows(rows) {
+  const { key, direction } = state.traceSort;
+  const multiplier = direction === "asc" ? 1 : -1;
+  return rows.slice().sort((left, right) => {
+    const a = sessionSortValue(left, key);
+    const b = sessionSortValue(right, key);
+    const compared = typeof a === "string" || typeof b === "string"
+      ? String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" })
+      : finite(a) - finite(b);
+    return compared * multiplier || left.id.localeCompare(right.id);
+  });
+}
+
+function sessionStatusMarkup(row) {
+  const label = row.aggregate?.status_label;
+  if (label) {
+    const kind = label === "Error" ? "error" : label === "Done" ? "success" : "neutral";
+    return `<span class="trace-status-chip ${kind}"><i></i>${escapeHtml(label)}</span>`;
+  }
+  return traceStatusChip(row.latest.status, row.latest.error);
+}
+
+function sessionRowMarkup(row, nested = false) {
+  const aggregate = row.aggregate || {};
+  const trace = row.latest;
+  const active = row.sessionId ? state.selectedSessionId === row.sessionId : state.selectedTraceId === trace.id;
+  const error = aggregate.status_label === "Error" || traceStatusKind(trace.status, trace.error) === "error";
+  const children = sortedSessionRows(row.children);
+  const expanded = state.traceExpandedSessions.has(row.id) || !state.traceExpandedSessions.has(`closed:${row.id}`);
+  const provider = aggregate.providers?.[0] || trace.provider;
+  const harness = aggregate.harness || trace.harness;
+  const model = aggregate.models?.[0] || trace.model || trace.served_model;
+  const rowTarget = row.sessionId ? `data-session-id="${escapeHtml(row.sessionId)}"` : `data-trace-id="${escapeHtml(trace.id)}"`;
+  const treeControl = nested
+    ? children.length
+      ? `<button class="trace-tree-toggle trace-tree-elbow" data-session-toggle="${escapeHtml(row.id)}" aria-label="${expanded ? "Collapse" : "Expand"} subagent sessions">${expanded ? "⌄" : "›"}</button>`
+      : '<span class="trace-tree-elbow" aria-hidden="true"></span>'
+    : children.length
+      ? `<button class="trace-tree-toggle" data-session-toggle="${escapeHtml(row.id)}" aria-label="${expanded ? "Collapse" : "Expand"} subagent sessions">${expanded ? "⌄" : "›"}</button>`
+      : '<span class="trace-tree-spacer"></span>';
+  const turns = aggregate.trace_count ?? row.traces.length;
+  const cost = aggregate.total_cost_usd;
+  const duration = aggregate.duration_ms ?? trace.latency_ms;
+  const time = aggregate.last_ts_ms ?? trace.ts_request_ms;
+  const typeLabel = nested ? (row.nestedBy === "lineage" ? "subagent" : "same run") : harnessDisplayName(harness);
+  return `<section class="trace-session-group ${active ? "active" : ""} ${error ? "error" : ""} ${nested ? "nested-session" : ""}">
+    <div class="trace-session-row" data-session-grid ${rowTarget} tabindex="0" role="button">
+      <span class="trace-session-identity">${treeControl}<span class="trace-row-brands">${providerLogoTile(provider, provider, "trace-mini-brand")}${harnessLogoTile(harness, harness, "trace-mini-brand")}</span><span class="trace-row-copy"><code>${escapeHtml(traceShortId(row.sessionId || trace.id))}</code><small>${escapeHtml(`${providerDisplayName(provider)} · ${typeLabel}`)}</small></span>${model ? traceModelChip(model) : ""}</span>
+      <span data-session-column="turns" class="trace-table-number">${escapeHtml(turns)}</span>
+      <span data-session-column="cost" class="trace-table-number">${cost === null || cost === undefined ? "—" : escapeHtml(formatMoney(cost))}</span>
+      <span data-session-column="duration" class="trace-table-number">${escapeHtml(formatDurationMs(duration))}</span>
+      <span data-session-column="status">${sessionStatusMarkup(row)}</span>
+      <time data-session-column="time">${escapeHtml(traceRelativeTime(time))}</time>
+      ${row.sessionId ? `<button class="trace-row-menu" data-session-menu="${escapeHtml(row.sessionId)}" aria-label="Session actions">⋯</button>` : '<span></span>'}
+    </div>
+    ${children.length && expanded && state.traceShowSubagents ? `<div class="trace-session-children">${children.map((child) => sessionRowMarkup(child, true)).join("")}</div>` : ""}
+  </section>`;
+}
+
+function sessionGridTemplate() {
+  const widths = { turns: "22px", cost: "38px", duration: "34px", status: "44px", time: "38px" };
+  return ["minmax(0,1fr)", ...TRACE_COLUMN_DEFAULTS.visible.filter((column) => state.traceVisibleColumns.has(column)).map((column) => widths[column]), "24px"].join(" ");
+}
+
+function applySessionGrid() {
+  const template = sessionGridTemplate();
+  $$("[data-session-grid]").forEach((node) => { node.style.gridTemplateColumns = template; });
+  $$("[data-session-column]").forEach((node) => { node.hidden = !state.traceVisibleColumns.has(node.dataset.sessionColumn); });
+}
+
+function renderTraceSortHeaders() {
+  $$("[data-trace-sort]").forEach((button) => {
+    const active = button.dataset.traceSort === state.traceSort.key;
+    button.classList.toggle("active", active);
+    $("[data-sort-arrow]", button).textContent = active ? (state.traceSort.direction === "asc" ? "↑" : "↓") : "";
+  });
+}
+
+function renderTraceColumnPicker() {
+  const picker = $("#trace-column-picker");
+  picker.innerHTML = `<strong>Visible columns</strong>${TRACE_COLUMN_DEFAULTS.visible.map((column) => `<label><input type="checkbox" data-trace-column="${escapeHtml(column)}" ${state.traceVisibleColumns.has(column) ? "checked" : ""}><span>${escapeHtml({ turns: "Turns", cost: "Cost", duration: "Duration", status: "Status", time: "Time" }[column])}</span></label>`).join("")}`;
+  $$("[data-trace-column]", picker).forEach((input) => input.addEventListener("change", () => {
+    if (input.checked) state.traceVisibleColumns.add(input.dataset.traceColumn);
+    else state.traceVisibleColumns.delete(input.dataset.traceColumn);
+    saveTraceColumnPreferences();
+    applySessionGrid();
+  }));
 }
 
 function renderTraceList() {
   const list = $("#trace-list");
-  const groups = groupTraceRows(state.traceRows);
-  list.innerHTML = groups.map((group) => {
-    if (group.type === "trace") return traceRowMarkup(group.trace);
-    const latest = group.traces[0];
-    const error = group.traces.some((trace) => traceStatusKind(trace.status, trace.error) === "error");
-    const active = state.selectedSessionId === group.id;
-    const status = error ? traceStatusChip(500, "Session contains errors") : traceStatusChip(latest.status, latest.error);
-    return `<section class="trace-session-group ${active ? "active" : ""} ${error ? "error" : ""}">
-      <button class="trace-session-row" data-session-id="${escapeHtml(group.id)}"><span class="trace-session-identity">${harnessLogoTile(latest.harness, latest.harness, "trace-session-brand")}<span><code>${escapeHtml(traceShortId(group.id))}</code><small>${escapeHtml(`${group.traces.length} turn${group.traces.length === 1 ? "" : "s"} loaded · ${latest.harness || "unknown harness"}`)}</small></span></span>${status}<time>${escapeHtml(traceRelativeTime(latest.ts_request_ms))}</time></button>
-      <div class="trace-session-children">${group.traces.map((trace) => traceRowMarkup(trace, true)).join("")}</div>
-    </section>`;
-  }).join("");
-  if (!groups.length) list.innerHTML = '<div class="empty-state compact"><p>No matching body-free trace summaries.</p><small>Route a request or change the metadata filters.</small></div>';
+  const roots = sortedSessionRows(traceSessionRows());
+  list.innerHTML = roots.map((row) => sessionRowMarkup(row)).join("");
+  if (!roots.length) list.innerHTML = '<div class="empty-state compact"><p>No matching body-free trace summaries.</p><small>Route a request or change the metadata filters.</small></div>';
   bindActions(list, "[data-trace-id]", (event) => selectTraceSummary(event.currentTarget.dataset.traceId));
   bindActions(list, "[data-session-id]", (event) => selectSessionSummary(event.currentTarget.dataset.sessionId));
-  $("#trace-count").textContent = String(state.traceRows.length);
-  $("#trace-list-status").textContent = `${state.traceRows.length} body-free summar${state.traceRows.length === 1 ? "y" : "ies"}`;
+  $$("[data-session-toggle]", list).forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const id = button.dataset.sessionToggle;
+    const closedKey = `closed:${id}`;
+    if (state.traceExpandedSessions.has(closedKey)) state.traceExpandedSessions.delete(closedKey);
+    else state.traceExpandedSessions.add(closedKey);
+    renderTraceList();
+  }));
+  $$("[data-session-menu]", list).forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openSessionMenu(button.dataset.sessionMenu, { anchor: button });
+  }));
+  $$("[data-session-id]", list).forEach((row) => row.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    openSessionMenu(row.dataset.sessionId, { x: event.clientX, y: event.clientY });
+  }));
+  applySessionGrid();
+  renderTraceSortHeaders();
+  $("#trace-count").textContent = String(roots.length);
+  $("#trace-list-status").textContent = `${roots.length} loaded session${roots.length === 1 ? "" : "s"}`;
+  const filterCount = Object.keys(state.traceFilters).length;
+  $("#trace-filter-state").textContent = filterCount ? ` · ${filterCount} filter${filterCount === 1 ? "" : "s"} applied` : "";
+  $("#trace-filters").classList.toggle("filters-applied", filterCount > 0);
 }
 
 async function loadTraces(append = false) {
   const supportData = [];
   if (!state.providers.length) supportData.push(loadProvidersData().catch(() => []));
   if (!state.harnesses.length) supportData.push(loadHarnessesData(false).catch(() => []));
-  const [data] = await Promise.all([api(`/traces/summaries?${traceQuery(append)}`), ...supportData]);
+  const [data, sessions] = await Promise.all([
+    api(`/traces/summaries?${traceQuery(append)}`),
+    api("/traces/sessions?limit=1000").catch(() => ({ sessions: [] })),
+    ...supportData,
+  ]);
   state.traceCursor = data.next_cursor;
+  state.traceSessions = sessions.sessions || [];
   const incoming = data.traces || [];
   state.traceRows = append ? [...state.traceRows, ...incoming.filter((trace) => !state.traceRows.some((current) => current.id === trace.id))] : incoming;
   populateTraceFilterOptions();
@@ -2168,7 +2359,8 @@ function middlewareRecords(attempt) {
 
 function renderAttempt(attempt, index) {
   const error = attempt.error?.message || attempt.error || attempt.error_kind;
-  return `<article class="trace-attempt"><header><span class="attempt-number">${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</span><div><strong>Attempt ${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</strong><small>${escapeHtml(attempt.provider || attempt.upstream_provider || "unrouted")}</small></div>${traceStatusChip(attempt.status, error)}</header><div class="trace-chip-row">${traceModelChip(attempt.model || attempt.routed_model)}${attempt.latency_ms === undefined ? "" : traceMetricChip("Latency", formatDurationMs(attempt.latency_ms))}${attempt.account_id ? traceMetricChip("Account", attempt.account_id) : ""}</div>${error ? `<p class="trace-error-copy">${escapeHtml(traceMetaValue(error))}</p>` : ""}<details class="trace-attempt-decisions" open><summary>Middleware decisions <span>${escapeHtml(parseList(attempt.middleware_decisions).length)}</span></summary>${middlewareRecords(attempt)}</details><details class="trace-json-card"><summary>Attempt metadata</summary><pre>${escapeHtml(JSON.stringify(attempt, null, 2))}</pre></details></article>`;
+  const provider = attempt.provider || attempt.upstream_provider;
+  return `<article class="trace-attempt"><header><span class="attempt-number">${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</span><div><strong>Attempt ${escapeHtml(attempt.attempt_number || attempt.attempt || index + 1)}</strong><small class="trace-provider-label">${providerLogoTile(provider, provider, "trace-detail-brand")}${escapeHtml(providerDisplayName(provider || "unrouted"))}</small></div>${traceStatusChip(attempt.status, error)}</header><div class="trace-chip-row">${traceModelChip(attempt.model || attempt.routed_model)}${attempt.latency_ms === undefined ? "" : traceMetricChip("Latency", formatDurationMs(attempt.latency_ms))}${attempt.account_id ? traceMetricChip("Account", attempt.account_id) : ""}</div>${error ? `<p class="trace-error-copy">${escapeHtml(traceMetaValue(error))}</p>` : ""}<details class="trace-attempt-decisions" open><summary>Middleware decisions <span>${escapeHtml(parseList(attempt.middleware_decisions).length)}</span></summary>${middlewareRecords(attempt)}</details><details class="trace-json-card"><summary>Attempt metadata</summary><pre>${escapeHtml(JSON.stringify(attempt, null, 2))}</pre></details></article>`;
 }
 
 function bodyDetails(trace) {
@@ -2194,9 +2386,9 @@ function renderTraceDetail(id, data) {
     ["Session", trace.session_id], ["Run", trace.run_id], ["Streamed", trace.streamed], ["Billing bucket", trace.billing_bucket],
   ]);
   const provenance = traceDetailGrid([
-    ["Harness", `${harnessLogoTile(trace.harness, trace.harness, "trace-detail-brand")}<span>${escapeHtml(traceMetaValue(trace.harness))}</span>`, true],
+    ["Harness", `${harnessLogoTile(trace.harness, trace.harness, "trace-detail-brand")}<span>${escapeHtml(harnessDisplayName(trace.harness))}</span>`, true],
     ["Client format", trace.client_format],
-    ["Provider", `${providerLogoTile(trace.upstream_provider, trace.upstream_provider, "trace-detail-brand")}<span>${escapeHtml(traceMetaValue(trace.upstream_provider))}</span>`, true],
+    ["Provider", `${providerLogoTile(trace.upstream_provider, trace.upstream_provider, "trace-detail-brand")}<span>${escapeHtml(providerDisplayName(trace.upstream_provider))}</span>`, true],
     ["Upstream format", trace.upstream_format], ["Requested model", trace.requested_model], ["Routed model", trace.routed_model],
     ["Original model", trace.original_model], ["Served model", trace.served_model], ["Account", trace.account_id],
     ["Original account", trace.original_account_id], ["Served account", trace.served_account_id], ["Via Dario", trace.via_dario],
@@ -2261,9 +2453,40 @@ function renderTurn(turn) {
   return `<article class="turn-expanded">${renderTurnMessage("user", turn.user, turn)}${renderTurnMessage("assistant", assistant || turn.error || "No assistant text was stored.", turn)}${renderExecutedTools(turn.executed_tools)}<footer class="turn-meta-footer"><code>${escapeHtml(traceShortId(turn.trace_id))}</code>${traceStatusChip(turn.status, turn.error)}${turn.cost_usd === null || turn.cost_usd === undefined ? "" : traceMetricChip("Cost", formatMoney(turn.cost_usd))}</footer></article>`;
 }
 
-function renderTurnSummary(turn) {
+function subagentsForTurn(turn, pageTurns) {
+  const currentSession = state.selectedSessionId;
+  if (!currentSession) return [];
+  const loadedIds = new Set(state.traceRows.map((trace) => trace.session_id).filter(Boolean));
+  const turnTrace = state.traceRows.find((trace) => trace.id === (turn.trace_id || turn.id));
+  const currentRun = turnTrace?.run_id;
+  return state.traceSessions.filter((session) => {
+    if (!loadedIds.has(session.session_id) || session.session_id === currentSession) return false;
+    const related = session.parent_session_id === currentSession || (currentRun && session.run_id === currentRun);
+    if (!related) return false;
+    if (session.lineage_turn_id && session.lineage_turn_id === turn.trace_id) return true;
+    const started = finite(session.subagent_started_ms ?? session.first_ts_ms);
+    const eligible = pageTurns.filter((candidate) => finite(candidate.ts_request_ms) <= started);
+    const assigned = eligible.length ? eligible[eligible.length - 1] : pageTurns[0];
+    return assigned && assigned.trace_id === turn.trace_id;
+  });
+}
+
+function renderSubagentCard(session) {
+  const status = session.status_label || "Running";
+  const model = session.models?.[0];
+  const provider = session.providers?.[0];
+  return `<article class="trace-subagent-card">
+    <div class="trace-subagent-badge">${harnessLogoTile(session.harness, session.harness, "trace-mini-brand")}<span><b>Subagent</b><small>${escapeHtml(status)}</small></span></div>
+    <div class="trace-subagent-facts">${model ? traceModelChip(model) : ""}${provider ? `<span>${providerLogoTile(provider, provider, "trace-mini-brand")}${escapeHtml(providerDisplayName(provider))}</span>` : ""}<span>${escapeHtml(`${session.trace_count || 0} turn${session.trace_count === 1 ? "" : "s"}`)}</span></div>
+    <button data-follow-session="${escapeHtml(session.session_id)}">Follow</button>
+  </article>`;
+}
+
+function renderTurnSummary(turn, pageTurns = []) {
   const traceId = turn.trace_id || turn.id;
-  return `<details class="turn-summary" data-turn-trace="${escapeHtml(traceId)}"><summary><div class="turn-summary-conversation"><div class="turn-summary-message user"><span class="turn-avatar">U</span><span><strong>User / Harness</strong><small>Open to load user text</small></span><time>${escapeHtml(traceRelativeTime(turn.ts_request_ms))}</time></div><div class="turn-thread-line"></div><div class="turn-summary-message assistant"><span class="turn-avatar">A</span><span><strong>Assistant</strong><small>${escapeHtml(turn.provider || "unrouted")}</small></span>${traceModelChip(turn.model || traceId)}${traceStatusChip(turn.status, turn.error)}<small class="turn-token-total">${escapeHtml(`${formatInteger(finite(turn.input_tokens) + finite(turn.output_tokens))} tok · ${traceRelativeTime(turn.ts_request_ms)}`)}</small></div></div></summary><div class="turn-detail muted">Open to load only this turn.</div></details>`;
+  const selected = state.selectedTraceId === traceId;
+  const subagents = subagentsForTurn(turn, pageTurns);
+  return `<details class="turn-summary ${selected ? "selected" : ""}" data-turn-trace="${escapeHtml(traceId)}" ${selected ? "open" : ""}><summary><div class="turn-summary-conversation"><div class="turn-summary-message user"><span class="turn-avatar">U</span><span><strong>User / Harness</strong><small>Body-free turn metadata</small></span><time>${escapeHtml(traceRelativeTime(turn.ts_request_ms))}</time></div><div class="turn-thread-line"></div><div class="turn-summary-message assistant"><span class="turn-avatar">A</span><span><strong>Assistant</strong><small>${providerLogoTile(turn.provider, turn.provider, "trace-mini-brand")}${escapeHtml(providerDisplayName(turn.provider || "unrouted"))}</small></span>${traceModelChip(turn.model || traceId)}${traceStatusChip(turn.status, turn.error)}<small class="turn-token-total">${escapeHtml(`${formatInteger(finite(turn.input_tokens) + finite(turn.output_tokens))} tok · ${traceRelativeTime(turn.ts_request_ms)}`)}</small></div></div>${subagents.length ? `<div class="turn-subagent-list">${subagents.map(renderSubagentCard).join("")}</div>` : ""}</summary><div class="turn-detail muted">Open to load only this turn.</div></details>`;
 }
 
 function replaceTranscriptPage(target, html) {
@@ -2272,6 +2495,8 @@ function replaceTranscriptPage(target, html) {
 }
 
 async function loadTranscriptTurn(node) {
+  if (node.dataset.loaded || node.dataset.loading) return;
+  node.dataset.loading = "true";
   node.dataset.loaded = "true";
   const target = $(".turn-detail", node);
   target.textContent = "Loading this turn…";
@@ -2280,6 +2505,20 @@ async function loadTranscriptTurn(node) {
     target.classList.remove("muted");
     target.innerHTML = renderTurn(data.turn);
   } catch (error) { delete node.dataset.loaded; target.textContent = `Could not load turn: ${error.message}`; }
+  finally { delete node.dataset.loading; }
+}
+
+function selectTranscriptTurn(node, options = {}) {
+  const traceId = node.dataset.turnTrace;
+  const changed = state.selectedTraceId !== traceId;
+  state.selectedTraceId = traceId;
+  $$("[data-turn-trace]", node.closest(".session-turns") || node.parentElement).forEach((turn) => turn.classList.toggle("selected", turn === node));
+  if (changed || options.forceInspector) openTrace(traceId);
+  if (options.expand) {
+    node.open = true;
+    loadTranscriptTurn(node);
+  }
+  if (options.scroll) node.scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 
 async function loadTranscriptPage(node, cursor) {
@@ -2289,12 +2528,48 @@ async function loadTranscriptPage(node, cursor) {
   if (cursor) { params.set("after_ms", cursor.after_ms); params.set("after_id", cursor.after_id); }
   try {
     const data = await api(`/traces/sessions/${encodeURIComponent(node.dataset.transcript)}/transcript/page?${params}`);
-    const turns = (data.turns || []).map(renderTurnSummary).join("") || '<p class="muted">No turns found.</p>';
-    const controls = `<div class="turn-page-controls"><button data-turn-previous ${node._pageIndex ? "" : "disabled"}>← Previous</button><span>Page ${node._pageIndex + 1} · up to ${TURN_PAGE_SIZE} turns</span><button data-turn-next ${data.has_more ? "" : "disabled"}>Next →</button></div>`;
+    const pageTurns = data.turns || [];
+    const selectedSummary = node._pageIndex === 0
+      ? state.traceRows.find((trace) => trace.id === state.selectedTraceId && trace.session_id === node.dataset.transcript)
+      : null;
+    if (selectedSummary && !pageTurns.some((turn) => turn.trace_id === selectedSummary.id)) {
+      pageTurns.push({
+        trace_id: selectedSummary.id,
+        ts_request_ms: selectedSummary.ts_request_ms,
+        ts_response_ms: selectedSummary.ts_response_ms,
+        harness: selectedSummary.harness,
+        model: selectedSummary.model,
+        provider: selectedSummary.provider,
+        status: selectedSummary.status,
+        input_tokens: selectedSummary.input_tokens,
+        output_tokens: selectedSummary.output_tokens,
+        error: selectedSummary.error,
+        substituted: selectedSummary.substituted,
+        pinned_selected: true,
+      });
+    }
+    const selectedTurn = pageTurns.find((turn) => turn.trace_id === state.selectedTraceId) || pageTurns[pageTurns.length - 1];
+    if (selectedTurn) state.selectedTraceId = selectedTurn.trace_id;
+    const turns = pageTurns.map((turn) => renderTurnSummary(turn, pageTurns)).join("") || '<p class="muted">No turns found.</p>';
+    const pinned = pageTurns.some((turn) => turn.pinned_selected);
+    const controls = `<div class="turn-page-controls"><button data-turn-previous ${node._pageIndex ? "" : "disabled"}>← Previous</button><span>Page ${node._pageIndex + 1} · up to ${TURN_PAGE_SIZE} turns${pinned ? " + selected" : ""}</span><button data-turn-next ${data.has_more ? "" : "disabled"}>Next →</button></div>`;
     replaceTranscriptPage(target, `${turns}${controls}`);
-    $$('[data-turn-trace]', target).forEach((turn) => turn.addEventListener("toggle", () => { if (turn.open && !turn.dataset.loaded) loadTranscriptTurn(turn); }));
+    $$('[data-turn-trace]', target).forEach((turn) => {
+      turn.addEventListener("click", (event) => {
+        if (event.target.closest("[data-follow-session]")) return;
+        selectTranscriptTurn(turn);
+      });
+      turn.addEventListener("toggle", () => { if (turn.open) loadTranscriptTurn(turn); });
+    });
+    $$("[data-follow-session]", target).forEach((button) => button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectSessionSummary(button.dataset.followSession);
+    }));
     $('[data-turn-previous]', target).addEventListener("click", () => { if (node._pageIndex > 0) { node._pageIndex -= 1; loadTranscriptPage(node, node._pageStarts[node._pageIndex]); } });
     $('[data-turn-next]', target).addEventListener("click", () => { if (data.next_cursor) { node._pageStarts = node._pageStarts.slice(0, node._pageIndex + 1); node._pageStarts.push(data.next_cursor); node._pageIndex += 1; loadTranscriptPage(node, data.next_cursor); } });
+    const selectedNode = selectedTurn ? $$("[data-turn-trace]", target).find((turn) => turn.dataset.turnTrace === selectedTurn.trace_id) : null;
+    if (selectedNode) selectTranscriptTurn(selectedNode, { expand: true, forceInspector: true, scroll: false });
   } catch (error) { target.textContent = `Could not load turns: ${error.message}`; }
 }
 
@@ -2309,18 +2584,35 @@ function conversationShell(trace) {
   const session = trace.session_id;
   const title = session ? traceShortId(session) : `Trace ${traceShortId(trace.id)}`;
   const subtitle = session ? "Bounded session transcript" : "Standalone trace";
-  return `<header class="trace-panel-head accent"><div class="conversation-identity"><span class="conversation-mark">⌁</span><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small></span>${traceModelChip(trace.model || trace.served_model)}</div><div class="conversation-actions"><button data-inspect-trace>Inspect trace</button><button class="mobile-only-action" data-close-conversation aria-label="Close conversation">Close</button></div></header><div class="trace-conversation-scroll">${session ? `<div class="session-transcript" data-transcript="${escapeHtml(session)}"><div class="session-turns">Loading a bounded page…</div></div>` : renderTurnSummary(trace)}</div>`;
+  return `<header class="trace-panel-head accent"><div class="conversation-identity"><span class="conversation-mark">⌁</span><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(subtitle)}</small></span>${traceModelChip(trace.model || trace.served_model)}</div><div class="conversation-actions">${session ? `<button class="trace-icon-button" data-session-menu="${escapeHtml(session)}" aria-label="Session actions">⋯</button>` : ""}<button class="mobile-only-action" data-close-conversation aria-label="Close conversation">Close</button></div></header><div class="trace-conversation-scroll">${session ? `<div class="session-transcript" data-transcript="${escapeHtml(session)}"><div class="session-turns">Loading a bounded page…</div></div>` : renderTurnSummary(trace, [trace])}</div>`;
 }
 
 function showTraceConversation(trace) {
   const conversation = $("#trace-conversation");
   conversation.classList.add("open");
+  conversation.tabIndex = 0;
   conversation.innerHTML = conversationShell(trace);
-  $('[data-inspect-trace]', conversation).addEventListener("click", () => $("#trace-detail").classList.add("open"));
   $('[data-close-conversation]', conversation).addEventListener("click", () => conversation.classList.remove("open"));
+  $('[data-session-menu]', conversation)?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openSessionMenu(event.currentTarget.dataset.sessionMenu, { anchor: event.currentTarget });
+  });
   const transcript = $('[data-transcript]', conversation);
   if (transcript) loadTranscript(transcript);
-  else $$('[data-turn-trace]', conversation).forEach((turn) => turn.addEventListener("toggle", () => { if (turn.open && !turn.dataset.loaded) loadTranscriptTurn(turn); }));
+  else $$('[data-turn-trace]', conversation).forEach((turn) => {
+    turn.addEventListener("click", () => selectTranscriptTurn(turn));
+    turn.addEventListener("toggle", () => { if (turn.open) loadTranscriptTurn(turn); });
+    selectTranscriptTurn(turn, { expand: true, forceInspector: true });
+  });
+  conversation.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key) || event.target.closest("input,select,textarea")) return;
+    const turns = $$("[data-turn-trace]", conversation);
+    if (!turns.length) return;
+    const selectedIndex = Math.max(0, turns.findIndex((turn) => turn.classList.contains("selected")));
+    const nextIndex = clamp(selectedIndex + (event.key === "ArrowDown" ? 1 : -1), 0, turns.length - 1);
+    event.preventDefault();
+    selectTranscriptTurn(turns[nextIndex], { expand: true, scroll: true });
+  });
 }
 
 function selectTraceSummary(id) {
@@ -2341,6 +2633,206 @@ function selectSessionSummary(sessionId) {
   renderTraceList();
   showTraceConversation(trace);
   openTrace(trace.id);
+}
+
+function saveTraceColumnPreferences() {
+  try {
+    localStorage.setItem(TRACE_COLUMN_STORAGE_KEY, JSON.stringify({
+      left: state.traceColumnWidths.left,
+      right: state.traceColumnWidths.right,
+      visible: [...state.traceVisibleColumns],
+      showSubagents: state.traceShowSubagents,
+    }));
+  } catch { /* Storage can be disabled without disabling the browser. */ }
+}
+
+function setTraceColumnWidth(side, width, persist = false) {
+  const limits = side === "left" ? [200, 560] : [280, 720];
+  state.traceColumnWidths[side] = clamp(width, limits[0], limits[1]);
+  $("#trace-browser").style.setProperty(`--trace-${side}-width`, `${state.traceColumnWidths[side]}px`);
+  if (persist) saveTraceColumnPreferences();
+}
+
+function initTraceColumns() {
+  setTraceColumnWidth("left", state.traceColumnWidths.left);
+  setTraceColumnWidth("right", state.traceColumnWidths.right);
+  renderTraceColumnPicker();
+  applySessionGrid();
+  const showSubagents = $("#trace-show-subagents");
+  showSubagents.checked = state.traceShowSubagents;
+  showSubagents.addEventListener("change", () => {
+    state.traceShowSubagents = showSubagents.checked;
+    saveTraceColumnPreferences();
+    renderTraceList();
+  });
+
+  $("#trace-column-picker-button").addEventListener("click", (event) => {
+    event.stopPropagation();
+    const picker = $("#trace-column-picker");
+    picker.hidden = !picker.hidden;
+    event.currentTarget.setAttribute("aria-expanded", String(!picker.hidden));
+  });
+  $("#trace-column-picker").addEventListener("click", (event) => event.stopPropagation());
+  document.addEventListener("click", () => {
+    $("#trace-column-picker").hidden = true;
+    $("#trace-column-picker-button").setAttribute("aria-expanded", "false");
+  });
+  $$("[data-trace-sort]").forEach((button) => button.addEventListener("click", () => {
+    const key = button.dataset.traceSort;
+    state.traceSort = state.traceSort.key === key
+      ? { key, direction: state.traceSort.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: key === "session" ? "asc" : "desc" };
+    renderTraceList();
+  }));
+
+  $$("[data-trace-divider]").forEach((divider) => {
+    const side = divider.dataset.traceDivider;
+    const reset = () => setTraceColumnWidth(side, TRACE_COLUMN_DEFAULTS[side], true);
+    divider.addEventListener("dblclick", reset);
+    divider.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") return reset();
+      if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      event.preventDefault();
+      const delta = event.key === "ArrowRight" ? 10 : -10;
+      setTraceColumnWidth(side, state.traceColumnWidths[side] + (side === "right" ? -delta : delta), true);
+    });
+    divider.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startX = event.clientX;
+      const startWidth = state.traceColumnWidths[side];
+      divider.classList.add("active");
+      document.body.classList.add("trace-resizing");
+      divider.setPointerCapture(event.pointerId);
+      const move = (moveEvent) => {
+        const delta = moveEvent.clientX - startX;
+        setTraceColumnWidth(side, startWidth + (side === "right" ? -delta : delta));
+      };
+      const finish = () => {
+        divider.classList.remove("active");
+        document.body.classList.remove("trace-resizing");
+        divider.removeEventListener("pointermove", move);
+        divider.removeEventListener("pointerup", finish);
+        divider.removeEventListener("pointercancel", finish);
+        saveTraceColumnPreferences();
+      };
+      divider.addEventListener("pointermove", move);
+      divider.addEventListener("pointerup", finish);
+      divider.addEventListener("pointercancel", finish);
+    });
+  });
+}
+
+function closeSessionMenu() {
+  const menu = $("#trace-session-menu");
+  if (menu) menu.remove();
+  state.sessionMenu = null;
+}
+
+function newestSessionTrace(sessionId) {
+  return state.traceRows
+    .filter((trace) => trace.session_id === sessionId)
+    .sort((left, right) => finite(right.ts_request_ms) - finite(left.ts_request_ms))[0] || null;
+}
+
+function sessionMenuMarkup(sessionId, fixtures, loading = false, fixtureError = null) {
+  const trace = newestSessionTrace(sessionId);
+  const exportUrl = safeUrl(`/traces/export.ndjson?${new URLSearchParams({ session: sessionId })}`);
+  const fixtureItems = loading
+    ? '<span class="trace-menu-note">Loading fixtures…</span>'
+    : fixtureError
+      ? `<span class="trace-menu-note danger">${escapeHtml(fixtureError)}</span>`
+      : fixtures.length
+        ? fixtures.map((fixture) => `<button data-inject-fixture="${escapeHtml(fixture.name)}"><span>${escapeHtml(fixture.direction === "upstream_to_client" ? "Send" : "Replay")}: ${escapeHtml(fixture.name)}</span><small>${escapeHtml(fixture.status || "")}</small></button>`).join("")
+        : '<span class="trace-menu-note">No fixtures available</span>';
+  return `<div class="trace-menu-card" role="menu" aria-label="Session actions">
+    <details class="trace-menu-submenu"><summary>Simulate <span>›</span></summary><div>${fixtureItems}</div></details>
+    <button data-clear-injections>Clear pending injections</button>
+    <hr>
+    <button data-copy-session>Copy Session ID</button>
+    <button data-copy-reply ${trace ? "" : "disabled"}>Copy Last Reply as Markdown</button>
+    <a href="${escapeHtml(exportUrl)}" download>Export Session…</a>
+  </div>`;
+}
+
+function positionSessionMenu(menu, position) {
+  const anchor = position.anchor?.getBoundingClientRect();
+  const preferredX = position.x ?? anchor?.left ?? 12;
+  const preferredY = position.y ?? anchor?.bottom ?? 12;
+  const left = clamp(preferredX, 8, Math.max(8, window.innerWidth - menu.offsetWidth - 8));
+  const top = clamp(preferredY, 8, Math.max(8, window.innerHeight - menu.offsetHeight - 8));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function bindSessionMenu(menu, sessionId, position) {
+  positionSessionMenu(menu, position);
+  if (menu.dataset.bound) return;
+  menu.dataset.bound = "true";
+  menu.addEventListener("click", async (event) => {
+    if (event.target.closest("a[download]")) {
+      closeSessionMenu();
+      return;
+    }
+    const fixtureButton = event.target.closest("[data-inject-fixture]");
+    if (fixtureButton) {
+      try {
+        await api(`/admin/sessions/${encodeURIComponent(sessionId)}/inject`, { method: "POST", body: JSON.stringify({ fixture: fixtureButton.dataset.injectFixture }) });
+        toast(`Queued ${fixtureButton.dataset.injectFixture} for ${traceShortId(sessionId)}.`);
+        closeSessionMenu();
+      } catch (error) { toast(error.message, "danger"); }
+      return;
+    }
+    if (event.target.closest("[data-clear-injections]")) {
+      try {
+        await api(`/admin/sessions/${encodeURIComponent(sessionId)}/injections`, { method: "DELETE" });
+        toast("Pending injections cleared.");
+        closeSessionMenu();
+      } catch (error) { toast(error.message, "danger"); }
+      return;
+    }
+    if (event.target.closest("[data-copy-session]")) {
+      await copyLoginText(sessionId);
+      toast("Session ID copied.");
+      closeSessionMenu();
+      return;
+    }
+    if (event.target.closest("[data-copy-reply]")) {
+      const trace = newestSessionTrace(sessionId);
+      if (!trace) return;
+      try {
+        const reply = await apiText(`/traces/${encodeURIComponent(trace.id)}/reply.md`);
+        await copyLoginText(reply);
+        toast("Last reply copied as Markdown.");
+        closeSessionMenu();
+      } catch (error) { toast(error.message, "danger"); }
+    }
+  });
+}
+
+async function openSessionMenu(sessionId, position = {}) {
+  closeSessionMenu();
+  const menu = document.createElement("div");
+  menu.id = "trace-session-menu";
+  menu.className = "trace-session-menu";
+  menu.innerHTML = sessionMenuMarkup(sessionId, state.fixtures, !state.sessionFixturesLoaded);
+  document.body.append(menu);
+  state.sessionMenu = { sessionId, position };
+  bindSessionMenu(menu, sessionId, position);
+  $("[role=menu] button:not([disabled]), [role=menu] summary, [role=menu] a", menu)?.focus();
+  if (state.sessionFixturesLoaded) return;
+  try {
+    const data = await api("/admin/fixtures");
+    state.fixtures = data.fixtures || [];
+    state.sessionFixturesLoaded = true;
+    if (state.sessionMenu?.sessionId !== sessionId) return;
+    menu.innerHTML = sessionMenuMarkup(sessionId, state.fixtures);
+    bindSessionMenu(menu, sessionId, position);
+  } catch (error) {
+    if (state.sessionMenu?.sessionId !== sessionId) return;
+    menu.innerHTML = sessionMenuMarkup(sessionId, [], false, error.message);
+    bindSessionMenu(menu, sessionId, position);
+  }
 }
 
 function applyTraceFilters(event) {
@@ -2406,9 +2898,24 @@ function bindStaticEvents() {
   $("#refresh-traces").addEventListener("click", () => loadTraces(false));
   $("#more-traces").addEventListener("click", () => loadTraces(true));
   $("#trace-filters").addEventListener("submit", applyTraceFilters);
-  $("#trace-filters").addEventListener("reset", () => { state.traceFilters = {}; state.traceCursor = null; setTimeout(() => loadTraces(false), 0); });
+  $("#trace-filters").addEventListener("reset", () => {
+    state.traceFilters = {};
+    state.traceCursor = null;
+    setTimeout(() => {
+      $("#trace-show-subagents").checked = state.traceShowSubagents;
+      loadTraces(false);
+    }, 0);
+  });
+  document.addEventListener("pointerdown", (event) => {
+    const menu = $("#trace-session-menu");
+    if (menu && !menu.contains(event.target)) closeSessionMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeSessionMenu();
+  });
   window.addEventListener("hashchange", () => selectView(location.hash.slice(1), false));
   window.addEventListener("popstate", () => selectView(location.hash.slice(1), false));
+  initTraceColumns();
 }
 
 bindStaticEvents();

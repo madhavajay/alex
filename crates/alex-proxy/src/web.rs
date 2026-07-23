@@ -101,6 +101,27 @@ pub async fn static_asset(Path(file): Path<String>) -> Response {
             "image/jpeg",
             include_bytes!("../web/assets/logos/goose.jpg"),
         )),
+        "oh-my-pi.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/oh-my-pi.png"),
+        )),
+        "mini-swe-agent.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/mini-swe-agent.png"),
+        )),
+        "jcode.png" => Some(("image/png", include_bytes!("../web/assets/logos/jcode.png"))),
+        "hermes.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/hermes.png"),
+        )),
+        "opensage-adk.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/opensage-adk.png"),
+        )),
+        "pydantic-ai-harness.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/pydantic-ai-harness.png"),
+        )),
         _ => None,
     };
     let Some((content_type, body)) = asset else {
@@ -282,9 +303,11 @@ mod tests {
         }
         assert!(INDEX.contains("<select name=\"provider\""));
         assert!(INDEX.contains("<select name=\"harness\""));
-        assert!(INDEX.contains("2xx success"));
-        assert!(INDEX.contains("4xx client"));
-        assert!(INDEX.contains("5xx server"));
+        // The summaries handler's `status` filter is an exact integer match,
+        // so the labels must not imply an unsupported status-class query.
+        assert!(INDEX.contains("200 only"));
+        assert!(INDEX.contains("400 only"));
+        assert!(INDEX.contains("500 only"));
         assert!(INDEX.contains("Errors only"));
         assert_local_script_and_style_assets();
         assert!(INDEX.contains("src=\"/ui/assets/alex-icon.png\""));
@@ -337,6 +360,8 @@ mod tests {
             "/admin/dario/prompt-caches",
             "/admin/middleware/test",
             "/admin/protection",
+            "/admin/fixtures",
+            "/admin/sessions/",
             "/admin/notifications/validate",
             "/admin/notifications/discover-chat",
             "/admin/storage/prune",
@@ -345,6 +370,8 @@ mod tests {
             assert!(APP_JS.contains(endpoint), "client must call {endpoint}");
         }
         assert!(APP_JS.contains("data-reauth-id"));
+        assert!(APP_JS.contains("/reply.md"));
+        assert!(APP_JS.contains("/traces/export.ndjson?"));
         assert!(APP_JS.contains("dry_run=true"));
         assert!(APP_JS.contains("/override"));
         assert!(APP_JS.contains("target=\"_blank\""));
@@ -378,12 +405,13 @@ mod tests {
         assert!(run_ping.contains("/admin/accounts/test"));
         assert!(run_ping.contains("renderCredentialPingRows"));
 
-        // The bootstrap key is page-memory only. The sole browser-persisted
-        // preference is the harmless refresh cadence.
+        // The bootstrap key is page-memory only. Browser persistence is
+        // limited to harmless presentation preferences.
         assert!(APP_JS.contains("adminKey: null"));
         assert!(!APP_JS.contains("localStorage.setItem(\"admin"));
         assert!(!APP_JS.contains("localStorage.setItem('admin"));
         assert!(APP_JS.contains("alex.web.refresh-seconds"));
+        assert!(APP_JS.contains("alex.web.trace-columns"));
 
         // CSP permits no inline handlers; the client follows the same rule for
         // dynamically-created controls.
@@ -413,6 +441,7 @@ mod tests {
         assert!(!open_trace.contains("/turn"));
         let load_traces = javascript_function(APP_JS, "loadTraces");
         assert!(load_traces.contains("/traces/summaries?"));
+        assert!(load_traces.contains("/traces/sessions?limit=1000"));
         assert!(!load_traces.contains("/body/"));
         assert!(!load_traces.contains("/transcript"));
         assert!(!load_traces.contains("/metadata"));
@@ -443,6 +472,11 @@ mod tests {
         // reaches the turn-body endpoint.
         let turn_loader = javascript_function(APP_JS, "loadTranscriptTurn");
         assert!(turn_loader.contains("/turn`"));
+        assert_eq!(
+            APP_JS.matches("/turn`").count(),
+            1,
+            "one explicit turn loader must remain the sole body-expansion path"
+        );
         assert!(!turn_loader.contains("/body/"));
         assert!(!turn_loader.contains("/transcript/page"));
         let page_loader = javascript_function(APP_JS, "loadTranscriptPage");
@@ -473,6 +507,12 @@ mod tests {
             ("opencode.png", "image/png"),
             ("qwen-code.png", "image/png"),
             ("goose.jpg", "image/jpeg"),
+            ("oh-my-pi.png", "image/png"),
+            ("mini-swe-agent.png", "image/png"),
+            ("jcode.png", "image/png"),
+            ("hermes.png", "image/png"),
+            ("opensage-adk.png", "image/png"),
+            ("pydantic-ai-harness.png", "image/png"),
         ] {
             let response = static_asset(Path(file.into())).await;
             assert_eq!(response.status(), StatusCode::OK, "{file}");

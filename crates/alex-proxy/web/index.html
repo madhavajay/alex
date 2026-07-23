@@ -215,18 +215,32 @@
                 <label class="trace-model-filter"><span>Model</span><input name="model" placeholder="Filter model…" autocomplete="off"></label>
                 <label><span>Provider</span><select name="provider"><option value="">Any provider</option></select></label>
                 <label><span>Harness</span><select name="harness"><option value="">Any harness</option></select></label>
-                <label><span>Status</span><select name="status"><option value="">Any status</option><option value="200">2xx success</option><option value="400">4xx client</option><option value="500">5xx server</option></select></label>
+                <label><span>Status</span><select name="status"><option value="">Any status</option><option value="200">200 only</option><option value="400">400 only</option><option value="500">500 only</option></select></label>
                 <label class="trace-toggle-chip"><input name="errors" type="checkbox"><span>Errors only</span></label>
+                <label class="trace-toggle-chip trace-subagent-toggle"><input id="trace-show-subagents" type="checkbox" checked><span>Show subagents</span></label>
                 <button class="trace-filter-apply">Apply</button><button class="trace-clear-chip" type="reset">Clear all</button>
               </form>
-              <div class="trace-list-labels"><span>Session / trace</span><span>Status</span><span>Time</span></div>
+              <div class="trace-column-bar">
+                <div id="trace-list-labels" class="trace-list-labels" data-session-grid>
+                  <button data-trace-sort="session">Session <span data-sort-arrow></span></button>
+                  <button data-session-column="turns" data-trace-sort="turns">T <span data-sort-arrow></span></button>
+                  <button data-session-column="cost" data-trace-sort="cost">Cost <span data-sort-arrow></span></button>
+                  <button data-session-column="duration" data-trace-sort="duration">Dur <span data-sort-arrow></span></button>
+                  <button data-session-column="status" data-trace-sort="status">Status <span data-sort-arrow></span></button>
+                  <button data-session-column="time" data-trace-sort="time">Time <span data-sort-arrow></span></button>
+                  <button id="trace-column-picker-button" class="trace-column-picker-button" type="button" aria-label="Choose session columns" aria-expanded="false">⋮</button>
+                </div>
+                <div id="trace-column-picker" class="trace-column-picker" hidden></div>
+              </div>
               <div id="trace-list" class="trace-list"></div>
-              <footer class="trace-list-footer"><span id="trace-list-status">Body-free summaries</span><button id="more-traces" hidden>Load older</button></footer>
+              <footer class="trace-list-footer"><span><span id="trace-list-status">Body-free summaries</span><span id="trace-filter-state"></span></span><button id="more-traces" hidden>Load older</button></footer>
             </aside>
+            <div class="trace-divider trace-divider-left" data-trace-divider="left" role="separator" aria-label="Resize session list" aria-orientation="vertical" tabindex="0"><i></i></div>
             <section id="trace-conversation" class="trace-conversation" aria-label="Session conversation">
               <header class="trace-panel-head"><div><strong>Chat flow</strong><small>Select a session or trace</small></div></header>
               <div class="empty-state"><span>◇</span><h2>No session selected</h2><p>Choose a trace to browse its bounded conversation pages.</p></div>
             </section>
+            <div class="trace-divider trace-divider-right" data-trace-divider="right" role="separator" aria-label="Resize trace inspector" aria-orientation="vertical" tabindex="0"><i></i></div>
             <article id="trace-detail" class="trace-detail" aria-label="Trace detail">
               <div class="empty-state"><span>⌁</span><h2>Select a trace</h2><p>Inspect metadata, attempts, middleware, and explicitly loaded bodies.</p></div>
             </article>
