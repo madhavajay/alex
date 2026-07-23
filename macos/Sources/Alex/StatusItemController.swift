@@ -960,6 +960,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     ) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
+            traceBrowser?.onOpenCredentialsSettings = { [weak self] in
+                self?.openPreferences(section: .credentials)
+            }
         }
         traceBrowser?.show(harness: harness, query: query, selectSessionId: selectSessionId)
     }
