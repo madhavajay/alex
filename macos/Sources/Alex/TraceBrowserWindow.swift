@@ -12,6 +12,7 @@ final class TraceBrowserModel {
     typealias TraceTurnFetcher = @Sendable (_ traceId: String) async throws -> TranscriptTurn
 
     private let store: SnapshotStore
+    let renderedArtifacts = RenderedArtifactCache()
     private let transcriptPageFetcher: TranscriptPageFetcher?
     private let traceTurnFetcher: TraceTurnFetcher?
 
@@ -707,6 +708,7 @@ final class TraceBrowserModel {
         turnApplyTask = nil
         actionTasks.values.forEach { $0.cancel() }
         actionTasks.removeAll()
+        renderedArtifacts.clear()
         searchTask?.cancel()
         searchTask = nil
         renderChain?.cancel()

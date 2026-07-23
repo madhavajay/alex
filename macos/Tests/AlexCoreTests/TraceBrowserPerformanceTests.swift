@@ -6,10 +6,11 @@ import Testing
 
 @Suite(.serialized) struct TraceBrowserPerformanceTests {
     private static func makeTurn(
-        _ index: Int, text: String, traceId: String? = nil
+        _ index: Int, text: String, traceId: String? = nil, completedMs: Int64? = nil
     ) -> TranscriptTurn {
         TranscriptTurn(
-            traceId: traceId ?? "perf-\(index)", tsRequestMs: Int64(index), tsResponseMs: Int64(index + 1),
+            traceId: traceId ?? "perf-\(index)", tsRequestMs: Int64(index),
+            tsResponseMs: completedMs ?? Int64(index + 1),
             model: "gpt-5.6-sol", provider: "openai", status: 200,
             inputTokens: 100, outputTokens: 100, reasoningEffort: nil,
             thinkingBudget: nil, costUsd: nil, billingBucket: nil, accountId: nil,
@@ -132,6 +133,88 @@ import Testing
         model.stop()
         #expect(count == 24)
         #expect(model.hiddenTurnCount == 476)
+    }
+
+    @Test @MainActor func renderedArtifactCacheHitsAndCompletionChangeMisses() {
+        let longText = String(repeating: "rendered artifact payload ", count: 500)
+        let turns = (0..<500).map { Self.makeTurn($0, text: longText) }
+        let cache = RenderedArtifactCache(
+            countLimit: 600, byteLimit: 128 * 1_024 * 1_024,
+            startMaintenance: false)
+
+        let missStart = ContinuousClock.now
+        let first = renderMessages(turns, cache: cache)
+        let missMs = milliseconds(missStart.duration(to: .now))
+        let afterMiss = cache.stats
+
+        let hitStart = ContinuousClock.now
+        let second = renderMessages(turns, cache: cache)
+        let hitMs = milliseconds(hitStart.duration(to: .now))
+        let afterHit = cache.stats
+
+        #expect(first == second)
+        #expect(afterMiss.misses == 500)
+        #expect(afterHit.hits == 500)
+        #expect(hitMs * 10 <= missMs || hitMs < 20)
+
+        let changed = Self.makeTurn(
+            0, text: longText, traceId: turns[0].traceId, completedMs: 99_999)
+        _ = TranscriptChatMessages.cachedMessages(
+            for: changed, harnessName: "Codex", cache: cache)
+        #expect(cache.stats.misses == 501)
+        print(
+            "S5 rendered-artifact miss_ms=\(missMs) hit_ms=\(hitMs) speedup=\(missMs / max(hitMs, 0.001))x changed_completed_misses=1")
+    }
+
+    @Test @MainActor func renderedArtifactCachePressureIdleAndBounds() async {
+        var now: TimeInterval = 1_000
+        let cache = RenderedArtifactCache(
+            countLimit: 2, byteLimit: 1_024, idleInterval: 300,
+            clock: { now }, startMaintenance: false)
+        let firstKey = RenderedArtifactKey(
+            traceId: "first", completedMs: 1, discriminator: "json-v1")
+        let secondKey = RenderedArtifactKey(
+            traceId: "second", completedMs: 2, discriminator: "sse-v1")
+        let thirdKey = RenderedArtifactKey(
+            traceId: "third", completedMs: 3, discriminator: "chat-v1")
+        cache.insertFormatted(
+            AttributedStringBox(NSAttributedString(string: "{}")), for: firstKey)
+        let parsed = RenderedSSEPages.parse("data: {\"ok\":true}\n\n")
+        cache.insertSSE(parsed, for: secondKey)
+        cache.insertChat(
+            TranscriptChatMessages.messages(
+                for: Self.makeTurn(3, text: "small"), harnessName: "Codex"),
+            for: thirdKey)
+        #expect(cache.count == 2)
+        #expect(cache.approximateByteCost <= cache.byteLimit)
+        #expect(cache.formatted(for: firstKey) == nil)
+        #expect(cache.sse(for: secondKey) == parsed)
+
+        now += 301
+        cache.evictIdle()
+        #expect(cache.count == 0)
+
+        cache.insertSSE(parsed, for: secondKey)
+        #expect(cache.count == 1)
+        cache.handleMemoryPressure()
+        #expect(cache.count == 0)
+
+        cache.insertFormatted(
+            AttributedStringBox(NSAttributedString(string: String(repeating: "x", count: 300))),
+            for: firstKey)
+        #expect(cache.count == 0)
+        #expect(cache.approximateByteCost == 0)
+    }
+
+    @MainActor
+    private func renderMessages(
+        _ turns: [TranscriptTurn], cache: RenderedArtifactCache
+    ) -> [[MessageDisplay]] {
+        turns.enumerated().map { index, turn in
+            TranscriptChatMessages.cachedMessages(
+                for: turn, harnessName: "Codex",
+                previousTurn: index > 0 ? turns[index - 1] : nil, cache: cache)
+        }
     }
 
     private static func metadata(_ sessionId: String) -> TranscriptTurnMetadata {
