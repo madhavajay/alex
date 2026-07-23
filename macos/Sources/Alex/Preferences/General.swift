@@ -235,6 +235,21 @@ struct GeneralPreferencesPane: View {
 
         SectionLabel(text: "Daemon")
             .settingsSectionSpacing()
+        SettingRow(
+            label: "Web dashboard",
+            hint: "Open the shared web UI served by the local daemon."
+        ) {
+            PillButton(
+                title: "Open Dashboard", variant: .bordered, horizontalPadding: 12,
+                verticalPadding: 5, cornerRadius: 7, showsBorder: true,
+                isEnabled: store.config != nil
+            ) {
+                if let config = store.config ?? DaemonDiscovery.load() {
+                    NSWorkspace.shared.open(config.baseURL.appendingPathComponent("ui"))
+                }
+            }
+        }
+        RowDivider()
         SettingRow(label: "Binary path", hint: "Blank = auto-discover the Alex CLI") {
             TextField("auto", text: $binaryPath)
                 .settingsField()
