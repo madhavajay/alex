@@ -927,7 +927,7 @@ struct OnboardingView: View {
     private var meetAlex: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let image = HarnessIconLoader.image(
-                resource: "header-v2", extension: "jpg", subdirectory: "onboarding")
+                resource: "header", extension: "jpg", subdirectory: "onboarding")
             {
                 Image(nsImage: image)
                     .resizable().aspectRatio(contentMode: .fill)
