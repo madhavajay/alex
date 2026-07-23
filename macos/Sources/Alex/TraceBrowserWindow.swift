@@ -1065,16 +1065,6 @@ final class TraceBrowserModel {
         selectFromFollow(candidate.id)
     }
 
-    var newerActivityRow: SessionRow? {
-        guard let selected = selectedSession, let newest = newestVisibleRow else { return nil }
-        guard LiveFollow.newerActivity(
-            live: !pinned, selectedId: selected.sessionId,
-            selectedLastTsMs: selected.lastTsMs,
-            newestId: newest.id, newestLastTsMs: newest.lastTsMs)
-        else { return nil }
-        return newest
-    }
-
     private func pollTranscript() async {
         guard let sid = selectedSessionId else { return }
         guard transcriptPageFetcher != nil || client() != nil else {
@@ -2709,22 +2699,6 @@ private struct TranscriptView: View {
                     .padding(.bottom, 48)
                 }
                 VStack(spacing: 6) {
-                    if let newer = model.newerActivityRow {
-                        Button {
-                            model.selectFromFollow(newer.id)
-                        } label: {
-                            Label(
-                                "newer activity — \(newer.sessionShort)",
-                                systemImage: "bolt.fill")
-                                .font(.system(size: 11, weight: .medium))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Capsule().fill(.thinMaterial))
-                                .overlay(Capsule().strokeBorder(.quaternary))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Switch to the session with newer activity")
-                    }
                     if !model.userAtBottom, !model.turns.isEmpty {
                         Button {
                             model.setUserAtBottom(true)

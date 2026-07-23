@@ -3279,14 +3279,3 @@ public struct DarioLogsResponse: Codable, Sendable {
     }
 }
 
-public enum LiveFollow {
-    public static func newerActivity(
-        live: Bool, selectedId: String?, selectedLastTsMs: Int64?,
-        newestId: String?, newestLastTsMs: Int64?
-    ) -> Bool {
-        guard live, let selectedId, let newestId, newestId != selectedId,
-            let newestLastTsMs
-        else { return false }
-        return newestLastTsMs > (selectedLastTsMs ?? Int64.min)
-    }
-}
