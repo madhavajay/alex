@@ -233,6 +233,40 @@ final class TraceBrowserModel {
         }
     }
 
+    static let fontScaleDefaultsKey = "TranscriptFontScale"
+    static let fontScaleSteps: [Double] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0]
+
+    var transcriptFontScale: Double = {
+        let stored = UserDefaults.standard.double(forKey: fontScaleDefaultsKey)
+        return stored > 0 ? stored : 1
+    }() {
+        didSet {
+            guard oldValue != transcriptFontScale else { return }
+            UserDefaults.standard.set(transcriptFontScale, forKey: Self.fontScaleDefaultsKey)
+            renderState = nil
+            scheduleRender()
+        }
+    }
+
+    var canZoomTranscript: (in: Bool, out: Bool) {
+        let steps = Self.fontScaleSteps
+        return (transcriptFontScale < steps.last! - 0.001,
+                transcriptFontScale > steps.first! + 0.001)
+    }
+
+    func zoomTranscript(_ direction: Int) {
+        let steps = Self.fontScaleSteps
+        let index = steps.enumerated().min {
+            abs($0.element - transcriptFontScale) < abs($1.element - transcriptFontScale)
+        }?.offset ?? 2
+        let next = min(max(index + direction, 0), steps.count - 1)
+        transcriptFontScale = steps[next]
+    }
+
+    func resetTranscriptZoom() {
+        transcriptFontScale = 1
+    }
+
     var firstTurnTraceId: String? { turns.first?.traceId }
 
     func previousTraceId(before traceId: String) -> String? {
@@ -816,13 +850,14 @@ final class TraceBrowserModel {
                 ($0, ProviderChipRenderer.image(for: $0))
             }))
         let prev = renderChain
+        let fontScale = transcriptFontScale
         renderChain = Task { [weak self] in
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
                 let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
-                    icons: icons, rawMode: rawMode)
+                    icons: icons, rawMode: rawMode, fontScale: fontScale)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
@@ -2472,6 +2507,18 @@ private struct TranscriptView: View {
         } right: {
             if let session = model.selectedSession {
                 CopyButton(value: session.sessionId, label: "Copy ID")
+                PanelIconButton(
+                    systemImage: "textformat.size.smaller", help: "Smaller text (⌘−)"
+                ) {
+                    model.zoomTranscript(-1)
+                }
+                .disabled(!model.canZoomTranscript.out)
+                PanelIconButton(
+                    systemImage: "textformat.size.larger", help: "Larger text (⌘=, ⌘0 resets)"
+                ) {
+                    model.zoomTranscript(1)
+                }
+                .disabled(!model.canZoomTranscript.in)
                 Toggle("Raw", isOn: $model.transcriptRawMode)
                     .toggleStyle(.checkbox)
                     .controlSize(.mini)
@@ -2624,6 +2671,29 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
             let host = NSHostingController(rootView: TraceBrowserView(model: model))
             let win = NSWindow(contentViewController: host)
             win.title = "Alex UI — Trace Browser"
+            // Title-bar brand icon: NSWindow only shows a title icon for
+            // document windows, so use representedURL-free standardWindowButton
+            // adjacency via a titlebar accessory instead.
+            if let icon = IconRenderer.trayImage?.copy() as? NSImage {
+                icon.size = NSSize(width: 16, height: 16)
+                let imageView = NSImageView(image: icon)
+                imageView.translatesAutoresizingMaskIntoConstraints = false
+                let container = NSView()
+                container.addSubview(imageView)
+                NSLayoutConstraint.activate([
+                    imageView.leadingAnchor.constraint(
+                        equalTo: container.leadingAnchor, constant: 8),
+                    imageView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                    imageView.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+                    imageView.widthAnchor.constraint(equalToConstant: 16),
+                    imageView.heightAnchor.constraint(equalToConstant: 16),
+                    container.heightAnchor.constraint(equalToConstant: 24),
+                ])
+                let accessory = NSTitlebarAccessoryViewController()
+                accessory.view = container
+                accessory.layoutAttribute = .left
+                win.addTitlebarAccessoryViewController(accessory)
+            }
             win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             win.isReleasedWhenClosed = false
             win.delegate = self

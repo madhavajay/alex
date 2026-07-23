@@ -162,6 +162,18 @@ pub trait OpenrouterExposedPersister: Send + Sync {
     fn persist(&self, exposed: &[String]) -> std::result::Result<(), String>;
 }
 
+/// Persists the cross-provider curated model list owned by the daemon config.
+pub trait ExposedModelsPersister: Send + Sync {
+    fn persist(&self, exposed: Option<&[String]>) -> std::result::Result<(), String>;
+}
+
+/// Rewrites connected harness config files after providers or the curated
+/// model list change, so harness pickers never go stale. Implementations
+/// spawn their own task; callers fire-and-forget.
+pub trait HarnessConfigSyncer: Send + Sync {
+    fn sync(&self, reason: &str);
+}
+
 /// Persists notification settings owned by the daemon configuration. Keeping
 /// this boundary in the binary lets the proxy hot-apply channels without
 /// knowing where config.toml lives.
@@ -680,6 +692,11 @@ pub struct AppState {
     /// `openrouter_exposed_catalog`). Seeded from config at daemon startup.
     openrouter_exposed: std::sync::RwLock<Vec<String>>,
     openrouter_exposed_persister: std::sync::RwLock<Option<Arc<dyn OpenrouterExposedPersister>>>,
+    /// Cross-provider curated model list in user-chosen order. `None`
+    /// publishes the full merged catalog (pre-curation behavior).
+    exposed_models: std::sync::RwLock<Option<Vec<String>>>,
+    exposed_models_persister: std::sync::RwLock<Option<Arc<dyn ExposedModelsPersister>>>,
+    harness_config_syncer: std::sync::RwLock<Option<Arc<dyn HarnessConfigSyncer>>>,
     exo: std::sync::RwLock<ExoConfig>,
     exo_persister: std::sync::RwLock<Option<Arc<dyn ExoConfigPersister>>>,
     pub logins: alex_auth::sessions::LoginManager,
@@ -1065,6 +1082,9 @@ pub fn build_state_with_substitution(
         openrouter_models: std::sync::Mutex::new(Vec::new()),
         openrouter_exposed: std::sync::RwLock::new(default_openrouter_exposed_models()),
         openrouter_exposed_persister: std::sync::RwLock::new(None),
+        exposed_models: std::sync::RwLock::new(None),
+        exposed_models_persister: std::sync::RwLock::new(None),
+        harness_config_syncer: std::sync::RwLock::new(None),
         exo: std::sync::RwLock::new(ExoConfig::default()),
         exo_persister: std::sync::RwLock::new(None),
         logins: alex_auth::sessions::LoginManager::default(),
@@ -1253,6 +1273,61 @@ pub fn set_openrouter_exposed_persister(
     if let Ok(mut slot) = state.openrouter_exposed_persister.write() {
         *slot = Some(persister);
     }
+}
+
+pub fn set_exposed_models(state: &AppState, exposed: Option<Vec<String>>) {
+    if let Ok(mut slot) = state.exposed_models.write() {
+        *slot = exposed.map(normalize_exposed_models);
+    }
+}
+
+pub fn set_exposed_models_persister(
+    state: &Arc<AppState>,
+    persister: Arc<dyn ExposedModelsPersister>,
+) {
+    if let Ok(mut slot) = state.exposed_models_persister.write() {
+        *slot = Some(persister);
+    }
+}
+
+pub fn set_harness_config_syncer(state: &Arc<AppState>, syncer: Arc<dyn HarnessConfigSyncer>) {
+    if let Ok(mut slot) = state.harness_config_syncer.write() {
+        *slot = Some(syncer);
+    }
+}
+
+/// The user-curated cross-provider list in its saved (user-chosen) order, or
+/// None when curation is off and the full catalog is published.
+pub fn exposed_models_list(state: &AppState) -> Option<Vec<String>> {
+    state
+        .exposed_models
+        .read()
+        .map(|slot| slot.clone())
+        .unwrap_or(None)
+}
+
+/// Rewrite connected harness configs off-request. Call after any change that
+/// alters the published model set (provider added/removed, curation edits).
+pub fn request_harness_config_sync(state: &AppState, reason: &str) {
+    let syncer = state
+        .harness_config_syncer
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(syncer) = syncer {
+        syncer.sync(reason);
+    }
+}
+
+/// Same shape rules as OpenRouter ids, minus the provider-prefix requirement.
+pub fn normalize_exposed_models(exposed: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    exposed
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| is_valid_openrouter_id(id) && seen.insert(id.clone()))
+        .take(500)
+        .collect()
 }
 
 /// Overwrites the cached full OpenRouter catalog (bare ids). Used by the live
@@ -2048,6 +2123,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/openrouter/exposed",
             get(admin_openrouter_exposed).post(admin_openrouter_exposed_update),
         )
+        .route("/admin/models", get(admin_models))
+        .route("/admin/models/exposed", post(admin_models_exposed_update))
+        .route("/admin/models/check", post(admin_models_check))
         .route(
             "/admin/notifications",
             get(admin_notifications).post(admin_notifications_save),
@@ -2905,6 +2983,9 @@ async fn admin_auth_import(
                     })
                 })
                 .collect();
+            if outcomes.iter().any(|o| !o.imported.is_empty()) {
+                request_harness_config_sync(&state, "provider credentials imported");
+            }
             axum::Json(json!({"outcomes": items})).into_response()
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -3004,7 +3085,10 @@ async fn admin_account_remove(
         );
     }
     match state.vault.remove(&id).await {
-        Ok(true) => axum::Json(json!({"removed": id})).into_response(),
+        Ok(true) => {
+            request_harness_config_sync(&state, "provider account removed");
+            axum::Json(json!({"removed": id})).into_response()
+        }
         Ok(false) => error_response(StatusCode::NOT_FOUND, &format!("unknown account '{id}'")),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -3557,7 +3641,12 @@ async fn admin_auth_login_complete(
         return error_response(StatusCode::BAD_REQUEST, "missing 'login_id' or 'input'");
     };
     match state.logins.complete(state.vault.clone(), id, input).await {
-        Ok(snapshot) => axum::Json(snapshot).into_response(),
+        Ok(snapshot) => {
+            if snapshot["status"].as_str() == Some("complete") {
+                request_harness_config_sync(&state, "provider login completed");
+            }
+            axum::Json(snapshot).into_response()
+        }
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     }
 }
@@ -3906,6 +3995,89 @@ struct OpenrouterExposedUpdate {
     exposed: Vec<String>,
 }
 
+/// One row of the models admin: a catalog id, its routed provider, and
+/// whether it is still present in the live merged catalog.
+fn model_admin_row(id: &str, available: bool) -> Value {
+    let (provider, _) = alex_core::route_model(id);
+    json!({
+        "id": id,
+        "provider": provider.map(|p| p.as_str()),
+        "available": available,
+    })
+}
+
+/// The models admin snapshot: the live merged catalog (grouped for the
+/// picker) plus the curated list in user order with per-row availability.
+async fn admin_models(State(state): State<Arc<AppState>>) -> Response {
+    let catalog = merged_catalog(&state).await;
+    let available: HashSet<&String> = catalog.iter().collect();
+    let curated = exposed_models_list(&state);
+    let curated_rows: Vec<Value> = curated
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|id| model_admin_row(id, available.contains(id)))
+        .collect();
+    let catalog_rows: Vec<Value> = catalog
+        .iter()
+        .map(|id| model_admin_row(id, true))
+        .collect();
+    axum::Json(json!({
+        "catalog": catalog_rows,
+        "curation_enabled": curated.is_some(),
+        "curated": curated_rows,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ExposedModelsUpdate {
+    /// None disables curation (publish everything); a list enables it.
+    exposed: Option<Vec<String>>,
+}
+
+async fn admin_models_exposed_update(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<ExposedModelsUpdate>,
+) -> Response {
+    let exposed = body.exposed.map(normalize_exposed_models);
+    let persister = state
+        .exposed_models_persister
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(persister) = persister else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model curation persistence is unavailable",
+        );
+    };
+    if let Err(error) = persister.persist(exposed.as_deref()) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
+    }
+    set_exposed_models(&state, exposed);
+    request_harness_config_sync(&state, "curated model list changed");
+    axum::Json(json!({"exposed": exposed_models_list(&state)})).into_response()
+}
+
+/// Re-fetch every dynamic provider catalog and report each curated model's
+/// availability — the "Check models" button. Static (pricing-seeded) ids are
+/// checked against the merged catalog, which the refresh just rebuilt.
+async fn admin_models_check(State(state): State<Arc<AppState>>) -> Response {
+    let catalog = merged_catalog(&state).await;
+    let available: HashSet<&String> = catalog.iter().collect();
+    let curated = exposed_models_list(&state).unwrap_or_default();
+    let rows: Vec<Value> = curated
+        .iter()
+        .map(|id| model_admin_row(id, available.contains(id)))
+        .collect();
+    let missing = rows
+        .iter()
+        .filter(|row| row["available"] == json!(false))
+        .count();
+    axum::Json(json!({"checked": rows, "missing": missing})).into_response()
+}
+
 /// Persist a new curated OpenRouter exposure list. Only these models are
 /// advertised in `/v1/models` and injected into connected harnesses.
 async fn admin_openrouter_exposed_update(
@@ -3928,27 +4100,55 @@ async fn admin_openrouter_exposed_update(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error);
     }
     set_openrouter_exposed_models(&state, exposed);
+    request_harness_config_sync(&state, "OpenRouter exposure changed");
     axum::Json(json!({"exposed": openrouter_exposed_list(&state)})).into_response()
+}
+
+/// Assemble the full merged catalog (bare ids, sorted) after refreshing the
+/// dynamic provider catalogs. Shared by `/v1/models` and the models admin.
+async fn merged_catalog(state: &AppState) -> Vec<String> {
+    refresh_openrouter_models(state).await;
+    refresh_cliproxyapi_models(state).await;
+    let mut ids = state.store.pricing_models();
+    // OpenRouter exposes only the user-curated subset, never its full catalog.
+    ids.extend(openrouter_exposed_catalog(state));
+    ids.extend(cliproxyapi_catalog_models(state).await);
+    ids.extend(exo_catalog_models(state));
+    ids.extend(kimi_catalog_models(state).await);
+    for (alias, _) in alex_core::model_aliases() {
+        ids.push((*alias).to_string());
+    }
+    sort_model_ids(&mut ids);
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+/// Apply the cross-provider curated list: keep the user's saved order, drop
+/// curated ids missing from the live catalog. None (curation off) or an
+/// intersection that comes up empty publishes the full catalog.
+pub fn apply_exposed_models(state: &AppState, catalog: Vec<String>) -> Vec<String> {
+    let Some(exposed) = exposed_models_list(state) else {
+        return catalog;
+    };
+    if exposed.is_empty() {
+        return catalog;
+    }
+    let available: HashSet<&String> = catalog.iter().collect();
+    let curated: Vec<String> = exposed
+        .into_iter()
+        .filter(|id| available.contains(id))
+        .collect();
+    if curated.is_empty() {
+        return catalog;
+    }
+    curated
 }
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // Dynamic provider catalogs refresh only on an explicit model-list
     // request; Alex has no catalog refresh worker.
-    refresh_openrouter_models(&state).await;
-    refresh_cliproxyapi_models(&state).await;
-    let mut ids = state.store.pricing_models();
-    // OpenRouter exposes only the user-curated subset, never its full catalog.
-    ids.extend(openrouter_exposed_catalog(&state));
-    ids.extend(cliproxyapi_catalog_models(&state).await);
-    ids.extend(exo_catalog_models(&state));
-    ids.extend(kimi_catalog_models(&state).await);
-    for (alias, _) in alex_core::model_aliases() {
-        ids.push((*alias).to_string());
-    }
-    // Advertise every provider's models alphabetically (case-insensitive) so the
-    // picker is scrollable. Sort before deriving the `alex/*` aliases
-    // and de-duplicating so both blocks share one order.
-    sort_model_ids(&mut ids);
+    let mut ids = apply_exposed_models(&state, merged_catalog(&state).await);
     let claude_gateway = headers
         .get_all("x-alex-harness")
         .iter()
@@ -9116,6 +9316,19 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// A missing account is configuration, not a transient upstream failure.
+/// 502 makes client SDKs retry for tens of seconds before showing the fix;
+/// 403 is non-retryable in the Anthropic/OpenAI/Gemini SDKs, so the
+/// `run \`alex auth\`` hint surfaces immediately.
+fn account_selection_error(e: anyhow::Error) -> (StatusCode, String) {
+    let message = e.to_string();
+    if message.contains("no active") && message.contains("account") {
+        (StatusCode::FORBIDDEN, message)
+    } else {
+        (StatusCode::BAD_GATEWAY, message)
+    }
+}
+
 fn client_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
@@ -9436,7 +9649,7 @@ async fn plan_upstream(
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
                     .await
-                    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                    .map_err(account_selection_error)?;
                 (
                     upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
                     account,
@@ -9458,7 +9671,7 @@ async fn plan_upstream(
                         .vault
                         .account_for_excluding(provider, true, excluded_accounts)
                         .await
-                        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                        .map_err(account_selection_error)?;
                     (
                         upstream_base(state, Provider::Anthropic, ANTHROPIC_BASE),
                         account,
@@ -9503,7 +9716,7 @@ async fn plan_upstream(
                                 .vault
                                 .account_for_excluding(provider, true, excluded_accounts)
                                 .await
-                                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                                .map_err(account_selection_error)?;
                             (
                                 active.base_url.trim_end_matches('/').to_string(),
                                 attribution_account,
@@ -9591,7 +9804,7 @@ async fn plan_upstream(
                     preferred.is_some() && !policy.allow_mid_thread_failover,
                 )
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let oauth = account.kind == "oauth";
             let openai_base = if oauth {
                 codex_upstream_base(state)
@@ -9738,7 +9951,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let extra_headers = vec![
                 ("x-grok-model-override".into(), routed_model.to_string()),
                 ("x-grok-conv-id".into(), trace_id.to_string()),
@@ -9800,7 +10013,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let raw_base = account
                 .account_meta
                 .get("api_base")
@@ -9889,7 +10102,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             match format {
                 ClientFormat::OpenaiChat => {
                     body_json["model"] = json!(routed_model);
@@ -9972,7 +10185,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, true, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             match format {
                 ClientFormat::OpenaiChat => {
                     body_json["model"] = json!(routed_model);
@@ -10034,7 +10247,7 @@ async fn plan_upstream(
                 .vault
                 .account_for_excluding(provider, false, excluded_accounts)
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+                .map_err(account_selection_error)?;
             let (gemini_req, respond_as) = match format {
                 ClientFormat::GeminiGenerate => {
                     let mut g = body_json.clone();
@@ -16379,6 +16592,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn missing_account_maps_to_forbidden_not_bad_gateway() {
+        let (status, message) = account_selection_error(anyhow::anyhow!(
+            "no active anthropic account; run `alex auth import`"
+        ));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("alex auth"));
+
+        let (status, _) =
+            account_selection_error(anyhow::anyhow!("connection reset by upstream"));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
     fn reauth_login_tracker_dedupes_pending_and_replaces_expired_session() {
         let key = ReauthLoginKey {
             provider: Provider::Xai,
@@ -18109,6 +18335,71 @@ mod tests {
     fn is_case_insensitively_sorted(ids: &[String]) -> bool {
         ids.windows(2)
             .all(|pair| pair[0].to_ascii_lowercase() <= pair[1].to_ascii_lowercase())
+    }
+
+    #[test]
+    fn exposed_models_curation_keeps_user_order_and_drops_missing() {
+        let state = test_state("exposed-models-curation");
+        let catalog = vec![
+            "claude-sonnet-5".to_string(),
+            "gpt-5.6-sol".to_string(),
+            "grok-code-fast-1".to_string(),
+        ];
+
+        // Curation off: catalog passes through untouched.
+        assert_eq!(apply_exposed_models(&state, catalog.clone()), catalog);
+
+        // Curation on: user order preserved, stale id dropped.
+        set_exposed_models(
+            &state,
+            Some(vec![
+                "gpt-5.6-sol".into(),
+                "claude-sonnet-5".into(),
+                "removed/model".into(),
+            ]),
+        );
+        assert_eq!(
+            apply_exposed_models(&state, catalog.clone()),
+            vec!["gpt-5.6-sol".to_string(), "claude-sonnet-5".to_string()]
+        );
+
+        // A curated list with zero survivors must not blank the picker.
+        set_exposed_models(&state, Some(vec!["ghost/model".into()]));
+        assert_eq!(apply_exposed_models(&state, catalog.clone()), catalog);
+
+        // Empty list is treated as curation off.
+        set_exposed_models(&state, Some(Vec::new()));
+        assert_eq!(apply_exposed_models(&state, catalog.clone()), catalog);
+    }
+
+    #[tokio::test]
+    async fn models_admin_reports_curated_availability() {
+        let state = test_state("models-admin-availability");
+        set_exposed_models(
+            &state,
+            Some(vec!["gpt-5.6-sol".into(), "vanished/model".into()]),
+        );
+        let (status, body) = response_json(admin_models(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["curation_enabled"], json!(true));
+        let curated = body["curated"].as_array().unwrap();
+        assert_eq!(curated.len(), 2);
+        let by_id: HashMap<&str, bool> = curated
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap(),
+                    row["available"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_id["gpt-5.6-sol"], true);
+        assert_eq!(by_id["vanished/model"], false);
+
+        let (status, checked) =
+            response_json(admin_models_check(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(checked["missing"], json!(1));
     }
 
     #[test]

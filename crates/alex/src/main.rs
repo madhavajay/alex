@@ -1171,6 +1171,11 @@ struct Config {
     /// empty list exposes nothing. Never re-defaults over a user's own choice.
     #[serde(default = "alex_proxy::default_openrouter_exposed_models")]
     openrouter_exposed_models: Vec<String>,
+    /// Cross-provider curated model list in user-chosen order. `None` keeps
+    /// curation off and publishes the full merged catalog; an explicit empty
+    /// list is normalized back to off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exposed_models: Option<Vec<String>>,
     #[serde(default)]
     gemini_project: String,
     #[serde(default = "default_anthropic_upstream")]
@@ -1272,6 +1277,183 @@ impl alex_proxy::OpenrouterExposedPersister for ConfigOpenrouterExposedPersister
         Ok(())
     }
 }
+
+struct ConfigExposedModelsPersister {
+    config: Arc<std::sync::Mutex<Config>>,
+}
+
+impl alex_proxy::ExposedModelsPersister for ConfigExposedModelsPersister {
+    fn persist(&self, exposed: Option<&[String]>) -> std::result::Result<(), String> {
+        let exposed = exposed.map(<[String]>::to_vec);
+        let fresh = update_config_on_disk(|config| {
+            config.exposed_models = exposed.clone();
+        })
+        .map_err(|error| error.to_string())?;
+        sync_shared_config(&self.config, fresh);
+        Ok(())
+    }
+}
+
+/// Rewrites every connected harness's config via the same writers the
+/// refresh-config admin uses. Debounced by a coalescing flag: a sync
+/// requested while one runs marks it dirty and re-runs once.
+struct DaemonHarnessConfigSyncer {
+    state: std::sync::Weak<alex_proxy::AppState>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    dirty: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl alex_proxy::HarnessConfigSyncer for DaemonHarnessConfigSyncer {
+    fn sync(&self, reason: &str) {
+        use std::sync::atomic::Ordering;
+        let Some(state) = self.state.upgrade() else { return };
+        self.dirty.store(true, Ordering::SeqCst);
+        if self.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let reason = reason.to_string();
+        let running = self.running.clone();
+        let dirty = self.dirty.clone();
+        tokio::spawn(async move {
+            while dirty.swap(false, Ordering::SeqCst) {
+                tracing::info!(%reason, "syncing connected harness configs");
+                sync_connected_harness_configs(&state).await;
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+/// Rewrite the Alex-managed config of every connected harness so its model
+/// list matches the currently published catalog. Reuses each harness's
+/// existing key; harnesses that fail to write are logged, not fatal.
+async fn sync_connected_harness_configs(state: &alex_proxy::AppState) {
+    let Ok((config, _)) = load_or_create_config() else {
+        return;
+    };
+    for spec in harness_connect::HARNESSES {
+        if !spec.supports_connect {
+            continue;
+        }
+        let config_dir = harness_connect::resolve_config_dir(&config, spec, None);
+        let connected = harness_connect::harness_config_connected(spec.name, &config_dir);
+        if !connected {
+            continue;
+        }
+        if let Err(error) = refresh_one_harness_config(state, &config, spec, config_dir).await {
+            tracing::warn!(harness = spec.name, %error, "harness config sync failed");
+        }
+    }
+}
+
+/// The model ids advertised on `/v1/models` and written into harness configs:
+/// the merged provider catalog, filtered, curated, and sorted. Shared by the
+/// app-driven connect/refresh-config path and the background config sync.
+async fn published_models(state: &alex_proxy::AppState) -> Vec<String> {
+    // Provider catalogs advertised in /v1/models must also reach the
+    // app-driven connect / refresh-config path; otherwise a provider added
+    // after a harness was connected (e.g. Kimi, or a newly-curated
+    // OpenRouter model) never lands in that harness's model list on
+    // reconnect. Mirror the daemon `/v1/models` handler: refresh the
+    // OpenRouter catalog and fold in only the user-curated exposed subset.
+    let mut ids = state.store.pricing_models();
+    alex_proxy::refresh_openrouter_models(state).await;
+    alex_proxy::refresh_cliproxyapi_models(state).await;
+    ids.extend(alex_proxy::openrouter_exposed_catalog(state));
+    ids.extend(alex_proxy::cliproxyapi_catalog_models(state).await);
+    ids.extend(alex_proxy::exo_catalog_models(state));
+    ids.extend(alex_proxy::kimi_catalog_models(state).await);
+    for (alias, _) in alex_core::model_aliases() {
+        ids.push((*alias).to_string());
+    }
+    let mut filtered = harness_connect::filter_model_ids(ids);
+    // Advertise all providers' models alphabetically (case-insensitive) so
+    // the harness picker matches the daemon `/v1/models` ordering.
+    alex_proxy::sort_model_ids(&mut filtered);
+    let filtered = alex_proxy::apply_exposed_models(state, filtered);
+    if filtered.is_empty() {
+        vec![
+            "claude-opus-4-8".into(),
+            "claude-sonnet-5".into(),
+            "claude-haiku-4-5".into(),
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-terra".into(),
+            "gpt-5.6-luna".into(),
+            "gpt-5.5".into(),
+            "grok-code-fast-1".into(),
+            "gemini-2.5-flash".into(),
+        ]
+    } else {
+        filtered
+    }
+}
+
+/// Rewrite one connected harness's Alex config with the current model list,
+/// reusing its existing key. Skips harnesses whose key is unreadable rather
+/// than minting a fresh one from a background task.
+async fn refresh_one_harness_config(
+    state: &alex_proxy::AppState,
+    config: &Config,
+    spec: &'static harness_connect::HarnessSpec,
+    config_dir: PathBuf,
+) -> Result<()> {
+    let name = spec.name;
+    let api_key = match name {
+        "claude" => harness_connect::read_claude_api_key(&config_dir),
+        "codex" => harness_connect::read_codex_api_key(&config_dir),
+        "grok" => harness_connect::read_grok_api_key(&config_dir),
+        "amp" => harness_connect::read_amp_api_key(&config_dir),
+        "kimi" => harness_connect::read_kimi_api_key(&config_dir),
+        _ => harness_connect::read_pi_api_key(&config_dir),
+    }
+    .context("no stored harness key; skipping config sync")?;
+    let models = published_models(state).await;
+    let status = harness_connect::harness_status(config, spec, None, true).await?;
+    let capture = config.harness_tool_capture.get(name).copied().unwrap_or(false);
+    let base_url = state.base_url.clone();
+    let key_id = String::new();
+    match name {
+        "codex" => {
+            let binary = status.binary.as_deref().context("codex binary missing")?;
+            let catalog = harness_connect::codex_model_catalog(
+                std::path::Path::new(binary),
+                &models,
+            )
+            .await?;
+            harness_connect::write_codex_connection_with_capture(
+                config_dir, base_url, key_id, api_key, catalog, status.version, capture,
+            )?;
+        }
+        "claude" => {
+            harness_connect::write_claude_connection_with_capture(
+                config_dir, base_url, key_id, api_key, models, status.version, capture,
+            )?;
+        }
+        "grok" => {
+            harness_connect::write_grok_connection(
+                config_dir, base_url, key_id, api_key, models, status.version,
+            )?;
+        }
+        "amp" => {
+            harness_connect::write_amp_connection_with_capture(
+                config_dir, base_url, key_id, api_key, status.version, capture,
+            )?;
+        }
+        "kimi" => {
+            harness_connect::write_kimi_connection(
+                config_dir, base_url, key_id, api_key, models, status.version,
+            )?;
+        }
+        _ => {
+            harness_connect::write_pi_connection_with_capture(
+                config_dir, base_url, key_id, api_key, models, status.version, capture,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+
 
 impl alex_proxy::ProtectionPolicyPersister for ConfigProtectionPolicyPersister {
     fn persist(&self, policy: &alex_proxy::ProtectionPolicy) -> std::result::Result<(), String> {
@@ -1554,6 +1736,7 @@ impl Config {
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
             openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
+            exposed_models: None,
             gemini_project: String::new(),
             heartbeat_minutes: default_heartbeat_minutes(),
             reauth_check_minutes: default_reauth_check_minutes(),
@@ -2792,41 +2975,7 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
     }
 
     async fn state_models(state: &alex_proxy::AppState) -> Vec<String> {
-        let mut ids = state.store.pricing_models();
-        // Provider catalogs advertised in /v1/models must also reach the
-        // app-driven connect / refresh-config path; otherwise a provider added
-        // after a harness was connected (e.g. Kimi, or a newly-curated
-        // OpenRouter model) never lands in that harness's model list on
-        // reconnect. Mirror the daemon `/v1/models` handler: refresh the
-        // OpenRouter catalog and fold in only the user-curated exposed subset.
-        alex_proxy::refresh_openrouter_models(state).await;
-        alex_proxy::refresh_cliproxyapi_models(state).await;
-        ids.extend(alex_proxy::openrouter_exposed_catalog(state));
-        ids.extend(alex_proxy::cliproxyapi_catalog_models(state).await);
-        ids.extend(alex_proxy::exo_catalog_models(state));
-        ids.extend(alex_proxy::kimi_catalog_models(state).await);
-        for (alias, _) in alex_core::model_aliases() {
-            ids.push((*alias).to_string());
-        }
-        let mut filtered = harness_connect::filter_model_ids(ids);
-        // Advertise all providers' models alphabetically (case-insensitive) so
-        // the harness picker matches the daemon `/v1/models` ordering.
-        alex_proxy::sort_model_ids(&mut filtered);
-        if filtered.is_empty() {
-            vec![
-                "claude-opus-4-8".into(),
-                "claude-sonnet-5".into(),
-                "claude-haiku-4-5".into(),
-                "gpt-5.6-sol".into(),
-                "gpt-5.6-terra".into(),
-                "gpt-5.6-luna".into(),
-                "gpt-5.5".into(),
-                "grok-code-fast-1".into(),
-                "gemini-2.5-flash".into(),
-            ]
-        } else {
-            filtered
-        }
+        published_models(state).await
     }
 
     async fn list(
@@ -3791,6 +3940,7 @@ async fn main() -> Result<()> {
                 &state,
                 config.openrouter_exposed_models.clone(),
             );
+            alex_proxy::set_exposed_models(&state, config.exposed_models.clone());
             let daemon_config = Arc::new(std::sync::Mutex::new(config.clone()));
             alex_proxy::set_protection_policy_persister(
                 &state,
@@ -3822,6 +3972,20 @@ async fn main() -> Result<()> {
                 &state,
                 Arc::new(ConfigOpenrouterExposedPersister {
                     config: daemon_config.clone(),
+                }),
+            );
+            alex_proxy::set_exposed_models_persister(
+                &state,
+                Arc::new(ConfigExposedModelsPersister {
+                    config: daemon_config.clone(),
+                }),
+            );
+            alex_proxy::set_harness_config_syncer(
+                &state,
+                Arc::new(DaemonHarnessConfigSyncer {
+                    state: Arc::downgrade(&state),
+                    running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 }),
             );
             alex_proxy::set_fixture_dir(&state, config.data_dir.join("fixtures"));
@@ -10915,15 +11079,22 @@ async fn up_cmd(
     // Pi's non-interactive mode does not consistently honour its persisted
     // defaultProvider across releases, so pass the connected profile explicitly
     // while retaining every user argument after it (including an override).
-    let mut launch_args = if harness == "pi" {
-        vec![
+    // Claude only reads the Alex profile when told to; a plain `claude` exec
+    // would use the user's own settings and report Alex as not configured.
+    let mut launch_args = match harness {
+        "pi" => vec![
             OsString::from("--provider"),
             OsString::from("alex"),
             OsString::from("--model"),
             OsString::from(model),
-        ]
-    } else {
-        Vec::new()
+        ],
+        "claude" => vec![
+            OsString::from("--settings"),
+            config_dir
+                .join(harness_connect::CLAUDE_PROFILE_FILE)
+                .into_os_string(),
+        ],
+        _ => Vec::new(),
     };
     launch_args.extend(args.into_iter().map(OsString::from));
     launch_harness(&binary, &launch_args)
@@ -12740,6 +12911,7 @@ continue = true
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
             openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
+            exposed_models: None,
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,
@@ -13549,6 +13721,7 @@ continue = true
             exo_url: default_exo_url(),
             exo_enabled_models: Vec::new(),
             openrouter_exposed_models: alex_proxy::default_openrouter_exposed_models(),
+            exposed_models: None,
             gemini_project: String::new(),
             anthropic_upstream: "direct".into(),
             dario_mode_migrated: true,
