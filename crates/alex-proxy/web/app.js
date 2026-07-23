@@ -18,6 +18,35 @@ const PROVIDERS = [
   ["exo", "Exo", "form"],
   ["cliproxyapi", "CLIProxyAPI", "form"],
 ];
+const PROVIDER_LOGOS = Object.freeze({
+  claude: "claude-code.png",
+  anthropic: "claude-code.png",
+  codex: "codex.png",
+  openai: "codex.png",
+  gemini: "gemini-cli.png",
+  google: "gemini-cli.png",
+  kimi: "kimi-code.png",
+  moonshot: "kimi-code.png",
+  grok: "grok-build.png",
+  xai: "grok-build.png",
+  amp: "amp-code.svg",
+  openrouter: "openrouter.png",
+  exo: "exo.png",
+});
+const HARNESS_LOGOS = Object.freeze({
+  pi: "pi.svg",
+  claude: "claude-code.png",
+  codex: "codex.png",
+  gemini: "gemini-cli.png",
+  kimi: "kimi-code.png",
+  cursor: "cursor-cli.png",
+  amp: "amp-code.svg",
+  droid: "droid-cli.svg",
+  grok: "grok-build.png",
+  opencode: "opencode.png",
+  qwen: "qwen-code.png",
+  goose: "goose.jpg",
+});
 const LOGIN_PROVIDERS = {
   claude: ["Claude Code", "Anthropic", "A", "claude"],
   anthropic: ["Claude Code", "Anthropic", "A", "claude"],
@@ -89,6 +118,15 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 })[character]);
+const logoTile = (logos, name, label, className) => {
+  const key = String(name || "").toLowerCase();
+  const file = logos[key];
+  if (file) return `<span class="${escapeHtml(className)} brand-logo-tile" aria-hidden="true"><img src="/ui/assets/${escapeHtml(file)}" alt=""></span>`;
+  const monogram = key === "cliproxyapi" ? "⚙" : String(label || name || "?").trim().charAt(0).toUpperCase() || "?";
+  return `<span class="${escapeHtml(className)} brand-monogram-tile" aria-hidden="true">${escapeHtml(monogram)}</span>`;
+};
+const providerLogoTile = (name, label, className = "provider-monogram") => logoTile(PROVIDER_LOGOS, name, label, className);
+const harnessLogoTile = (name, label, className = "harness-logo") => logoTile(HARNESS_LOGOS, name, label, className);
 const display = (value) => value === null || value === undefined || value === "" ? "—" : String(value);
 const parseList = (value) => {
   if (Array.isArray(value)) return value;
@@ -427,7 +465,7 @@ function renderOnboardingProviders() {
     const detected = providerCandidates(id).length;
     const selected = state.selectedProvider === id;
     const status = selected ? "Selected" : connected ? `${connected} connected` : detected ? "Detected login" : "Connect";
-    return `<button class="onboarding-choice ${selected ? "selected" : ""}" data-onboarding-provider="${escapeHtml(id)}"><span class="provider-monogram">${escapeHtml(label.charAt(0))}</span><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(status)}</small></span>${selected ? '<b aria-hidden="true">✓</b>' : ""}</button>`;
+    return `<button class="onboarding-choice ${selected ? "selected" : ""}" data-onboarding-provider="${escapeHtml(id)}">${providerLogoTile(id, label)}<span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(status)}</small></span>${selected ? '<b aria-hidden="true">✓</b>' : ""}</button>`;
   }).join("");
   bindActions(grid, "[data-onboarding-provider]", (event) => {
     clearTimeout(state.loginPoll);
@@ -565,7 +603,7 @@ function renderOnboardingHarnessStages() {
   const installed = connectable.filter((harness) => harness.installed);
   const stageOneComplete = state.harnessStatus === "success";
   const stageTwoComplete = Boolean(state.harnessTrace);
-  const cards = installed.map((harness) => `<button class="harness-choice ${state.selectedHarness === harness.name ? "selected" : ""}" data-onboarding-harness="${escapeHtml(harness.name)}"><span class="harness-logo">${escapeHtml(harnessDisplayName(harness.name).charAt(0))}</span><span><strong>${escapeHtml(harnessDisplayName(harness.name))}</strong><small>${state.selectedHarness === harness.name && state.harnessPlanStatus === "success" ? "Plan loaded" : "Preview plan"}</small></span>${state.selectedHarness === harness.name ? "<b>✓</b>" : ""}</button>`).join("");
+  const cards = installed.map((harness) => `<button class="harness-choice ${state.selectedHarness === harness.name ? "selected" : ""}" data-onboarding-harness="${escapeHtml(harness.name)}">${harnessLogoTile(harness.name, harnessDisplayName(harness.name))}<span><strong>${escapeHtml(harnessDisplayName(harness.name))}</strong><small>${state.selectedHarness === harness.name && state.harnessPlanStatus === "success" ? "Plan loaded" : "Preview plan"}</small></span>${state.selectedHarness === harness.name ? "<b>✓</b>" : ""}</button>`).join("");
   const manualOptions = connectable.map((harness) => `<option value="${escapeHtml(harness.name)}" ${state.selectedHarness === harness.name ? "selected" : ""}>${escapeHtml(harnessDisplayName(harness.name))}</option>`).join("");
   const manualResult = state.manualHarnessResult ? `<p class="inline-message ${escapeHtml(state.manualHarnessResult.kind)}">${escapeHtml(state.manualHarnessResult.message)}</p>` : "";
   const stageOneBody = stageOneComplete ? "" : `<div class="harness-choice-grid">${cards || '<p class="muted">No installed, connectable harnesses were detected. Add one manually or skip this page and continue.</p>'}</div>${renderHarnessPlan()}<details class="manual-harness" ${state.manualHarnessResult ? "open" : ""}><summary>Add harness manually</summary><p>Choose the harness and enter its binary path. Alex saves the existing override, refreshes detection, and reports the detected version.</p><form id="manual-harness-form" class="manual-harness-form"><select name="harness" required>${manualOptions}</select><input name="binary" required placeholder="/absolute/path/to/binary" spellcheck="false"><button>Check binary</button></form><div id="manual-harness-result">${manualResult}</div></details>`;
@@ -741,7 +779,8 @@ const VIEW_LOADERS = {
 
 function selectView(requested, updateHash = true) {
   let view = VIEW_COPY[requested] ? requested : "dashboard";
-  if (!state.auth?.onboarding_completed) view = "onboarding";
+  // Traces stays reachable mid-onboarding so "See your trace" can open it in a new tab.
+  if (!state.auth?.onboarding_completed && view !== "traces") view = "onboarding";
   state.currentView = view;
   $$('[data-panel]').forEach((panel) => { panel.hidden = panel.id !== `${view}-view`; });
   $$('nav [data-view]').forEach((button) => {
@@ -916,7 +955,7 @@ async function loadDashboard() {
   renderLimits($("#dashboard-limits"), state.limits.providers || []);
   $("#dashboard-accounts").innerHTML = compactAccounts(state.accounts);
   bindAccountActions($("#dashboard-accounts"));
-  $("#dashboard-harnesses").innerHTML = state.harnesses.filter((item) => item.installed).slice(0, 5).map((item) => `<div class="mini-row"><strong>${escapeHtml(item.display_name || item.name)}</strong><span class="pill ${item.connected ? "success" : "neutral"}">${item.connected ? "Connected" : "Detected"}</span></div>`).join("") || '<p class="muted">No supported harness detected.</p>';
+  $("#dashboard-harnesses").innerHTML = state.harnesses.filter((item) => item.installed).slice(0, 5).map((item) => `<div class="mini-row"><div>${harnessLogoTile(item.name, item.display_name || item.name)}<strong>${escapeHtml(item.display_name || item.name)}</strong></div><span class="pill ${item.connected ? "success" : "neutral"}">${item.connected ? "Connected" : "Detected"}</span></div>`).join("") || '<p class="muted">No supported harness detected.</p>';
   $("#dashboard-dario").innerHTML = state.dario ? facts([["Health", state.dario.health], ["Active generation", state.dario.active_generation_id], ["Generations", state.dario.generations?.length || 0], ["Route enabled", state.dario.route_enabled]]) : '<p class="muted">Dario mode is not enabled.</p>';
   const traceRows = traces.status === "fulfilled" ? traces.value.traces || [] : [];
   $("#dashboard-traces").innerHTML = traceRows.map((trace) => `<button class="trace-mini" data-dashboard-trace="${escapeHtml(trace.id)}"><code>${escapeHtml(trace.model || trace.id)}</code><span>${escapeHtml(trace.provider || "unrouted")} · ${escapeHtml(formatTime(trace.ts_request_ms))}</span><b>${escapeHtml(trace.status ?? "—")}</b></button>`).join("") || '<p class="muted">No recent traces.</p>';
@@ -995,7 +1034,7 @@ function renderProviderPicker(node, collapsible = true) {
   node.innerHTML = PROVIDERS.map(([id, label, mode]) => {
     const count = counts.get(providerCanonical(id)) || 0;
     const action = mode === "oauth" ? "Connect subscription" : mode === "import" ? "Review import" : "Configure below";
-    return `<button data-provider="${escapeHtml(id)}" data-provider-mode="${escapeHtml(mode)}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(`${count} connected · ${action}`)}</span></button>`;
+    return `<button class="provider-picker-choice" data-provider="${escapeHtml(id)}" data-provider-mode="${escapeHtml(mode)}">${providerLogoTile(id, label)}<span class="provider-choice-copy"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(`${count} connected · ${action}`)}</span></span></button>`;
   }).join("");
   node.hidden = collapsible ? node.hidden : false;
   bindActions(node, "[data-provider]", (event) => {
@@ -1280,7 +1319,7 @@ function renderHarnessCard(harness) {
   const support = harnessSupportNote(harness);
   const captureSupported = ["pi", "claude", "codex", "amp"].includes(harness.name);
   return `<article class="harness-card" data-harness-card="${escapeHtml(harness.name)}">
-    <div class="card-heading"><div><span class="section-kicker">${harness.installed ? "DETECTED" : "NOT DETECTED"}</span><h3>${escapeHtml(harness.display_name || harness.name)}</h3><p>${escapeHtml(harness.version || harness.binary || "Version unavailable")}</p></div><span class="pill ${harness.connected ? "success" : harness.installed ? "neutral" : "warning"}">${harness.connected ? "Connected" : harness.installed ? "Available" : "Unavailable"}</span></div>
+    <div class="card-heading"><div class="harness-card-identity">${harnessLogoTile(harness.name, harness.display_name || harness.name)}<div><span class="section-kicker">${harness.installed ? "DETECTED" : "NOT DETECTED"}</span><h3>${escapeHtml(harness.display_name || harness.name)}</h3><p>${escapeHtml(harness.version || harness.binary || "Version unavailable")}</p></div></div><span class="pill ${harness.connected ? "success" : harness.installed ? "neutral" : "warning"}">${harness.connected ? "Connected" : harness.installed ? "Available" : "Unavailable"}</span></div>
     ${support ? `<p class="inline-message warning">${escapeHtml(support)}</p>` : ""}
     ${facts([["Binary", harness.binary], ["Config directory", harness.config_dir], ["Models", harness.models_total ?? harness.models?.length], ["Last checked", harness.checked_ms ? formatTime(harness.checked_ms) : "Current scan"]])}
     <div class="card-actions">${harness.supports_connect && harness.installed ? `<button class="primary" data-harness-mutate="${escapeHtml(harness.connected ? "disconnect" : "connect")}">${harness.connected ? "Disconnect" : "Connect"}</button><button data-harness-refresh ${harness.connected ? "" : "disabled"}>Refresh models/config</button>` : ""}</div>
@@ -1657,7 +1696,7 @@ function setLoginFlow(html) {
 function loginProvider(provider) {
   const raw = String(provider || "Provider");
   const known = LOGIN_PROVIDERS[raw.toLowerCase()];
-  return known ? { name: known[0], vendor: known[1], monogram: known[2], accent: known[3] } : { name: raw, vendor: "Provider", monogram: raw.trim().charAt(0).toUpperCase() || "P", accent: "default" };
+  return known ? { name: known[0], vendor: known[1], monogram: known[2], accent: known[3], key: raw.toLowerCase() } : { name: raw, vendor: "Provider", monogram: raw.trim().charAt(0).toUpperCase() || "P", accent: "default", key: raw.toLowerCase() };
 }
 
 function selectLoginText(node) {
@@ -1750,7 +1789,7 @@ function renderLogin(session, reauthProvider = null) {
   const codeStep = session.user_code ? `<section class="provider-auth-step"><div class="provider-auth-step-title"><span class="provider-auth-step-badge">2</span><span>Enter this code when ${escapeHtml(provider.name)} asks for it:</span></div><div class="provider-auth-code-row"><div class="provider-auth-code" data-login-code tabindex="0">${escapeHtml(session.user_code)}</div><button type="button" class="provider-auth-code-copy" data-login-copy-code="${escapeHtml(session.user_code)}" aria-label="Copy authorization code"><span data-login-copy-icon aria-hidden="true">⧉</span></button></div></section>` : "";
   const pasteStep = paste && pending ? `<section class="provider-auth-step"><div class="provider-auth-step-title"><span class="provider-auth-step-badge">2</span><span>Paste the authorization code or callback URL.</span></div><form data-login-complete class="provider-auth-paste"><label><span>Authorization code or callback URL</span><input name="input" required autocomplete="off"></label><button type="submit">Complete login</button></form></section>` : "";
   const status = session.error ? `<div class="provider-auth-status danger"><span class="provider-auth-status-icon" aria-hidden="true">!</span><span>${escapeHtml(session.error)}</span></div>` : session.state === "done" ? `<div class="provider-auth-status success"><span class="provider-auth-status-icon" aria-hidden="true">✓</span><span>${escapeHtml(session.success_message || "Authorization complete — account connected.")}</span></div>` : pending ? '<div class="provider-auth-status waiting"><span class="spinner" aria-hidden="true"></span><span>Waiting for authorization — keep this window open.</span></div>' : `<div class="provider-auth-status danger"><span class="provider-auth-status-icon" aria-hidden="true">!</span><span>Authorization ${escapeHtml(session.state || "failed")}.</span></div>`;
-  const html = `<div class="provider-auth-card" data-login-accent="${escapeHtml(provider.accent)}"><div class="provider-auth-body"><header class="provider-auth-identity"><div class="provider-auth-logo" aria-hidden="true">${escapeHtml(provider.monogram)}</div><div class="provider-auth-name"><strong>${escapeHtml(provider.name)}</strong><span>by ${escapeHtml(provider.vendor)}</span></div><div class="provider-auth-pill"><i></i><span>${paste ? "Paste code" : "OAuth Device Flow"}</span></div></header><div class="provider-auth-divider"></div>${openStep}${codeStep}${pasteStep}${status}</div></div>`;
+  const html = `<div class="provider-auth-card" data-login-accent="${escapeHtml(provider.accent)}"><div class="provider-auth-body"><header class="provider-auth-identity">${providerLogoTile(provider.key, provider.monogram, "provider-auth-logo")}<div class="provider-auth-name"><strong>${escapeHtml(provider.name)}</strong><span>by ${escapeHtml(provider.vendor)}</span></div><div class="provider-auth-pill"><i></i><span>${paste ? "Paste code" : "OAuth Device Flow"}</span></div></header><div class="provider-auth-divider"></div>${openStep}${codeStep}${pasteStep}${status}</div></div>`;
   setLoginFlow(html);
   loginFlowNodes().forEach((node) => bindLoginCard(node, session, reauthProvider));
 }

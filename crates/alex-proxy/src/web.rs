@@ -1,10 +1,10 @@
+use axum::extract::Path;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLES: &str = include_str!("../web/styles.css");
-const ALEX_ICON: &[u8] = include_bytes!("../web/assets/alex-icon.png");
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
@@ -44,10 +44,72 @@ pub async fn styles() -> Response {
     asset("text/css; charset=utf-8", STYLES)
 }
 
-pub async fn alex_icon() -> Response {
-    let mut response = (StatusCode::OK, ALEX_ICON).into_response();
+pub async fn static_asset(Path(file): Path<String>) -> Response {
+    let asset: Option<(&'static str, &'static [u8])> = match file.as_str() {
+        "alex-icon.png" => Some(("image/png", include_bytes!("../web/assets/alex-icon.png"))),
+        "onboarding-header.jpg" => Some((
+            "image/jpeg",
+            include_bytes!("../web/assets/onboarding-header.jpg"),
+        )),
+        "claude-code.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/claude-code.png"),
+        )),
+        "codex.png" => Some(("image/png", include_bytes!("../web/assets/logos/codex.png"))),
+        "gemini-cli.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/gemini-cli.png"),
+        )),
+        "kimi-code.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/kimi-code.png"),
+        )),
+        "grok-build.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/grok-build.png"),
+        )),
+        "amp-code.svg" => Some((
+            "image/svg+xml",
+            include_bytes!("../web/assets/logos/amp-code.svg"),
+        )),
+        "openrouter.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/openrouter.png"),
+        )),
+        "exo.png" => Some(("image/png", include_bytes!("../web/assets/logos/exo.png"))),
+        "cursor-cli.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/cursor-cli.png"),
+        )),
+        "pi.svg" => Some((
+            "image/svg+xml",
+            include_bytes!("../web/assets/logos/pi.svg"),
+        )),
+        "droid-cli.svg" => Some((
+            "image/svg+xml",
+            include_bytes!("../web/assets/logos/droid-cli.svg"),
+        )),
+        "opencode.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/opencode.png"),
+        )),
+        "qwen-code.png" => Some((
+            "image/png",
+            include_bytes!("../web/assets/logos/qwen-code.png"),
+        )),
+        "goose.jpg" => Some((
+            "image/jpeg",
+            include_bytes!("../web/assets/logos/goose.jpg"),
+        )),
+        _ => None,
+    };
+    let Some((content_type, body)) = asset else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut response = (StatusCode::OK, body).into_response();
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -153,7 +215,6 @@ mod tests {
         }
 
         for destination in [
-            "onboarding",
             "dashboard",
             "traces",
             "general",
@@ -201,6 +262,20 @@ mod tests {
         }
         assert_local_script_and_style_assets();
         assert!(INDEX.contains("src=\"/ui/assets/alex-icon.png\""));
+        assert!(INDEX.contains("src=\"/ui/assets/onboarding-header.jpg\""));
+
+        let external_asset =
+            Regex::new(r#"(?i)(?:src\s*=\s*[\"']|url\(\s*[\"']?)(?:https?:)?//"#).unwrap();
+        for (name, source) in [
+            ("index.html", INDEX),
+            ("app.js", APP_JS),
+            ("styles.css", STYLES),
+        ] {
+            assert!(
+                !external_asset.is_match(source),
+                "{name} must not reference external assets"
+            );
+        }
 
         for endpoint in [
             "/web/auth/status",
@@ -267,6 +342,7 @@ mod tests {
         let inline_handler_assignment =
             Regex::new(r"\.(?:onclick|onsubmit|onchange|ontoggle|onreset)\s*=").unwrap();
         assert!(!inline_handler_assignment.is_match(APP_JS));
+        assert!(!APP_JS.to_ascii_lowercase().contains("onerror="));
         assert!(APP_JS.contains("addEventListener"));
 
         let page_size = Regex::new(r"const\s+TURN_PAGE_SIZE\s*=\s*20\s*;").unwrap();
@@ -311,14 +387,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alex_icon_is_embedded_and_immutable() {
-        let response = alex_icon().await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
-        assert_eq!(
-            response.headers()[header::CACHE_CONTROL],
-            "public, max-age=31536000, immutable"
-        );
-        assert!(ALEX_ICON.starts_with(b"\x89PNG\r\n\x1a\n"));
+    async fn static_assets_are_allowlisted_and_immutable() {
+        for (file, content_type) in [
+            ("alex-icon.png", "image/png"),
+            ("onboarding-header.jpg", "image/jpeg"),
+            ("claude-code.png", "image/png"),
+            ("codex.png", "image/png"),
+            ("gemini-cli.png", "image/png"),
+            ("kimi-code.png", "image/png"),
+            ("grok-build.png", "image/png"),
+            ("amp-code.svg", "image/svg+xml"),
+            ("openrouter.png", "image/png"),
+            ("exo.png", "image/png"),
+            ("cursor-cli.png", "image/png"),
+            ("pi.svg", "image/svg+xml"),
+            ("droid-cli.svg", "image/svg+xml"),
+            ("opencode.png", "image/png"),
+            ("qwen-code.png", "image/png"),
+            ("goose.jpg", "image/jpeg"),
+        ] {
+            let response = static_asset(Path(file.into())).await;
+            assert_eq!(response.status(), StatusCode::OK, "{file}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=31536000, immutable"
+            );
+        }
+
+        let missing = static_asset(Path("not-in-the-bundle.png".into())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }
