@@ -1,26 +1,37 @@
 import { test, expect, openUi } from './fixtures';
 
-test('onboarding renders daemon status, seeded accounts, and connected provider tiles', async ({ page, request, runtime }) => {
+test('dashboard and providers render seeded account health and stats', async ({ page, request, runtime }) => {
   const response = await request.get(`${runtime.baseUrl}/admin/accounts`, { headers: { 'x-api-key': runtime.localKey } });
   expect(response.ok()).toBe(true);
-  const payload = await response.json() as { accounts: Array<{ provider: string; health?: string; status?: string }> };
+  const payload = await response.json() as {
+    accounts: Array<{ id: string; provider: string; name: string; health?: string; status?: string }>;
+  };
 
   await openUi(page, runtime);
-  await page.getByRole('button', { name: 'Onboarding' }).click();
 
-  const accounts = page.locator('#accounts .card');
-  await expect(accounts).toHaveCount(2);
+  const dashboardAccounts = page.locator('#dashboard-accounts .account-row');
+  await expect(dashboardAccounts).toHaveCount(2);
   for (const provider of ['anthropic', 'openai']) {
     const account = payload.accounts.find(value => value.provider === provider)!;
-    const card = accounts.filter({ hasText: provider });
-    await expect(card).toContainText('mock');
-    await expect(card).toContainText(account.health || account.status || 'configured');
+    const row = dashboardAccounts.filter({ hasText: provider });
+    const health = account.health === 'unknown' ? 'not checked yet' : account.health?.replaceAll('_', ' ');
+    await expect(row).toContainText(account.name);
+    await expect(row).toContainText(health || account.status || 'not checked yet');
   }
 
-  await expect(page.locator('[data-provider="claude"]')).toContainText('1 connected');
-  await expect(page.locator('[data-provider="codex"]')).toContainText('1 connected');
+  const stats = page.locator('#dashboard-stats .stat-card');
+  await expect(stats).toHaveCount(4);
+  await expect(stats).toContainText(['Last hour', 'Last 24 hours', '24h cost', 'In flight']);
 
-  await page.getByRole('button', { name: 'Status' }).click();
-  await expect(page.locator('#status-cards')).toContainText('Accounts');
-  await expect(page.locator('#status-cards')).toContainText('2');
+  await page.locator('nav [data-view="providers"]').click();
+  const providerAccounts = page.locator('#provider-accounts [data-account-card]');
+  await expect(providerAccounts).toHaveCount(2);
+  for (const account of payload.accounts) {
+    const card = page.locator(`[data-account-card="${account.id}"]`);
+    const health = account.health === 'unknown' ? 'not checked yet' : account.health?.replaceAll('_', ' ');
+    await expect(card).toContainText(account.provider);
+    await expect(card).toContainText(account.name);
+    await expect(card).toContainText(health || account.status || 'not checked yet');
+    await expect(card).toContainText(account.status || 'active');
+  }
 });

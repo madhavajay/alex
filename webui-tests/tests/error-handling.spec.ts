@@ -1,6 +1,6 @@
 import { test, expect, openUi } from './fixtures';
 
-test('onboarding shows an upstream-backed admin error instead of a blank state', async ({ page, runtime }) => {
+test('providers show an upstream-backed CLIProxyAPI error instead of a blank state', async ({ page, runtime }) => {
   const queued = await fetch(`${runtime.fakeBaseUrl}/_control/queue`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-control-key': runtime.fakeControlKey },
@@ -9,13 +9,14 @@ test('onboarding shows an upstream-backed admin error instead of a blank state',
   expect(queued.ok).toBe(true);
 
   await openUi(page, runtime);
-  await page.getByRole('button', { name: 'Onboarding' }).click();
-  await page.getByText('API-key and local providers').click();
-  await page.getByLabel('CLIProxyAPI endpoint').fill(`${runtime.fakeBaseUrl}/cliproxyapi/v1`);
-  await page.getByLabel('CLIProxyAPI credential').fill('webui-invalid-probe');
+  await page.locator('nav [data-view="providers"]').click();
+  const setup = page.locator('[data-provider-setup="cliproxyapi"]');
+  await setup.locator('summary').click();
+  await setup.getByLabel('Endpoint URL').fill(`${runtime.fakeBaseUrl}/cliproxyapi/v1`);
+  await setup.getByLabel('Credential').fill('webui-invalid-probe');
 
   const response = page.waitForResponse(value => value.url().endsWith('/admin/auth/cliproxyapi') && value.request().method() === 'POST');
-  await page.getByRole('button', { name: 'Probe and connect CLIProxyAPI' }).click();
+  await setup.getByRole('button', { name: 'Probe and connect' }).click();
   expect((await response).status()).toBe(500);
   await expect(page.locator('#cliproxyapi-result')).toContainText('CLIProxyAPI connection failed');
   await expect(page.locator('#cliproxyapi-result')).toContainText('HTTP 500');
