@@ -4,12 +4,12 @@
         <title>Alex</title>
         <item>
             <title>0.1.30</title>
-            <pubDate>Thu, 23 Jul 2026 08:31:41 +0000</pubDate>
+            <pubDate>Thu, 23 Jul 2026 08:42:30 +0000</pubDate>
             <sparkle:version>0.1.30</sparkle:version>
             <sparkle:shortVersionString>0.1.30</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.30/Alex-0.1.30.dmg" length="11928722" type="application/octet-stream" sparkle:edSignature="beT48LZpeDrW59a/NM8F65xd5s07HFMN031wQYh7dvmD4JOI0zk4VWeF6jizZwrdkRbuqYp8gThkYk6TYeqLCg=="/>
+            <enclosure url="https://github.com/madhavajay/alex/releases/download/v0.1.30/Alex-0.1.30.dmg" length="11928657" type="application/octet-stream" sparkle:edSignature="UDaVohC5cUBfl+/WUQcZn5HzOQpcoUC77pDjtw8dUU+ROJx4zLYNjoQCKQfxqkH5lZF6V81KGhVAIKnc7GOTAA=="/>
         </item>
     </channel>
 </rss>
