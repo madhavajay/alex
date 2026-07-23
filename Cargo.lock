@@ -167,6 +167,7 @@ dependencies = [
 name = "alex-lar-scale"
 version = "0.1.25"
 dependencies = [
+ "alex-core",
  "alex-lar",
  "alex-store",
  "anyhow",
@@ -200,6 +201,7 @@ dependencies = [
  "alex-auth",
  "alex-core",
  "alex-fakeprov",
+ "alex-lar-scale",
  "alex-middleware",
  "alex-store",
  "anyhow",
@@ -209,6 +211,7 @@ dependencies = [
  "chrono",
  "flate2",
  "futures-util",
+ "libc",
  "once_cell",
  "rand 0.8.6",
  "regex",

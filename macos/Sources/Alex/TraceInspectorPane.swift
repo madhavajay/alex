@@ -106,7 +106,9 @@ struct ToolBodyInspectorView: View {
             phase = .loading
             do {
                 let body = try await model.fetchToolBody(id: route.toolId, kind: route.kind)
-                phase = .loaded(raw: body.text, diskPath: body.diskPath)
+                phase = .loaded(
+                    raw: body.text, diskPath: body.diskPath,
+                    isTruncated: body.isTruncated, fullByteCount: body.fullByteCount)
             } catch {
                 phase = .failed(error.localizedDescription)
             }
@@ -187,14 +189,13 @@ struct ToolBodyInspectorView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
-        case let .loaded(raw, diskPath):
-            let displayed = BodyPretty.display(raw, cap: .max).text
-            let capped = BodyPretty.capped(displayed)
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
+            let capped = BodyPretty.capped(raw)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(displayed, forType: .string)
+                        NSPasteboard.general.setString(capped.text, forType: .string)
                     }
                     Button("Reveal in Finder") {
                         guard let diskPath else { return }
@@ -202,7 +203,20 @@ struct ToolBodyInspectorView: View {
                             [URL(fileURLWithPath: diskPath)])
                     }
                     .disabled(diskPath == nil)
-                    if !SSEFrames.isSSE(raw), !BodyPretty.isJSON(raw), capped.isTruncated {
+                    if isTruncated {
+                        Button("Load full body") {
+                            Task {
+                                guard let body = try? await model.fetchToolBody(
+                                    id: route.toolId, kind: route.kind, loadFull: true)
+                                else { return }
+                                phase = .loaded(
+                                    raw: body.text, diskPath: body.diskPath,
+                                    isTruncated: false, fullByteCount: body.fullByteCount)
+                            }
+                        }
+                        .help("Load all \(ByteCountFormatter.string(fromByteCount: Int64(fullByteCount), countStyle: .file))")
+                    }
+                    if !SSEFrames.isSSE(raw), !BodyPretty.looksLikeJSON(raw), capped.isTruncated {
                         Text("truncated to \(BodyPretty.displayCap / 1000)KB")
                             .font(.system(size: 9))
                             .foregroundStyle(.orange)
@@ -211,15 +225,28 @@ struct ToolBodyInspectorView: View {
                 }
                 .controlSize(.small)
                 if SSEFrames.isSSE(raw) {
-                    SSEBodyView(source: raw)
-                } else if BodyPretty.isJSON(raw) {
-                    FormattedJSONBody(source: raw)
+                    SSEBodyView(
+                        source: raw, cache: model.renderedArtifacts,
+                        key: artifactKey(kind: "sse", truncated: isTruncated))
+                } else if BodyPretty.looksLikeJSON(raw) {
+                    FormattedJSONBody(
+                        source: raw, cache: model.renderedArtifacts,
+                        key: artifactKey(kind: "json", truncated: isTruncated))
                 } else {
                     InspectorTextPane(text: capped.text, highlightJSON: false)
                         .frame(minHeight: 220, maxHeight: .infinity)
                 }
             }
         }
+    }
+
+    private func artifactKey(kind: String, truncated: Bool) -> RenderedArtifactKey {
+        let completed = model.turns.first(where: { $0.traceId == route.turnId }).map {
+            $0.tsResponseMs ?? $0.tsRequestMs
+        } ?? 0
+        return RenderedArtifactKey(
+            traceId: route.turnId, completedMs: completed,
+            discriminator: "tool-\(kind)-v1|\(route.toolId)|\(route.kind)|\(truncated ? "capped" : "full")")
     }
 }
 
@@ -251,7 +278,8 @@ struct TraceInspectorView: View {
         enum Phase {
             case idle
             case loading
-            case loaded(raw: String, diskPath: String?)
+            case loaded(
+                raw: String, diskPath: String?, isTruncated: Bool, fullByteCount: Int)
             case failed(String)
         }
     }
@@ -317,7 +345,9 @@ struct TraceInspectorView: View {
         }
     }
 
-    private func loadBody(_ kind: TraceBodyKind, into load: Binding<BodyLoad>) {
+    private func loadBody(
+        _ kind: TraceBodyKind, into load: Binding<BodyLoad>, loadFull: Bool = false
+    ) {
         // Keep previously loaded content visible while the next turn's body
         // loads so the inspector scroll position survives turn browsing.
         if case .loaded = load.wrappedValue.phase {
@@ -326,7 +356,7 @@ struct TraceInspectorView: View {
         }
         let tid = traceId
         Task {
-            let phase = await fetchBody(tid, kind: kind)
+            let phase = await fetchBody(tid, kind: kind, loadFull: loadFull)
             guard tid == traceId else { return }
             load.wrappedValue.phase = phase
         }
@@ -735,7 +765,7 @@ struct TraceInspectorView: View {
         title: String, kind: TraceBodyKind, load: Binding<BodyLoad>, isExpanded: Binding<Bool>
     ) -> some View {
         DisclosureGroup(isExpanded: isExpanded) {
-            bodyContent(load.wrappedValue.phase)
+            bodyContent(load.wrappedValue.phase, kind: kind, load: load)
         } label: {
             groupLabel(title)
         }
@@ -752,13 +782,16 @@ struct TraceInspectorView: View {
             bodyLoadingView("Loading request body…")
         case let .failed(message):
             bodyErrorView(message)
-        case let .loaded(raw, diskPath):
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
             if fullRequestJSON {
                 bodyViewer(
                     source: raw,
-                    displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
-                    diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
-                    note: nil, showsFullJSONToggle: true)
+                    displayed: BodyPretty.capped(raw).text,
+                    diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.looksLikeJSON(raw),
+                    note: nil, showsFullJSONToggle: true,
+                    renderConfig: "request|full-view|\(isTruncated ? "capped" : "full")",
+                    sourceTruncated: isTruncated, fullByteCount: fullByteCount,
+                    loadFull: { loadBody(.request, into: $reqBody, loadFull: true) })
             } else if model.previousTraceId(before: traceId) == nil {
                 let presentation = RequestJSONDiff.presentation(previous: nil, current: raw)
                 requestDiffViewer(presentation, source: raw, diskPath: diskPath)
@@ -768,11 +801,15 @@ struct TraceInspectorView: View {
                     bodyLoadingView("Loading previous request for comparison…")
                 case let .failed(message):
                     bodyViewer(
-                        source: raw, displayed: BodyPretty.display(raw, cap: .max).text,
-                        diskPath: diskPath, highlightJSON: BodyPretty.isJSON(raw),
+                        source: raw, displayed: BodyPretty.capped(raw).text,
+                        diskPath: diskPath, highlightJSON: BodyPretty.looksLikeJSON(raw),
                         note: "Previous request unavailable (\(message)); showing the full current body.",
-                        showsFullJSONToggle: true)
-                case let .loaded(previous, _):
+                        showsFullJSONToggle: true,
+                        renderConfig: "request|fallback|\(isTruncated ? "capped" : "full")",
+                        sourceTruncated: isTruncated,
+                        fullByteCount: fullByteCount,
+                        loadFull: { loadBody(.request, into: $reqBody, loadFull: true) })
+                case let .loaded(previous, _, _, _):
                     let presentation = RequestJSONDiff.presentation(
                         previous: previous, current: raw)
                     requestDiffViewer(presentation, source: raw, diskPath: diskPath)
@@ -788,22 +825,28 @@ struct TraceInspectorView: View {
         bodyViewer(
             source: source, displayed: presentation.text, diskPath: diskPath,
             highlightJSON: BodyPretty.isJSON(presentation.text), note: presentation.note,
-            showsFullJSONToggle: true)
+            showsFullJSONToggle: true, renderConfig: "request|diff|\(presentation.kind)")
     }
 
     @ViewBuilder
-    private func bodyContent(_ phase: BodyLoad.Phase) -> some View {
+    private func bodyContent(
+        _ phase: BodyLoad.Phase, kind: TraceBodyKind, load: Binding<BodyLoad>
+    ) -> some View {
         switch phase {
         case .idle, .loading:
             bodyLoadingView("Loading body…")
         case let .failed(message):
             bodyErrorView(message)
-        case let .loaded(raw, diskPath):
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
             bodyViewer(
                 source: raw,
-                displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
-                diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
-                note: nil, showsFullJSONToggle: false)
+                displayed: BodyPretty.capped(raw).text,
+                diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.looksLikeJSON(raw),
+                note: nil, showsFullJSONToggle: false,
+                renderConfig: "body|\(kind.rawValue)|\(isTruncated ? "capped" : "full")",
+                sourceTruncated: isTruncated,
+                fullByteCount: fullByteCount,
+                loadFull: { loadBody(kind, into: load, loadFull: true) })
         }
     }
 
@@ -827,7 +870,9 @@ struct TraceInspectorView: View {
     @ViewBuilder
     private func bodyViewer(
         source: String, displayed: String, diskPath: String?, highlightJSON: Bool,
-        note: String?, showsFullJSONToggle: Bool
+        note: String?, showsFullJSONToggle: Bool, renderConfig: String,
+        sourceTruncated: Bool = false,
+        fullByteCount: Int = 0, loadFull: (() -> Void)? = nil
     ) -> some View {
         let capped = BodyPretty.capped(displayed)
         VStack(alignment: .leading, spacing: 4) {
@@ -844,6 +889,10 @@ struct TraceInspectorView: View {
                         [URL(fileURLWithPath: diskPath)])
                 }
                 .disabled(diskPath == nil)
+                if sourceTruncated, let loadFull {
+                    Button("Load full body", action: loadFull)
+                        .help("Load all \(ByteCountFormatter.string(fromByteCount: Int64(fullByteCount), countStyle: .file))")
+                }
                 if showsFullJSONToggle {
                     Toggle("Full JSON", isOn: $fullRequestJSON)
                         .toggleStyle(.checkbox)
@@ -874,9 +923,13 @@ struct TraceInspectorView: View {
                     .foregroundStyle(.secondary)
             }
             if !rawMode, SSEFrames.isSSE(source) {
-                SSEBodyView(source: source)
+                SSEBodyView(
+                    source: source, cache: model.renderedArtifacts,
+                    key: bodyArtifactKey(kind: "sse", config: renderConfig))
             } else if !rawMode, BodyPretty.isJSON(source) {
-                FormattedJSONBody(source: source)
+                FormattedJSONBody(
+                    source: source, cache: model.renderedArtifacts,
+                    key: bodyArtifactKey(kind: "json", config: renderConfig))
             } else {
                 InspectorTextPane(text: capped.text, highlightJSON: highlightJSON)
                     .frame(height: 220)
@@ -884,12 +937,23 @@ struct TraceInspectorView: View {
         }
     }
 
+    private func bodyArtifactKey(kind: String, config: String) -> RenderedArtifactKey {
+        let completed = detail?.trace.tsResponseMs
+            ?? detail?.trace.tsRequestMs
+            ?? model.turns.first(where: { $0.traceId == traceId }).map {
+                $0.tsResponseMs ?? $0.tsRequestMs
+            } ?? 0
+        return RenderedArtifactKey(
+            traceId: traceId, completedMs: completed,
+            discriminator: "trace-\(kind)-v1|\(config)")
+    }
+
     /// Whether `bodyViewer` renders one of the new formatted views (SSE
     /// frames or tree-aware JSON) instead of the plain capped-text fallback,
     /// mirroring the branch above.
     private func usesEnhancedFormatting(source: String) -> Bool {
         guard !rawMode else { return false }
-        return SSEFrames.isSSE(source) || BodyPretty.isJSON(source)
+        return SSEFrames.isSSE(source) || BodyPretty.looksLikeJSON(source)
     }
 
     private func groupLabel(_ text: String) -> some View {
@@ -914,10 +978,15 @@ struct TraceInspectorView: View {
         }
     }
 
-    private func fetchBody(_ id: String, kind: TraceBodyKind) async -> BodyLoad.Phase {
+    private func fetchBody(
+        _ id: String, kind: TraceBodyKind, loadFull: Bool = false
+    ) async -> BodyLoad.Phase {
         do {
-            let content = try await model.fetchTraceBody(id: id, kind: kind)
-            return .loaded(raw: content.text, diskPath: content.diskPath)
+            let content = try await model.fetchTraceBody(
+                id: id, kind: kind, loadFull: loadFull)
+            return .loaded(
+                raw: content.text, diskPath: content.diskPath,
+                isTruncated: content.isTruncated, fullByteCount: content.fullByteCount)
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -1097,9 +1166,11 @@ struct SystemPromptView: View {
 /// and shows the exact original text.
 struct FormattedJSONBody: View {
     let source: String
+    let cache: RenderedArtifactCache
+    let key: RenderedArtifactKey
 
     @State private var built: NSAttributedString?
-    @State private var builtKey: String?
+    @State private var builtKey: RenderedArtifactKey?
 
     var body: some View {
         Group {
@@ -1117,12 +1188,18 @@ struct FormattedJSONBody: View {
             }
         }
         .frame(height: 220)
-        .task(id: source) {
-            guard builtKey != source else { return }
+        .task(id: key) {
+            guard builtKey != key else { return }
+            if let cached = cache.formatted(for: key) {
+                built = cached.value
+                builtKey = key
+                return
+            }
             let attributed = await FormattedJSONBodyBuilder.build(source)
             guard !Task.isCancelled else { return }
+            cache.insertFormatted(attributed, for: key)
             built = attributed.value
-            builtKey = source
+            builtKey = key
         }
     }
 }
@@ -1130,7 +1207,7 @@ struct FormattedJSONBody: View {
 /// The formatting work itself, split out of `FormattedJSONBody` (a `View`,
 /// and so implicitly `@MainActor`) so it can genuinely run off the main
 /// actor via `Task.detached`.
-private enum FormattedJSONBodyBuilder {
+enum FormattedJSONBodyBuilder {
     /// Above this size, skip the tree-walk enhancement (embedded-JSON
     /// sub-blocks, literal-newline rendering) and fall back to the existing
     /// linear `JsonHighlight` colorer — still computed off the main thread
@@ -1154,7 +1231,7 @@ private enum FormattedJSONBodyBuilder {
             {
                 return AttributedStringBox(attributedString(tokens: tokens, font: font))
             }
-            let displayed = BodyPretty.display(source, cap: .max).text
+            let displayed = BodyPretty.display(source).text
             let capped = BodyPretty.capped(displayed).text
             return AttributedStringBox(
                 JsonHighlight.attributed(capped, font: font, colors: InspectorTextPane.jsonColors))
@@ -1181,18 +1258,6 @@ private enum FormattedJSONBodyBuilder {
     }
 }
 
-/// `NSAttributedString` isn't `Sendable` (Apple explicitly withholds the
-/// conformance); this box carries a freshly-built, not-yet-shared one across
-/// the `Task.detached` boundary, matching the existing
-/// `TranscriptDocument`/`BuiltDocument` pattern used for render output.
-private struct AttributedStringBox: @unchecked Sendable {
-    let value: NSAttributedString
-
-    init(_ value: NSAttributedString) {
-        self.value = value
-    }
-}
-
 /// Formatted SSE ("event: X\ndata: {...}") body view: splits the stream into
 /// frames (`SSEFrames` in Core), shows a dim "event: <name>" header per
 /// frame, and pretty-prints/highlights each frame's data via the existing
@@ -1201,11 +1266,13 @@ private struct AttributedStringBox: @unchecked Sendable {
 /// rendering the whole stream at once. Parsing runs off the main actor.
 struct SSEBodyView: View {
     let source: String
+    let cache: RenderedArtifactCache
+    let key: RenderedArtifactKey
 
-    @State private var frames: [SSEFrames.Frame] = []
+    @State private var pages: [[SSEFrames.Frame]] = []
     @State private var truncated = false
-    @State private var parsedKey: String?
-    @State private var visibleCount = 20
+    @State private var parsedKey: RenderedArtifactKey?
+    @State private var visiblePageCount = 1
 
     private static let pageSize = 20
 
@@ -1219,24 +1286,24 @@ struct SSEBodyView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
-                } else if frames.isEmpty {
+                } else if pages.isEmpty {
                     Text("No events parsed")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(Array(frames.prefix(visibleCount).enumerated()), id: \.offset) {
+                    ForEach(Array(visibleFrames.enumerated()), id: \.offset) {
                         _, frame in
                         frameView(frame)
                     }
-                    if visibleCount < frames.count {
-                        Button("Show more (\(frames.count - visibleCount) more loaded)") {
-                            visibleCount = min(frames.count, visibleCount + Self.pageSize)
+                    if visiblePageCount < pages.count {
+                        Button("Show more (\(frameCount - visibleFrames.count) more loaded)") {
+                            visiblePageCount = min(pages.count, visiblePageCount + 1)
                         }
                         .buttonStyle(.link)
                         .font(.system(size: 10))
                     } else if truncated {
                         Text(
-                            "Showing the first \(frames.count) events — switch to Raw mode to see the full stream."
+                            "Showing the first \(frameCount) events — switch to Raw mode to see the full stream."
                         )
                         .font(.system(size: 9))
                         .foregroundStyle(.orange)
@@ -1250,17 +1317,33 @@ struct SSEBodyView: View {
         .background(
             RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
                 .fill(AlexTheme.Colors.surfaceFaint))
-        .task(id: source) {
-            guard parsedKey != source else { return }
+        .task(id: key) {
+            guard parsedKey != key else { return }
+            if let cached = cache.sse(for: key) {
+                apply(cached)
+                return
+            }
+            let pageSize = Self.pageSize
             let result = await Task.detached(priority: .userInitiated) {
-                SSEFrames.parse(source)
+                RenderedSSEPages.parse(source, pageSize: pageSize)
             }.value
             guard !Task.isCancelled else { return }
-            frames = result.frames
-            truncated = result.truncated
-            parsedKey = source
-            visibleCount = min(Self.pageSize, result.frames.count)
+            cache.insertSSE(result, for: key)
+            apply(result)
         }
+    }
+
+    private var visibleFrames: [SSEFrames.Frame] {
+        Array(pages.prefix(visiblePageCount).joined())
+    }
+
+    private var frameCount: Int { pages.reduce(0) { $0 + $1.count } }
+
+    private func apply(_ result: RenderedSSEPages) {
+        pages = result.pages
+        truncated = result.truncated
+        parsedKey = key
+        visiblePageCount = min(1, result.pages.count)
     }
 
     @ViewBuilder

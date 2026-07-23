@@ -5,6 +5,63 @@ import AlexCore
 final class TranscriptTextView: NSTextView {
     var onTurnClick: ((Int) -> Void)?
     var selectedTurnProvider: (() -> String?)?
+    private var bubbleRects: [(group: String, kind: TranscriptBubbleKind, rect: CGRect)] = []
+    private var bubbleRectsDirty = true
+    private var bubbleLayoutWidth: CGFloat = 0
+
+    var bubbleRectCount: Int { bubbleRects.count }
+
+    func invalidateBubbleRects() {
+        bubbleRectsDirty = true
+    }
+
+    func rebuildBubbleRects() {
+        guard bubbleRectsDirty,
+            let layoutManager = textLayoutManager,
+            let contentManager = layoutManager.textContentManager,
+            let storage = textStorage, storage.length > 0
+        else {
+            if textStorage?.length == 0 {
+                bubbleRects = []
+                bubbleRectsDirty = false
+            }
+            return
+        }
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
+        var rebuilt: [(group: String, kind: TranscriptBubbleKind, rect: CGRect)] = []
+        var visited = Set<String>()
+        storage.enumerateAttribute(
+            .transcriptBubbleGroup, in: NSRange(location: 0, length: storage.length)
+        ) { value, partialRange, _ in
+            guard let group = value as? String, visited.insert(group).inserted else { return }
+            var groupRange = NSRange()
+            guard storage.attribute(
+                .transcriptBubbleGroup, at: partialRange.location,
+                longestEffectiveRange: &groupRange,
+                in: NSRange(location: 0, length: storage.length)) != nil,
+                let kindRaw = storage.attribute(
+                    .transcriptBubbleKind, at: groupRange.location,
+                    effectiveRange: nil) as? String,
+                let kind = TranscriptBubbleKind(rawValue: kindRaw)
+            else { return }
+            let paragraph = storage.attribute(
+                .paragraphStyle, at: groupRange.location, effectiveRange: nil)
+                as? NSParagraphStyle
+            guard let rect = unifiedRect(
+                for: groupRange, kind: kind, paragraphStyle: paragraph,
+                layoutManager: layoutManager, contentManager: contentManager)
+            else { return }
+            rebuilt.append((group, kind, rect))
+        }
+        bubbleRects = rebuilt
+        bubbleLayoutWidth = bounds.width
+        bubbleRectsDirty = false
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        if newSize.width != frame.width { invalidateBubbleRects() }
+        super.setFrameSize(newSize)
+    }
 
     override func mouseDown(with event: NSEvent) {
         let downPoint = convert(event.locationInWindow, from: nil)
@@ -27,48 +84,17 @@ final class TranscriptTextView: NSTextView {
     }
 
     private func drawBubbles(in dirtyRect: NSRect) {
-        guard let layoutManager = textLayoutManager,
-            let contentManager = layoutManager.textContentManager,
-            let storage = textStorage, storage.length > 0,
-            let context = NSGraphicsContext.current?.cgContext
-        else { return }
-        let viewport = layoutManager.textViewportLayoutController.viewportRange
-            ?? layoutManager.documentRange
-        let start = contentManager.offset(
-            from: contentManager.documentRange.location, to: viewport.location)
-        let end = contentManager.offset(
-            from: contentManager.documentRange.location, to: viewport.endLocation)
-        guard start >= 0, end > start, end <= storage.length else { return }
+        if bubbleLayoutWidth != bounds.width { invalidateBubbleRects() }
+        rebuildBubbleRects()
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
         let origin = textContainerOrigin
         let selectedTurn = selectedTurnProvider?()
-        var drawnGroups = Set<String>()
-        storage.enumerateAttribute(
-            .transcriptBubbleGroup, in: NSRange(location: start, length: end - start)
-        ) { value, partialRange, _ in
-            guard let group = value as? String, drawnGroups.insert(group).inserted else {
-                return
-            }
-            var groupRange = NSRange()
-            guard storage.attribute(
-                .transcriptBubbleGroup, at: partialRange.location,
-                longestEffectiveRange: &groupRange,
-                in: NSRange(location: 0, length: storage.length)) != nil
-            else { return }
-            guard let kindRaw = storage.attribute(
-                .transcriptBubbleKind, at: groupRange.location, effectiveRange: nil) as? String,
-                let kind = TranscriptBubbleKind(rawValue: kindRaw)
-            else { return }
-            let para = storage.attribute(
-                .paragraphStyle, at: groupRange.location, effectiveRange: nil)
-                as? NSParagraphStyle
-            guard let bubble = unifiedRect(
-                for: groupRange, kind: kind, paragraphStyle: para,
-                layoutManager: layoutManager, contentManager: contentManager)
-            else { return }
-            let deviceRect = bubble.offsetBy(dx: origin.x, dy: origin.y)
-            guard deviceRect.intersects(dirtyRect.insetBy(dx: -8, dy: -8)) else { return }
-            let selected = selectedTurn.map { group.hasPrefix($0 + "#") } ?? false
-            BubbleStyle.draw(kind: kind, rect: deviceRect, selected: selected, in: context)
+        for bubble in bubbleRects {
+            let deviceRect = bubble.rect.offsetBy(dx: origin.x, dy: origin.y)
+            guard deviceRect.intersects(dirtyRect.insetBy(dx: -8, dy: -8)) else { continue }
+            let selected = selectedTurn.map { bubble.group.hasPrefix($0 + "#") } ?? false
+            BubbleStyle.draw(
+                kind: bubble.kind, rect: deviceRect, selected: selected, in: context)
         }
     }
 
@@ -81,7 +107,6 @@ final class TranscriptTextView: NSTextView {
             let endLocation = contentManager.location(startLocation, offsetBy: range.length),
             let textRange = NSTextRange(location: startLocation, end: endLocation)
         else { return nil }
-        layoutManager.ensureLayout(for: textRange)
         var top: CGFloat?
         var bottom: CGFloat = 0
         var maxLineX: CGFloat = 0
@@ -268,6 +293,8 @@ struct TranscriptTextPane: NSViewRepresentable {
                     case let .append(doc): storage.append(doc)
                     }
                 }
+                textView.invalidateBubbleRects()
+                textView.rebuildBubbleRects()
                 if model.userAtBottom, !findBarVisible { scrollToBottom() }
             }
             if lastSelectedTurn != model.inspectorTraceId {

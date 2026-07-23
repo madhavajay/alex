@@ -747,13 +747,21 @@ final class OnboardingModel {
             case .rejected:
                 guard lastRejectedSessionId != match.sessionId else { return true }
                 lastRejectedSessionId = match.sessionId
-                let transcript = try? await AlexClient(config: config)
-                    .traceTranscript(sessionId: match.sessionId)
-                let rejectedTurn = transcript?.turns.reversed().first {
+                let client = AlexClient(config: config)
+                var metadata: [TranscriptTurnMetadata] = []
+                var cursor: TranscriptCursor?
+                repeat {
+                    guard let page = try? await client.traceTranscriptPage(
+                        sessionId: match.sessionId, limit: 50, cursor: cursor)
+                    else { break }
+                    metadata.append(contentsOf: page.turns)
+                    cursor = page.nextCursor
+                    if !page.hasMore { break }
+                } while cursor != nil
+                let rejectedTurn = metadata.reversed().first {
                     ($0.status ?? 0) >= 400 || $0.error?.isEmpty == false
                 }
                 let detail = rejectedTurn?.error
-                    ?? rejectedTurn?.errorCode
                     ?? match.statusLabel
                 if case .rejected(let message) = OnboardingSupport.traceOutcome(
                     status: match.lastStatus, errorCount: match.errors, error: detail)
