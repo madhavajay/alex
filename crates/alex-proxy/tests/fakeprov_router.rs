@@ -149,6 +149,12 @@ fn assert_upstream_headers(records: &[RequestRecord]) {
                 );
                 assert!(record.headers.get("x-api-key").is_none());
             }
+            "/openrouter/api/v1/credits" => {
+                assert_eq!(
+                    record.headers.get("authorization").map(String::as_str),
+                    Some("Bearer openrouter-test-key")
+                );
+            }
             path => panic!("unexpected FakeProv request path {path}"),
         }
     }
@@ -162,7 +168,7 @@ fn assert_upstream_headers(records: &[RequestRecord]) {
 }
 
 #[tokio::test]
-async fn fakeprov_drives_real_anthropic_and_openai_router_paths() {
+async fn fakeprov_drives_real_router_and_openrouter_limits_paths() {
     let fakeprov = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
     let root = temp_root();
     let vault = Arc::new(Vault::open(root.join("accounts")).unwrap());
@@ -182,6 +188,14 @@ async fn fakeprov_drives_real_anthropic_and_openai_router_paths() {
         ))
         .await
         .unwrap();
+    vault
+        .upsert(api_account(
+            "openrouter-mock",
+            Provider::Openrouter,
+            "openrouter-test-key",
+        ))
+        .await
+        .unwrap();
     let store = Arc::new(Store::open(root.join("store")).unwrap());
     let state = build_state(
         LOCAL_KEY.into(),
@@ -192,6 +206,12 @@ async fn fakeprov_drives_real_anthropic_and_openai_router_paths() {
         Duration::from_secs(30),
     );
     apply_all_provider_overrides(&state, fakeprov.base_url());
+    std::env::set_var(
+        "ALEX_UPSTREAM_OPENROUTER_URL",
+        format!("{}/openrouter", fakeprov.base_url()),
+    );
+    apply_upstream_env_overrides(&state);
+    std::env::remove_var("ALEX_UPSTREAM_OPENROUTER_URL");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -205,6 +225,26 @@ async fn fakeprov_drives_real_anthropic_and_openai_router_paths() {
     });
     let base = format!("http://{address}");
     let client = reqwest::Client::new();
+
+    let limits: Value = client
+        .get(format!("{base}/admin/limits"))
+        .header("x-api-key", LOCAL_KEY)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let openrouter = limits["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == "openrouter")
+        .unwrap_or_else(|| panic!("missing openrouter limits entry: {limits}"));
+    assert_eq!(openrouter["account_id"], "openrouter-mock");
+    assert_eq!(openrouter["individual_credits_usd"], 30.25);
 
     let (anthropic_response, anthropic_trace_id) = post(
         &client,
@@ -330,7 +370,7 @@ async fn fakeprov_drives_real_anthropic_and_openai_router_paths() {
     );
 
     let records = fakeprov.requests().await;
-    assert_eq!(records.len(), 5);
+    assert_eq!(records.len(), 6);
     assert_upstream_headers(&records);
     assert_eq!(
         store.search_traces(&TraceFilter::default()).unwrap().len(),

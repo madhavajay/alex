@@ -670,6 +670,7 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
+    pub openrouter_usage: std::sync::Mutex<UsageCache>,
     /// Backoff guard for on-demand Kimi `/usages` probes triggered from the
     /// limits snapshot (the recorded routing-limits act as the value cache).
     pub kimi_usage: std::sync::Mutex<UsageCache>,
@@ -1215,6 +1216,7 @@ pub fn build_state_with_substitution(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
+        openrouter_usage: std::sync::Mutex::new(UsageCache::default()),
         kimi_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
         openrouter_exposed: std::sync::RwLock::new(default_openrouter_exposed_models()),
@@ -4849,6 +4851,87 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     .await
 }
 
+pub fn parse_openrouter_credits_payload(payload: &Value) -> Option<f64> {
+    let data = payload.get("data")?;
+    let total = data.get("total_credits")?.as_f64()?;
+    let used = data.get("total_usage")?.as_f64()?;
+    (total.is_finite() && used.is_finite()).then_some((total - used).max(0.0))
+}
+
+async fn openrouter_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state
+        .vault
+        .account_for(Provider::Openrouter, false)
+        .await
+        .ok()?;
+    let headers = openrouter_auth_headers(&account).ok()?;
+    cached_usage_fetch(
+        &state.openrouter_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let result = state
+                .http
+                .get(format!(
+                    "{}/credits",
+                    upstream_base(state, Provider::Openrouter, OPENROUTER_BASE)
+                ))
+                .headers(headers)
+                .header("accept", "application/json")
+                .header("user-agent", "alex-openrouter-usage")
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(raw) => match parse_openrouter_credits_payload(&raw) {
+                        Some(remaining) => UsageFetchOutcome::Fresh(Some(json!({
+                            "provider": "openrouter",
+                            "account_id": account.id,
+                            "source": "openrouter credits API",
+                            "plan": account.label,
+                            "individual_credits_usd": remaining,
+                        }))),
+                        None => UsageFetchOutcome::Failed {
+                            retry_after_ms: None,
+                            fallback: None,
+                            log: UsageFailureLog::Error {
+                                error: "missing total_credits or total_usage".into(),
+                                message: "openrouter credits parse failed",
+                            },
+                        },
+                    },
+                    Err(e) => UsageFetchOutcome::Failed {
+                        retry_after_ms: None,
+                        fallback: None,
+                        log: UsageFailureLog::Error {
+                            error: e.to_string(),
+                            message: "openrouter credits parse failed",
+                        },
+                    },
+                },
+                Ok(resp) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Status {
+                        status: resp.status().as_u16(),
+                        message: "openrouter credits endpoint unavailable; backing off",
+                    },
+                },
+                Err(e) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Error {
+                        error: e.to_string(),
+                        message: "openrouter credits request failed",
+                    },
+                },
+            }
+        },
+    )
+    .await
+}
+
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
 /// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
 async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
@@ -5043,6 +5126,9 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
         providers.push(entry);
     }
     if let Some(entry) = amp_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = openrouter_usage_entry(state).await {
         providers.push(entry);
     }
     if let Some(entry) = kimi_usage_entry(state).await {
@@ -17666,6 +17752,55 @@ mod tests {
         let snap = parse_kimi_usage_payload(&json!({}));
         assert_eq!(snap["windows"].as_array().unwrap().len(), 0);
         assert!(snap["credits"].is_null());
+    }
+
+    #[test]
+    fn openrouter_credits_payload_calculates_remaining_balance() {
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 42.5, "total_usage": 12.25}
+            })),
+            Some(30.25)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 12.25, "total_usage": 12.25}
+            })),
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 10.0}
+            })),
+            None
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 5.0, "total_usage": 8.0}
+            })),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_fakeprov_credits_surface_as_limits_balance() {
+        let server = alex_fakeprov::FakeProv::spawn(alex_fakeprov::Config::default())
+            .await
+            .unwrap();
+        let state = test_state("openrouter-usage-entry");
+        state.vault.upsert(openrouter_account()).await.unwrap();
+        set_upstream_base_override(
+            &state,
+            Provider::Openrouter,
+            format!("{}/openrouter/api/v1", server.base_url()),
+        );
+
+        let entry = openrouter_usage_entry(&state)
+            .await
+            .expect("openrouter usage entry");
+        assert_eq!(entry["provider"], "openrouter");
+        assert_eq!(entry["account_id"], "openrouter-api-key");
+        assert_eq!(entry["individual_credits_usd"], 30.25);
     }
 
     fn test_kimi_account() -> Account {

@@ -694,6 +694,25 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_account_shows_dollar_balance() {
+        let now = 1_000_000;
+        let mut summary = synthetic_summary(now);
+        summary.accounts[0].provider = "openrouter".into();
+        summary.accounts[0].id = "openrouter-api-key".into();
+        summary.limits = Some(serde_json::json!({
+            "providers": [{
+                "provider": "openrouter",
+                "account_id": "openrouter-api-key",
+                "individual_credits_usd": 30.25
+            }]
+        }));
+
+        let text = summary.telegram_text_at(now);
+        println!("{text}");
+        assert!(text.contains("💰 $30.25 credits"), "{text}");
+    }
+
+    #[test]
     fn formats_healthy_account_as_one_entry() {
         let now = 1_000_000;
         let mut summary = synthetic_summary(now);

@@ -404,6 +404,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/kimi/api/oauth/token", post(kimi_token))
         .route("/openrouter/api/v1/chat/completions", post(openai_chat))
         .route("/openrouter/api/v1/models", get(openrouter_models))
+        .route("/openrouter/api/v1/credits", get(openrouter_credits))
         .route("/exo/v1/chat/completions", post(openai_chat))
         .route("/exo/v1/models", get(exo_models))
         .route("/cliproxyapi/v1/models", get(cliproxyapi_models))
@@ -662,6 +663,7 @@ fixed_handler!(
 );
 fixed_handler!(kimi_token, POST, "kimi/token.json", body);
 fixed_handler!(openrouter_models, GET, "openrouter/models.json");
+fixed_handler!(openrouter_credits, GET, "openrouter/credits.json");
 fixed_handler!(exo_models, GET, "exo/models.json");
 fixed_handler!(cliproxyapi_models, GET, "cliproxyapi/models.json");
 fixed_handler!(
@@ -2071,6 +2073,20 @@ mod tests {
                 "meta-llama/llama-3.1-70b-instruct",
             ]
         );
+
+        let credits: Value = client
+            .get(format!("{}/openrouter/api/v1/credits", server.base_url()))
+            .bearer_auth("openrouter-test-key")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(credits["data"]["total_credits"], 42.5);
+        assert_eq!(credits["data"]["total_usage"], 12.25);
 
         let kimi: Value = client
             .get(format!("{}/kimi/coding/v1/usages", server.base_url()))
