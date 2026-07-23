@@ -1249,6 +1249,13 @@ fn limit_items(providers: &[Value]) -> Vec<LimitItem> {
                 Style::default().fg(Color::Red),
             ))));
         }
+        let individual_credit = crate::individual_credit_balance_text(p);
+        if let Some(balance) = &individual_credit {
+            items.push(LimitItem::Text(Line::from(Span::styled(
+                format!("  💰 {balance}"),
+                Style::default().fg(Color::Green),
+            ))));
+        }
         for w in p
             .get("windows")
             .and_then(|v| v.as_array())
@@ -1256,6 +1263,9 @@ fn limit_items(providers: &[Value]) -> Vec<LimitItem> {
             .unwrap_or_default()
         {
             let window = jstr(w, "window");
+            if individual_credit.is_some() && window == "credits" {
+                continue;
+            }
             let pct = jf64(w, "used_pct").unwrap_or(0.0);
             let reset = reset_secs(w, now_s)
                 .map(|s| format!("resets in {}", humanize_s(s)))
@@ -1843,5 +1853,28 @@ mod tests {
         assert!(meters[0].0.contains("anthropic 5h"));
         assert!(meters[0].0.contains("resets in"));
         assert_eq!(meters[0].1, 63.0);
+    }
+
+    #[test]
+    fn limit_items_show_openrouter_credit_balance() {
+        let items = limit_items(&[json!({
+            "provider": "openrouter",
+            "source": "openrouter credits API",
+            "individual_credits_usd": 12.34
+        })]);
+        let text = items
+            .iter()
+            .filter_map(|item| match item {
+                LimitItem::Text(line) => Some(
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>(),
+                ),
+                LimitItem::Meter { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("💰 $12.34 credits"), "{text}");
     }
 }

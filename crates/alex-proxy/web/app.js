@@ -1110,8 +1110,18 @@ function quotaPercent(entry) {
   return windows.length ? Math.max(...windows.map((window) => clamp(window.used_pct, 0, 100))) : 0;
 }
 
+function creditBalanceText(entry) {
+  const raw = entry?.individual_credits_usd;
+  if (raw === null || raw === undefined || !Number.isFinite(Number(raw))) return null;
+  return `💰 $${Number(raw).toFixed(2)} credits`;
+}
+
 function renderLimits(node, providers) {
   node.innerHTML = providers.length ? providers.map((provider) => {
+    const credits = creditBalanceText(provider);
+    if (credits) {
+      return `<div class="limit-row" data-credit-provider="${escapeHtml(provider.provider)}"><div><strong>${escapeHtml(provider.provider)}</strong><small>${escapeHtml(provider.source || "Credit balance")}</small></div><span data-credit-balance>${escapeHtml(credits)}</span></div>`;
+    }
     const used = quotaPercent(provider);
     const label = provider.quota?.state || provider.plan || provider.source || "Observed usage";
     return `<div class="limit-row"><div><strong>${escapeHtml(provider.provider)}</strong><small>${escapeHtml(label)}</small></div><progress max="100" value="${escapeHtml(used)}"></progress><span>${escapeHtml(`${formatNumber(used)}% used`)}</span></div>`;
@@ -1339,8 +1349,17 @@ function accountTitle(account) {
 
 function quotaMarkup(limits) {
   if (!limits || typeof limits !== "object") return '<span class="muted">No quota observation</span>';
+  const credits = creditBalanceText(limits);
+  if (credits) return `<div class="quota-line credit-balance" data-credit-balance><span>Credit balance</span><strong>${escapeHtml(credits)}</strong></div>`;
   const percent = quotaPercent(limits);
   return `<div class="quota-line"><progress max="100" value="${escapeHtml(percent)}"></progress><span>${escapeHtml(`${formatNumber(percent)}% used`)}</span></div>`;
+}
+
+function providerLimitsForAccount(account) {
+  const limits = state.limits?.providers || [];
+  return limits.find((entry) => entry.provider === account.provider && entry.account_id === account.id)
+    || limits.find((entry) => entry.provider === account.provider && !entry.account_id)
+    || null;
 }
 
 function renderAccountCard(account) {
@@ -1348,7 +1367,7 @@ function renderAccountCard(account) {
   const needsReauth = account.kind === "oauth" && (account.needs_reauth || health.value === "auth_failed" || account.status !== "active");
   return `<article class="account-card" data-account-card="${escapeHtml(account.id)}">
     <div class="account-head">${providerLogoTile(account.provider, account.provider, "account-provider-logo")}<span class="status-dot ${escapeHtml(health.value)}"></span><div><span class="section-kicker">${escapeHtml(account.provider)}</span><h3>${escapeHtml(accountTitle(account))}</h3><small>${escapeHtml(health.label)} · ${escapeHtml(account.kind)}${account.paused ? " · paused" : ""}</small></div></div>
-    ${quotaMarkup(account.limits)}
+    ${quotaMarkup(account.limits || providerLimitsForAccount(account))}
     ${facts([["Status", account.status], ["Expires", account.expires_in_s === null || account.expires_in_s === undefined ? "—" : formatAge(account.expires_in_s)], ["Routing", account.routing?.eligible ? `Priority ${finite(account.routing.priority) + 1}` : "Ineligible"], ["Reserve", account.routing?.reserve_pct === undefined ? "—" : `${account.routing.reserve_pct}%`]])}
     <div class="card-actions"><button data-account-pause="${escapeHtml(account.id)}" data-paused="${account.paused}">${account.paused ? "Resume" : "Pause"}</button>${needsReauth ? `<button data-reauth-id="${escapeHtml(account.id)}" data-reauth-provider="${escapeHtml(account.provider)}">Re-authenticate</button>` : ""}<button class="danger-button" data-account-remove="${escapeHtml(account.id)}">Remove</button></div>
   </article>`;
@@ -1442,10 +1461,15 @@ async function saveRouting(event) {
 }
 
 async function loadProviders() {
-  const [accounts, analytics] = await Promise.all([loadAccounts(), api("/admin/accounts/analytics?since_minutes=1440&bucket_minutes=60")]);
+  const [accounts, analytics, limits] = await Promise.all([
+    loadAccounts(),
+    api("/admin/accounts/analytics?since_minutes=1440&bucket_minutes=60"),
+    api("/admin/limits"),
+  ]);
   const providers = [...new Set(accounts.map((account) => account.provider))];
   const routings = await Promise.all(providers.map((provider) => api(`/admin/routing/${encodeURIComponent(provider)}`).catch(() => null)));
   state.providerAnalytics = analytics;
+  state.limits = limits;
   state.providerRoutings = routings.filter(Boolean);
   renderProvidersView();
   await Promise.allSettled([loadOpenRouterModels(), loadExo(), loadCLIProxyAPI(), loadImportCandidates()]);

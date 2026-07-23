@@ -531,6 +531,7 @@ public struct ProvidersResponse: Codable, Sendable {
 
 public struct ProviderLimits: Codable, Sendable {
     public let provider: String
+    public let accountId: String?
     public let plan: String?
     public let source: String?
     public let error: String?
@@ -538,12 +539,19 @@ public struct ProviderLimits: Codable, Sendable {
     public let requests: CountPair?
     public let tokens: CountPair?
     public let observedAtMs: Int64?
+    public let individualCreditsUsd: Double?
     /// The daemon-selected binding quota. Clients must not infer this from windows.
     public let quota: QuotaState?
 
     enum CodingKeys: String, CodingKey {
         case provider, plan, source, error, windows, requests, tokens, quota
+        case accountId = "account_id"
         case observedAtMs = "observed_at_ms"
+        case individualCreditsUsd = "individual_credits_usd"
+    }
+
+    public var formattedIndividualCredits: String? {
+        individualCreditsUsd.map { String(format: "$%.2f", $0) }
     }
 }
 
