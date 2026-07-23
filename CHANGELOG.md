@@ -30,8 +30,9 @@ predate this file — see the git history and GitHub releases.
 - The web Trace Browser uses a more compact layout with a dedicated filters
   toolbar; version and refresh controls moved to the footer, and the logo now
   links to the GitHub repository.
-- Providers is now the default first settings tab. Dashboard passwords accept
-  any non-empty value up to 256 characters.
+- The Providers page opens directly on the first provider instead of an
+  aggregate view. Dashboard passwords accept any non-empty value up to 256
+  characters.
 
 ### Fixed
 - Removed the confusing newer-activity pill and improved Trace Browser forks,
