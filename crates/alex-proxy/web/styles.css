@@ -142,3 +142,29 @@ body.trace-resizing,body.trace-resizing *{cursor:col-resize!important;user-selec
   .trace-session-row,.trace-list-labels{grid-template-columns:minmax(0,1fr) 48px 24px!important}
   [data-session-column=status]{display:none!important}
 }
+
+/* Compact trace toolbar and sidebar status footer. */
+.brand{color:var(--text)}
+.brand:hover{background:rgba(255,255,255,.035)}
+.sidebar-foot{min-height:72px;gap:7px;padding:8px 9px}
+.sidebar-foot .daemon-copy{flex:1;min-width:0}
+.sidebar-foot .daemon-copy strong{color:var(--secondary)}
+.sidebar-foot .daemon-copy small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar-icon-button{width:27px;height:27px;flex:0 0 27px;padding:0;display:grid;place-items:center}
+.sidebar-icon-button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8}
+.trace-panel{display:flex;flex-direction:column}
+.trace-toolbar{height:40px;min-height:40px;display:flex;align-items:center;gap:5px;overflow-x:auto;padding:6px 8px;border-bottom:1px solid var(--line);background:#19191b;scrollbar-width:thin}
+.trace-toolbar label{display:flex;align-items:center;gap:4px;min-width:max-content;color:var(--muted);font-size:8px;font-weight:650}
+.trace-toolbar .trace-model-filter{flex:1 1 180px;min-width:150px}
+.trace-toolbar input:not([type=checkbox]),.trace-toolbar select{width:118px;height:27px;min-height:27px;padding:2px 6px;background:rgba(255,255,255,.04);border-color:var(--line);font:9px "SFMono-Regular",Consolas,monospace}
+.trace-toolbar .trace-model-filter input{width:100%}
+.trace-toolbar .trace-toggle-chip{display:flex;min-width:max-content;height:27px;padding:0 6px}
+.trace-toolbar .trace-filter-apply,.trace-toolbar .trace-clear-chip{height:27px;min-width:max-content;padding:2px 7px;font-size:9px}
+.trace-browser{height:auto;flex:1}
+.trace-session-row{height:34px;min-height:34px;padding-top:4px;padding-bottom:4px}
+.trace-session-brand{width:20px;height:20px;flex-basis:20px}
+@media(max-width:760px){
+  .trace-toolbar{height:40px;min-height:40px;flex-wrap:nowrap}
+  .trace-toolbar .trace-model-filter{flex-basis:140px}
+  .trace-browser{height:auto}
+}

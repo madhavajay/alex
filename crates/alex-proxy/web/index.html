@@ -40,7 +40,7 @@
   <div id="app-shell" class="app-shell" hidden>
     <aside class="sidebar">
       <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
-      <div class="brand"><img class="brand-mark" src="/ui/assets/alex-icon.png" alt=""><div><strong>Alex</strong><small id="sidebar-version">Control plane</small></div></div>
+      <a class="brand" href="https://github.com/madhavajay/alex" target="_blank" rel="noopener"><img class="brand-mark" src="/ui/assets/alex-icon.png" alt=""><div><strong>Alex</strong><small>Control plane</small></div></a>
       <nav aria-label="Alex navigation">
         <p class="nav-label">Overview</p>
         <button data-view="dashboard"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Dashboard</button>
@@ -57,8 +57,8 @@
       </nav>
       <div class="sidebar-foot">
         <span id="sidebar-dot" class="status-dot pending"></span>
-        <div class="daemon-copy"><strong id="sidebar-status">Connecting</strong><small id="sidebar-uptime">Local daemon</small></div>
-        <button id="sidebar-refresh" class="sidebar-icon-button" title="Refresh daemon status" aria-label="Refresh daemon status"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+        <div class="daemon-copy"><strong id="daemon-status">Connecting</strong><small id="sidebar-web-version">Web UI —</small><small id="sidebar-uptime">Daemon —</small></div>
+        <button id="global-refresh" class="sidebar-icon-button" title="Refresh current page" aria-label="Refresh"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
         <button id="sidebar-update" class="sidebar-icon-button update" title="Review Alex update" aria-label="Review Alex update" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg></button>
       </div>
     </aside>
@@ -67,7 +67,6 @@
       <header class="topbar">
         <button id="mobile-menu" class="icon-button mobile-only" aria-label="Open navigation">☰</button>
         <div><h1 id="page-title">Onboarding</h1><p id="page-subtitle">Set up Alex in a few small steps</p></div>
-        <div class="topbar-actions"><span id="daemon-status" class="pill pending">Connecting…</span><button id="global-refresh" class="icon-button" title="Refresh current page" aria-label="Refresh">↻</button></div>
       </header>
 
       <div class="content">
@@ -77,7 +76,7 @@
             <article class="onboarding-card" data-onboarding-step="0">
               <div class="onboarding-intro"><h2>Protect your Alex dashboard</h2><p>Create a password for browsers on your LAN. Alex stores only a salted Argon2id hash, and browser sessions expire after 12 hours.</p></div>
               <div id="password-configured" class="success-box" hidden><span>✓</span><div><strong>Dashboard password configured</strong><p>You can replace it at any time in General → Web access.</p></div></div>
-              <form id="password-config-form" class="field-stack compact-form"><label>New dashboard password<input name="password" type="password" minlength="10" maxlength="256" required autocomplete="new-password"></label><label>Confirm password<input name="confirmation" type="password" minlength="10" maxlength="256" required autocomplete="new-password"></label><div class="password-meter"><i></i><span>Use at least 10 characters</span></div><button class="primary" type="submit">Save password</button></form>
+              <form id="password-config-form" class="field-stack compact-form"><label>New dashboard password<input name="password" type="password" maxlength="256" required autocomplete="new-password"></label><label>Confirm password<input name="confirmation" type="password" maxlength="256" required autocomplete="new-password"></label><div class="password-meter"><i></i><span>Any password works; longer is stronger</span></div><button class="primary" type="submit">Save password</button></form>
             </article>
             <article class="onboarding-card" data-onboarding-step="1" hidden><img class="onboarding-hero" src="/ui/assets/onboarding-header.jpg" alt="Alex routing harnesses to providers through one local daemon"><div class="onboarding-intro"><h2>Meet Alex</h2><p class="onboarding-lede">One local daemon exposing four client APIs and routing each request through supported provider and model paths.</p><p>Alex lets you manage and combine your token providers — and use them from compatible connected harnesses and API clients.</p></div></article>
             <article class="onboarding-card" data-onboarding-step="2" hidden><div class="onboarding-intro"><h2>Connect a real provider</h2><p>Choose a provider and complete its secure authentication here. You can skip for now at any point.</p></div><div id="onboarding-providers" class="provider-grid onboarding-provider-grid"></div><div id="onboarding-provider-detail"></div><div id="login-flow" class="login-flow" hidden aria-live="polite"></div></article>
@@ -116,7 +115,7 @@
             <div class="section-label">WEB DASHBOARD</div>
             <form id="web-password-form" class="setting-form">
               <div><strong>Dashboard password</strong><small>Replacing it signs out every other browser session</small></div>
-              <div class="inline-fields"><input name="password" type="password" minlength="10" maxlength="256" required placeholder="New password" autocomplete="new-password"><input name="confirmation" type="password" minlength="10" maxlength="256" required placeholder="Confirm" autocomplete="new-password"><button class="primary">Replace</button></div>
+              <div class="inline-fields"><input name="password" type="password" maxlength="256" required placeholder="New password" autocomplete="new-password"><input name="confirmation" type="password" maxlength="256" required placeholder="Confirm" autocomplete="new-password"><button class="primary">Replace</button></div>
             </form>
             <div class="setting-row"><div><strong>Current browser session</strong><small>Sessions expire automatically after 12 hours</small></div><button id="logout">Sign out</button></div>
             <div class="section-label">SYSTEM</div>
@@ -228,18 +227,18 @@
         </section>
 
         <section id="traces-view" class="panel trace-panel" data-panel hidden>
+          <form id="trace-filters" class="trace-filters trace-toolbar" aria-label="Trace filters">
+            <label class="trace-model-filter"><span>Model</span><input name="model" placeholder="Filter model…" autocomplete="off"></label>
+            <label><span>Provider</span><select name="provider"><option value="">Any provider</option></select></label>
+            <label><span>Harness</span><select name="harness"><option value="">Any harness</option></select></label>
+            <label><span>Status</span><select name="status"><option value="">Any status</option><option value="200">200 only</option><option value="400">400 only</option><option value="500">500 only</option></select></label>
+            <label class="trace-toggle-chip"><input name="errors" type="checkbox"><span>Errors only</span></label>
+            <label class="trace-toggle-chip trace-subagent-toggle"><input id="trace-show-subagents" type="checkbox" checked><span>Show subagents</span></label>
+            <button class="trace-filter-apply">Apply</button><button class="trace-clear-chip" type="reset">Clear all</button>
+          </form>
           <div id="trace-browser" class="trace-browser">
             <aside class="trace-sessions" aria-label="Sessions and traces">
               <header class="trace-panel-head"><div><strong>Sessions</strong><span id="trace-count" class="count-chip">0</span></div><button id="refresh-traces" class="trace-icon-button" aria-label="Refresh traces" title="Refresh traces">↻</button></header>
-              <form id="trace-filters" class="trace-filters">
-                <label class="trace-model-filter"><span>Model</span><input name="model" placeholder="Filter model…" autocomplete="off"></label>
-                <label><span>Provider</span><select name="provider"><option value="">Any provider</option></select></label>
-                <label><span>Harness</span><select name="harness"><option value="">Any harness</option></select></label>
-                <label><span>Status</span><select name="status"><option value="">Any status</option><option value="200">200 only</option><option value="400">400 only</option><option value="500">500 only</option></select></label>
-                <label class="trace-toggle-chip"><input name="errors" type="checkbox"><span>Errors only</span></label>
-                <label class="trace-toggle-chip trace-subagent-toggle"><input id="trace-show-subagents" type="checkbox" checked><span>Show subagents</span></label>
-                <button class="trace-filter-apply">Apply</button><button class="trace-clear-chip" type="reset">Clear all</button>
-              </form>
               <div class="trace-column-bar">
                 <div id="trace-list-labels" class="trace-list-labels" data-session-grid>
                   <button data-trace-sort="session">Session <span data-sort-arrow></span></button>

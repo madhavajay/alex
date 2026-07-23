@@ -935,12 +935,10 @@ function setRefreshInterval(event) {
 
 /* 4. Shared data loaders. */
 function loadHealthDisplay(health) {
-  $("#daemon-status").className = "pill success";
-  $("#daemon-status").textContent = `Online · ${health.version}`;
+  $("#daemon-status").textContent = "Online";
   $("#sidebar-dot").className = "status-dot ok";
-  $("#sidebar-status").textContent = "Daemon online";
-  $("#sidebar-uptime").textContent = `daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
-  $("#sidebar-version").textContent = `v${health.version}`;
+  $("#sidebar-web-version").textContent = `Web UI v${health.version}`;
+  $("#sidebar-uptime").textContent = `Daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
   $("#about-version").textContent = health.version;
 }
 
@@ -1049,14 +1047,6 @@ async function refreshUpdateState({ markChecked = false, suppressSessionRecovery
   loadHealthDisplay(health);
   renderUpdateState();
   return update;
-}
-
-async function refreshSidebarStatus() {
-  const button = $("#sidebar-refresh");
-  button.disabled = true;
-  try { await refreshUpdateState({ markChecked: true }); }
-  catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
-  finally { button.disabled = false; }
 }
 
 async function loadAccounts() {
@@ -1500,18 +1490,23 @@ function credentialPingResult(account, results) {
   const exact = results.find((result) => result.account_id === account.id);
   if (exact) return exact;
   const providerResults = results.filter((result) => providerCanonical(result.provider) === providerCanonical(account.provider));
-  const providerAccounts = state.accounts.filter((candidate) => providerCanonical(candidate.provider) === providerCanonical(account.provider));
+  const providerAccounts = activeCredentialAccounts().filter((candidate) => providerCanonical(candidate.provider) === providerCanonical(account.provider));
   return providerResults.length === 1 && providerAccounts.length === 1 ? providerResults[0] : null;
+}
+
+function activeCredentialAccounts() {
+  return state.accounts.filter((account) => account.status === "active" && !account.paused);
 }
 
 function renderCredentialPingRows(results = null, requestError = "") {
   const rows = $("#credential-ping-rows");
-  if (!state.accounts.length) {
+  const accounts = activeCredentialAccounts();
+  if (!accounts.length) {
     rows.innerHTML = '<div class="credential-ping-empty">No provider credentials are connected.</div>';
     return { passed: 0, total: 0 };
   }
   let passed = 0;
-  rows.innerHTML = state.accounts.map((account) => {
+  rows.innerHTML = accounts.map((account) => {
     if (!results && !requestError) {
       return `<div class="credential-ping-row pending">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}</small></div><span class="spinner" aria-label="Checking"></span></div>`;
     }
@@ -1521,7 +1516,7 @@ function renderCredentialPingRows(results = null, requestError = "") {
     const message = requestError || result?.message || "No ping result was returned for this credential.";
     return `<div class="credential-ping-row ${ok ? "passed" : "failed"}">${providerLogoTile(account.provider, account.provider, "credential-ping-logo")}<div><strong>${escapeHtml(account.email || account.id)}</strong><small>${escapeHtml(account.provider)}${result ? ` · ${escapeHtml(`${result.latency_ms} ms`)}` : ""}</small>${ok ? "" : `<p>${escapeHtml(message)}</p>`}</div><span class="credential-ping-mark" aria-label="${ok ? "Passed" : "Failed"}">${ok ? "✓" : "×"}</span></div>`;
   }).join("");
-  return { passed, total: state.accounts.length };
+  return { passed, total: accounts.length };
 }
 
 async function runCredentialPingChecks() {
@@ -1530,7 +1525,8 @@ async function runCredentialPingChecks() {
   const summary = $("#credential-ping-summary");
   rerun.disabled = true;
   summary.className = "credential-ping-summary checking";
-  summary.textContent = `Checking ${state.accounts.length} credential${state.accounts.length === 1 ? "" : "s"}…`;
+  const accountCount = activeCredentialAccounts().length;
+  summary.textContent = `Checking ${accountCount} credential${accountCount === 1 ? "" : "s"}…`;
   renderCredentialPingRows();
   try {
     const data = await api("/admin/accounts/test", { method: "POST" });
@@ -3048,7 +3044,6 @@ function bindStaticEvents() {
   $$('[data-refresh-card]').forEach((button) => button.addEventListener("click", refreshCurrentView));
   $("#mobile-menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
   $("#global-refresh").addEventListener("click", refreshCurrentView);
-  $("#sidebar-refresh").addEventListener("click", refreshSidebarStatus);
   $("#sidebar-update").addEventListener("click", () => selectView("updates", true));
   $("#quick-refresh").addEventListener("click", refreshCurrentView);
   $("#refresh-interval").addEventListener("change", setRefreshInterval);
