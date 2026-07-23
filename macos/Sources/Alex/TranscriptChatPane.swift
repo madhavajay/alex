@@ -98,6 +98,7 @@ struct TranscriptChatPane: View {
                     }
                 }
                 .id(entry.id)
+                .onAppear { model.transcriptTurnBecameVisible(entry.turn.traceId) }
         }
     }
 
@@ -109,8 +110,9 @@ struct TranscriptChatPane: View {
         // back in `model.turns`.
         let previousTurn = model.turns.indices.contains(entry.turnNumber - 2)
             ? model.turns[entry.turnNumber - 2] : nil
-        let messages = TranscriptChatMessages.messages(
-            for: entry.turn, harnessName: harnessName, previousTurn: previousTurn)
+        let messages = TranscriptChatMessages.cachedMessages(
+            for: entry.turn, harnessName: harnessName, previousTurn: previousTurn,
+            cache: model.renderedArtifacts)
         // `entry.role` only distinguishes which half of the turn this slot
         // is (structural), while the resolved message may be `.harness`
         // instead of `.user` for that same slot — match on "assistant half
@@ -225,6 +227,27 @@ enum TranscriptChatEntries {
 /// same fields the classic pane consumes (user/assistant text, assistant
 /// blocks, tool calls paired with executions via ToolLifecycle).
 enum TranscriptChatMessages {
+    @MainActor
+    static func cachedMessages(
+        for turn: TranscriptTurn, harnessName: String, previousTurn: TranscriptTurn? = nil,
+        cache: RenderedArtifactCache
+    ) -> [MessageDisplay] {
+        let previousKey = previousTurn.map {
+            "\($0.traceId):\($0.tsResponseMs ?? $0.tsRequestMs)"
+        } ?? "none"
+        let key = RenderedArtifactKey(
+            traceId: turn.traceId, completedMs: turn.tsResponseMs ?? turn.tsRequestMs,
+            discriminator: "chat-v1|\(harnessName)|\(previousKey)")
+        if let cached = cache.chat(for: key) { return cached }
+        var rendered = messages(
+            for: turn, harnessName: harnessName, previousTurn: previousTurn)
+        for index in rendered.indices {
+            rendered[index].attributedContent = AttributedString(rendered[index].content)
+        }
+        cache.insertChat(rendered, for: key)
+        return rendered
+    }
+
     @MainActor
     static func messages(
         for turn: TranscriptTurn, harnessName: String, previousTurn: TranscriptTurn? = nil
@@ -347,7 +370,7 @@ enum TranscriptChatMessages {
         }
         return AttemptEvent(
             title: titleParts.joined(separator: " · "),
-            detail: details.joined(separator: "\n"),
+            detail: cap(details.joined(separator: "\n")),
             model: failed?.model ?? attempts.first?.model,
             provider: failed?.provider ?? attempts.first?.provider)
     }
@@ -443,6 +466,6 @@ enum TranscriptChatMessages {
     }
 
     static func cap(_ text: String) -> String {
-        TurnTextCap.cap(text, maxChars: TranscriptRender.maxTurnChars, maxLines: .max).text
+        TurnTextCap.cap(text).text
     }
 }

@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notifier: AlertNotifier!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UIHangWatchdog.shared.startIfEnabled()
         NSApp.setActivationPolicy(.accessory)
         installMainMenu()
         store = SnapshotStore()
@@ -61,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        UIHangWatchdog.shared.stop()
         store.stopPolling()
     }
 

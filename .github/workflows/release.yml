@@ -148,6 +148,107 @@ jobs:
           overwrite: true
           retention-days: 14
 
+  windows-cli-asset:
+    name: Build Windows ${{ matrix.arch_tag }} CLI and installer artifacts
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch_tag: x86_64
+            iss_arch: x64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch_tag: arm64
+            iss_arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stable-windows-${{ matrix.arch_tag }}
+
+      # aws-lc-sys assembles its crypto sources with NASM on x86_64 and
+      # clang on ARM64; hosted images ship LLVM but not NASM.
+      - name: Install NASM (x86_64 only)
+        if: matrix.arch_tag == 'x86_64'
+        run: choco install nasm -y --no-progress
+        shell: pwsh
+
+      - name: Stamp release version
+        run: bash scripts/stamp-version.sh "${{ needs.meta.outputs.version }}"
+        shell: pwsh
+
+      - name: Build release CLI from tagged source
+        run: cargo build --release --locked -p alex --bins --target ${{ matrix.target }}
+        shell: pwsh
+
+      # Windows does not yet have a separate packaged-smoke lane. Keep this
+      # smoke-contract check in the asset job while release-gates remains Linux/macOS.
+      - name: Parse Windows packaging scripts and verify smoke contracts
+        run: ./packaging/ci-windows/test-smoke-installed.ps1
+        shell: pwsh
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $exe = "target\${{ matrix.target }}\release\alex.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $dist = "dist\windows-${{ matrix.arch_tag }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $asset = "alex-cli-${env:RELEASE_VERSION}-windows-${{ matrix.arch_tag }}.zip"
+          Compress-Archive -Path $exe -DestinationPath "$dist\$asset" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "$dist\$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline -Path "$dist\$asset.sha256"
+          "dist=$dist" >> $env:GITHUB_OUTPUT
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile Setup.exe
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          & $iscc `
+            "/DAppVersion=${env:RELEASE_VERSION}" `
+            "/DAlexExe=$PWD\target\${{ matrix.target }}\release\alex.exe" `
+            "/DOutputDir=$PWD\${{ steps.package.outputs.dist }}" `
+            "/DArch=${{ matrix.iss_arch }}" `
+            packaging\windows-installer\alex.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          $setup = "${{ steps.package.outputs.dist }}\Alex-Setup-${env:RELEASE_VERSION}-windows-${{ matrix.arch_tag }}.exe"
+          if (-not (Test-Path $setup)) { throw "missing $setup" }
+          $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path -Leaf $setup)" | Set-Content -NoNewline -Path "$setup.sha256"
+
+      - name: Upload Windows workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stable-windows-${{ matrix.arch_tag }}
+          path: dist/windows-${{ matrix.arch_tag }}/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
   macos-cli-asset:
     name: Build signed macOS CLI artifacts
     needs: [meta, rust-test, swift-test]
@@ -548,6 +649,7 @@ jobs:
       - linux-gnu-asset
       - linux-musl-asset
       - macos-cli-asset
+      - windows-cli-asset
       - stable-dmg
     runs-on: namespace-profile-linux-medium
     outputs:
@@ -568,6 +670,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: stable-macos-cli
+          path: dist/release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: stable-windows-x86_64
+          path: dist/release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: stable-windows-arm64
           path: dist/release-assets
       - uses: actions/download-artifact@v4
         with:
@@ -673,6 +783,14 @@ jobs:
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \
             "alex-cli-${version}-macos-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-windows-x86_64.zip" \
+            "alex-cli-${version}-windows-x86_64.zip.sha256" \
+            "alex-cli-${version}-windows-arm64.zip" \
+            "alex-cli-${version}-windows-arm64.zip.sha256" \
+            "Alex-Setup-${version}-windows-x86_64.exe" \
+            "Alex-Setup-${version}-windows-x86_64.exe.sha256" \
+            "Alex-Setup-${version}-windows-arm64.exe" \
+            "Alex-Setup-${version}-windows-arm64.exe.sha256" \
             alex-x86_64-unknown-linux-musl \
             alex-aarch64-unknown-linux-musl \
             checksums.txt \
@@ -763,6 +881,14 @@ jobs:
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \
             "alex-cli-${version}-macos-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-windows-x86_64.zip" \
+            "alex-cli-${version}-windows-x86_64.zip.sha256" \
+            "alex-cli-${version}-windows-arm64.zip" \
+            "alex-cli-${version}-windows-arm64.zip.sha256" \
+            "Alex-Setup-${version}-windows-x86_64.exe" \
+            "Alex-Setup-${version}-windows-x86_64.exe.sha256" \
+            "Alex-Setup-${version}-windows-arm64.exe" \
+            "Alex-Setup-${version}-windows-arm64.exe.sha256" \
             alex-x86_64-unknown-linux-musl \
             alex-aarch64-unknown-linux-musl \
             checksums.txt \

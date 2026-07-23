@@ -1,5 +1,9 @@
 import SwiftUI
 
+enum TranscriptPresentationDefaults {
+    static let chatBodiesExpanded = true
+}
+
 /// Faint-surface card with a clickable header row and an expandable body.
 /// The trailing chevron rotates when the card opens.
 struct CollapsibleCard<Header: View, Expanded: View>: View {

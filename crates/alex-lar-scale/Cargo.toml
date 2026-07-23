@@ -8,6 +8,7 @@ description = "Reproducible synthetic scale verifier for Alex LAR"
 publish = false
 
 [dependencies]
+alex-core = { workspace = true }
 alex-lar = { workspace = true }
 alex-store = { workspace = true }
 anyhow = { workspace = true }

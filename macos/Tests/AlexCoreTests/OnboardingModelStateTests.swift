@@ -142,6 +142,25 @@ import Testing
         #expect(OnboardingModel.stepTitles.last == "Beyond single provider")
     }
 
+    @Test func networkStepFollowsCredentialsAndPrecedesNotifications() {
+        #expect(OnboardingModel.stepTitles.count == 8)
+        #expect(OnboardingModel.stepTitles == [
+            "Meet Alex", "Pick a provider", "Connect and test",
+            "Credentials for compatible apps", "Network", "Never lose a login",
+            "Keep your agents running", "Beyond single provider",
+        ])
+
+        let model = makeModel()
+        model.step = 3
+        model.next()
+        #expect(model.step == 4)
+        #expect(model.canAdvance)
+        model.next()
+        #expect(model.step == 5)
+        model.back()
+        #expect(model.step == 4)
+    }
+
     @Test func supportedOnboardingWidthUsesThreeProviderColumnsAndRoomyChips() {
         #expect(OnboardingUILayout.contentWidth == 700)
         #expect(OnboardingUILayout.adaptiveColumnCount(

@@ -756,13 +756,21 @@ final class OnboardingModel {
             case .rejected:
                 guard lastRejectedSessionId != match.sessionId else { return true }
                 lastRejectedSessionId = match.sessionId
-                let transcript = try? await AlexClient(config: config)
-                    .traceTranscript(sessionId: match.sessionId)
-                let rejectedTurn = transcript?.turns.reversed().first {
+                let client = AlexClient(config: config)
+                var metadata: [TranscriptTurnMetadata] = []
+                var cursor: TranscriptCursor?
+                repeat {
+                    guard let page = try? await client.traceTranscriptPage(
+                        sessionId: match.sessionId, limit: 50, cursor: cursor)
+                    else { break }
+                    metadata.append(contentsOf: page.turns)
+                    cursor = page.nextCursor
+                    if !page.hasMore { break }
+                } while cursor != nil
+                let rejectedTurn = metadata.reversed().first {
                     ($0.status ?? 0) >= 400 || $0.error?.isEmpty == false
                 }
                 let detail = rejectedTurn?.error
-                    ?? rejectedTurn?.errorCode
                     ?? match.statusLabel
                 if case .rejected(let message) = OnboardingSupport.traceOutcome(
                     status: match.lastStatus, errorCount: match.errors, error: detail)
@@ -1681,6 +1689,15 @@ struct OnboardingView: View {
         }
     }
 
+    private var network: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intro(
+                "Network",
+                "Choose which interfaces Alex listens on. Loopback is right unless other devices need to reach this daemon.")
+            NetworkExposureSection(store: model.store)
+        }
+    }
+
     private var notifications: some View {
         VStack(alignment: .leading, spacing: 20) {
             Image(systemName: "paperplane.circle.fill").font(.system(size: 54)).foregroundStyle(AlexTheme.Colors.primary)
@@ -1950,6 +1967,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let openProviderSettings: @MainActor () -> Void
     private let openTraceBrowser: @MainActor (String?) -> Void
     private let onCompleted: @MainActor () -> Void
+
+    var orderingWindow: NSWindow? { window }
 
     init(
         store: SnapshotStore,

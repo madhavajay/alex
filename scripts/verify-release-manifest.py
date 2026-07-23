@@ -12,6 +12,8 @@ REQUIRED = {
     ("cli", "aarch64-apple-darwin"): "alex-cli-{version}-macos-aarch64.tar.gz",
     ("cli", "x86_64-apple-darwin"): "alex-cli-{version}-macos-x86_64.tar.gz",
     ("cli", "x86_64-unknown-linux-gnu"): "alex-cli-{version}-linux-x86_64.tar.gz",
+    ("cli", "x86_64-pc-windows-msvc"): "alex-cli-{version}-windows-x86_64.zip",
+    ("cli", "aarch64-pc-windows-msvc"): "alex-cli-{version}-windows-arm64.zip",
     ("cli", "x86_64-unknown-linux-musl"): "alex-x86_64-unknown-linux-musl",
     ("cli", "aarch64-unknown-linux-musl"): "alex-aarch64-unknown-linux-musl",
     ("app", "darwin-universal"): "Alex-{version}.dmg",

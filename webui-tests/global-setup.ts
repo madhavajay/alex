@@ -103,6 +103,15 @@ async function waitForTraces(baseUrl: string, localKey: string, expected: number
   throw new Error(`expected ${expected} seeded traces`);
 }
 
+async function completeWebOnboarding(baseUrl: string, localKey: string) {
+  const response = await fetch(`${baseUrl}/admin/web/onboarding`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': localKey },
+    body: JSON.stringify({ completed: true })
+  });
+  if (!response.ok) throw new Error(`web onboarding setup failed with ${response.status}: ${await response.text()}`);
+}
+
 function stop(child: ChildProcess | undefined) {
   if (!child?.pid || child.exitCode !== null) return;
   try {
@@ -159,7 +168,9 @@ export default async function globalSetup() {
     ].join('\n');
     const accounts = [
       { id: 'mock-anthropic', provider: 'anthropic', kind: 'api_key', name: 'mock', api_key: 'mock-anthropic-key', status: 'active' },
-      { id: 'mock-openai', provider: 'openai', kind: 'api_key', name: 'mock', api_key: 'mock-openai-key', status: 'active' }
+      { id: 'mock-openai', provider: 'openai', kind: 'api_key', name: 'mock', api_key: 'mock-openai-key', status: 'active' },
+      { id: 'mock-openrouter', provider: 'openrouter', kind: 'api_key', name: 'mock', api_key: 'mock-openrouter-key', status: 'active' },
+      { id: 'mock-amp', provider: 'amp', kind: 'api_key', name: 'mock', api_key: 'mock-amp-key', status: 'active' }
     ];
     const configPath = path.join(home, 'config.toml');
     await writeFile(configPath, config);
@@ -191,6 +202,7 @@ export default async function globalSetup() {
 
     for (let index = 0; index < 28; index += 1) await proxyRequest(baseUrl, localKey, index);
     await waitForTraces(baseUrl, localKey, 28);
+    await completeWebOnboarding(baseUrl, localKey);
 
     const runtime: TestRuntime = {
       baseUrl,

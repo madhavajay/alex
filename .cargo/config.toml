@@ -1,0 +1,8 @@
+# Windows main-thread stack matches the Unix 8 MiB default. The MSVC default
+# is 1 MiB, which the daemon's debug builds overflow at startup ("thread
+# 'main' has overflowed its stack" in the offline mock tier).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

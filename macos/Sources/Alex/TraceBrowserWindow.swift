@@ -6,7 +6,15 @@ import AlexCore
 @MainActor
 @Observable
 final class TraceBrowserModel {
+    typealias TranscriptPageFetcher = @Sendable (
+        _ sessionId: String, _ limit: Int, _ cursor: TranscriptCursor?
+    ) async throws -> TranscriptPageResponse
+    typealias TraceTurnFetcher = @Sendable (_ traceId: String) async throws -> TranscriptTurn
+
     private let store: SnapshotStore
+    let renderedArtifacts = RenderedArtifactCache()
+    private let transcriptPageFetcher: TranscriptPageFetcher?
+    private let traceTurnFetcher: TraceTurnFetcher?
 
     private(set) var sessions: [TraceSession] = [] {
         didSet { recomputeSessionSummary(); recomputeTranscriptSummary() }
@@ -106,6 +114,18 @@ final class TraceBrowserModel {
     private(set) var transcriptTotalCount = 0
     private(set) var transcriptTabCounts: TranscriptTabCounts?
     private var transcriptFilterTask: Task<Void, Never>?
+    private var transcriptMetadata: [TranscriptTurnMetadata] = []
+    private var expandedTurns: [String: TranscriptTurn] = [:]
+    private var turnFetchTasks: [String: Task<Void, Never>] = [:]
+    private var expandedRebuildTask: Task<Void, Never>?
+    private var turnApplyTask: Task<Void, Never>?
+    private var turnApplyGeneration = 0
+    private var forceChunkedPaneUpdate = false
+    private(set) var transcriptRendering = false
+    private(set) var lastTurnApplyBatchCharacterCounts: [Int] = []
+    private(set) var lastChatPaneBatchCharacterCounts: [Int] = []
+    private var actionTasks: [UUID: Task<Void, Never>] = [:]
+    private var metadataHiddenTurnCount = 0
 
     /// Recomputes `transcriptEntries`/`transcriptTotalCount` off the main
     /// actor. `debounce` is true for keystrokes (200ms settle) and false for
@@ -117,6 +137,7 @@ final class TraceBrowserModel {
         let turnsSnapshot = turns
         let tab = transcriptFilterTab
         let query = transcriptQuery
+        let forceIncremental = forceChunkedPaneUpdate
         transcriptFilterTask = Task { [weak self] in
             if debounce {
                 try? await Task.sleep(for: .milliseconds(200))
@@ -138,8 +159,56 @@ final class TraceBrowserModel {
                 return (filtered.entries, filtered.totalCount)
             }.value
             guard !Task.isCancelled, let self else { return }
-            self.transcriptEntries = self.mapFilterEntries(result.0, turns: turnsSnapshot)
+            let mapped = self.mapFilterEntries(result.0, turns: turnsSnapshot)
+            let characterCounts = mapped.map(Self.entryCharacterCount)
+            let ranges = TranscriptApplyPolicy.messageBatchRanges(
+                characterCounts: characterCounts,
+                forceIncremental: forceIncremental
+                    || mapped.count > TranscriptApplyPolicy.largeMessageCount)
+            self.lastChatPaneBatchCharacterCounts = []
             self.transcriptTotalCount = result.1
+            if ranges.isEmpty {
+                self.transcriptEntries = []
+            } else {
+                for range in ranges {
+                    guard !Task.isCancelled else { return }
+                    let batchChars = characterCounts[range].reduce(0, +)
+                    let interval = TraceBrowserSignpost.begin(
+                        .chatPaneUpdate,
+                        "batch_entries=\(range.count) batch_chars=\(batchChars) total_entries=\(mapped.count)")
+                    self.transcriptEntries = Array(mapped[..<range.upperBound])
+                    self.lastChatPaneBatchCharacterCounts.append(batchChars)
+                    DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
+                    if range.upperBound < mapped.count {
+                        await Task.yield()
+                        try? await Task.sleep(for: .milliseconds(1))
+                    }
+                }
+            }
+            guard !Task.isCancelled else { return }
+            self.forceChunkedPaneUpdate = false
+            self.transcriptRendering = false
+        }
+    }
+
+    private nonisolated static func entryCharacterCount(_ entry: TranscriptChatEntry) -> Int {
+        switch entry.role {
+        case .user:
+            entry.turn.user?.count ?? 0
+        case .assistant:
+            max(
+                0,
+                TranscriptApplyPolicy.inlineCharacterCount(entry.turn)
+                    - (entry.turn.user?.count ?? 0))
+        case .event:
+            min(
+                TurnTextCap.maxChars,
+                (entry.turn.attempts ?? []).reduce(0) {
+                    $0 + ($1.error?.message?.count ?? 0)
+                        + ($1.middlewareDecisions ?? []).reduce(0) {
+                            $0 + ($1.explanation?.count ?? 0)
+                        }
+                })
         }
     }
 
@@ -282,32 +351,38 @@ final class TraceBrowserModel {
 
     private var bodyCache = TraceBodyCache(capacity: 20)
 
-    func fetchTraceBody(id: String, kind: TraceBodyKind) async throws -> TraceBodyContent {
-        let key = TraceBodyCache.key(id: id, kind: kind)
+    func fetchTraceBody(
+        id: String, kind: TraceBodyKind, loadFull: Bool = false
+    ) async throws -> TraceBodyContent {
+        let key = TraceBodyCache.key(id: id, kind: kind) + (loadFull ? "|full" : "")
         if let cached = bodyCache.value(for: key) { return cached }
         guard let client = client() else {
             throw AlexClient.ClientError.http(0, "daemon unavailable")
         }
-        let content = try await client.traceBody(id: id, kind: kind)
+        let content = try await client.traceBody(
+            id: id, kind: kind, maxBytes: loadFull ? nil : AlexClient.displayBodyByteLimit)
         bodyCache.insert(content, for: key)
         return content
     }
 
-    private var toolBodyCache: [String: TraceBodyContent] = [:]
+    private var toolBodyCache = TraceBodyCache(capacity: 20)
 
     /// Captured args/result body for a tool execution (kind: "args" |
     /// "result"). Used both to backfill the Input/Output tabs when the wire
     /// arguments were empty and to drive `inspectorToolBody`. Cached per
     /// (tool id, kind) since a card can request it more than once (tab
     /// switch, reopening the inspector route).
-    func fetchToolBody(id: String, kind: String) async throws -> TraceBodyContent {
-        let key = "\(id)|\(kind)"
-        if let cached = toolBodyCache[key] { return cached }
+    func fetchToolBody(
+        id: String, kind: String, loadFull: Bool = false
+    ) async throws -> TraceBodyContent {
+        let key = "\(id)|\(kind)" + (loadFull ? "|full" : "")
+        if let cached = toolBodyCache.value(for: key) { return cached }
         guard let client = client() else {
             throw AlexClient.ClientError.http(0, "daemon unavailable")
         }
-        let content = try await client.toolBody(id: id, kind: kind)
-        toolBodyCache[key] = content
+        let content = try await client.toolBody(
+            id: id, kind: kind, maxBytes: loadFull ? nil : AlexClient.displayBodyByteLimit)
+        toolBodyCache.insert(content, for: key)
         return content
     }
 
@@ -412,26 +487,31 @@ final class TraceBrowserModel {
     func detailClient() -> AlexClient? { client() }
 
     func ensureFirstTraceDetail() {
-        guard let sid = selectedSessionId, let first = turns.first else { return }
-        let key = "\(sid)|\(first.traceId)"
+        guard let sid = selectedSessionId,
+            let traceId = transcriptMetadata.first?.traceId ?? turns.first?.traceId
+        else { return }
+        let key = "\(sid)|\(traceId)"
         guard key != firstDetailKey else { return }
         firstDetailKey = key
         firstTraceDetail = nil
         firstDetailTask?.cancel()
         firstDetailTask = Task { [weak self] in
             guard let client = self?.client() else { return }
-            guard let detail = try? await client.traceDetail(id: first.traceId) else { return }
+            guard let detail = try? await client.traceDetail(id: traceId) else { return }
             guard !Task.isCancelled, let self, self.firstDetailKey == key else { return }
             self.firstTraceDetail = detail
         }
     }
 
     func revealSessionBodies(_ session: TraceSession) {
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             var bodyPath: String?
-            if let last = try? await client.traceTranscript(sessionId: session.sessionId).turns.last,
-                let detail = try? await client.traceDetail(id: last.traceId) {
+            if let last = try? await allTranscriptMetadata(
+                client: client, sessionId: session.sessionId).last,
+                let detail = try? await client.traceDetail(id: last.traceId)
+            {
                 bodyPath = detail.trace.reqBodyPath
                     ?? detail.trace.respBodyPath ?? detail.trace.upstreamReqBodyPath
             }
@@ -445,8 +525,14 @@ final class TraceBrowserModel {
         }
     }
 
-    init(store: SnapshotStore, initialHarness: String? = nil, initialQuery: String? = nil) {
+    init(
+        store: SnapshotStore, initialHarness: String? = nil, initialQuery: String? = nil,
+        transcriptPageFetcher: TranscriptPageFetcher? = nil,
+        traceTurnFetcher: TraceTurnFetcher? = nil
+    ) {
         self.store = store
+        self.transcriptPageFetcher = transcriptPageFetcher
+        self.traceTurnFetcher = traceTurnFetcher
         if let initialQuery, !initialQuery.isEmpty {
             queryText = initialQuery
             parsedQuery = OmniQuery.parse(queryText)
@@ -697,12 +783,7 @@ final class TraceBrowserModel {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        transcriptTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.pollTranscript()
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-        }
+        startTranscriptPolling()
         // `stop()` cancels any in-flight search when an existing window is
         // reopened. Re-apply the current query so initial/preset key filters
         // always populate their server-backed session id set.
@@ -714,6 +795,16 @@ final class TraceBrowserModel {
         sessionsTask = nil
         transcriptTask?.cancel()
         transcriptTask = nil
+        turnFetchTasks.values.forEach { $0.cancel() }
+        turnFetchTasks.removeAll()
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = nil
+        turnApplyTask?.cancel()
+        turnApplyTask = nil
+        turnApplyGeneration += 1
+        actionTasks.values.forEach { $0.cancel() }
+        actionTasks.removeAll()
+        renderedArtifacts.clear()
         searchTask?.cancel()
         searchTask = nil
         renderChain?.cancel()
@@ -748,10 +839,24 @@ final class TraceBrowserModel {
         recomputeTranscriptSummary()
         resetTurns()
         setUserAtBottom(true)
-        Task { await pollTranscript() }
+        startTranscriptPolling()
     }
 
     private func resetTurns() {
+        turnFetchTasks.values.forEach { $0.cancel() }
+        turnFetchTasks.removeAll()
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = nil
+        turnApplyTask?.cancel()
+        turnApplyTask = nil
+        turnApplyGeneration += 1
+        forceChunkedPaneUpdate = false
+        transcriptRendering = false
+        lastTurnApplyBatchCharacterCounts = []
+        lastChatPaneBatchCharacterCounts = []
+        transcriptMetadata = []
+        expandedTurns = [:]
+        metadataHiddenTurnCount = 0
         allTurns = []
         turns = []
         transcriptLoadedSessionId = nil
@@ -782,6 +887,13 @@ final class TraceBrowserModel {
     }
 
     func loadEarlierTurns() {
+        if let first = transcriptMetadata.firstIndex(where: { expandedTurns[$0.traceId] != nil }),
+            first > 0
+        {
+            requestTurnWindow(
+                indices: max(0, first - TranscriptApplyPolicy.earlierTurnPageCount)..<first)
+            return
+        }
         windowMaxTurns += TranscriptWindow.defaultMaxTurns
         renderState = nil
         scheduleRender()
@@ -823,7 +935,7 @@ final class TraceBrowserModel {
                     .browser, "transcript windowed: showing \(windowed.count)/\(all.count) turns")
             }
         }
-        hiddenTurnCount = windowStart
+        hiddenTurnCount = metadataHiddenTurnCount + windowStart
         guard plan != .unchanged else { return }
         renderState = TranscriptRender.state(for: windowed, rawMode: rawMode)
         let slice: [TranscriptTurn]
@@ -859,12 +971,16 @@ final class TraceBrowserModel {
             await prev?.value
             let built = await Task.detached { () -> BuiltDocument in
                 let start = ContinuousClock.now
+                let interval = TraceBrowserSignpost.begin(
+                    .transcriptRenderBuild,
+                    "turns=\(slice.count) first=\(firstNumber) raw=\(rawMode)")
                 let doc = TranscriptRender.build(
                     turns: slice, firstTurnNumber: firstNumber, harnessName: harnessName,
                     icons: icons, rawMode: rawMode, fontScale: fontScale)
                 let elapsed = start.duration(to: .now)
                 let ms = Int(elapsed.components.seconds * 1000)
                     + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
+                TraceBrowserSignpost.end(interval, "chars=\(doc.text.length)")
                 return BuiltDocument(doc: doc, ms: ms)
             }.value
             let (doc, ms) = (built.doc, built.ms)
@@ -898,6 +1014,40 @@ final class TraceBrowserModel {
         // poll, directly on the main actor.
         guard let cfg = store.config else { return nil }
         return AlexClient(config: cfg)
+    }
+
+    private func launchAction(_ operation: @escaping @MainActor () async -> Void) {
+        let id = UUID()
+        actionTasks[id] = Task { [weak self] in
+            await operation()
+            self?.actionTasks[id] = nil
+        }
+    }
+
+    private func allTranscriptMetadata(
+        client: AlexClient, sessionId: String
+    ) async throws -> [TranscriptTurnMetadata] {
+        var output: [TranscriptTurnMetadata] = []
+        var cursor: TranscriptCursor?
+        repeat {
+            let page = try await client.traceTranscriptPage(
+                sessionId: sessionId, limit: 50, cursor: cursor)
+            try Task.checkCancellation()
+            output.append(contentsOf: page.turns)
+            cursor = page.nextCursor
+            if !page.hasMore { break }
+        } while cursor != nil
+        return output
+    }
+
+    private func startTranscriptPolling() {
+        transcriptTask?.cancel()
+        transcriptTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollTranscript()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
     }
 
     private func pollSessions() async {
@@ -954,19 +1104,9 @@ final class TraceBrowserModel {
         selectFromFollow(candidate.id)
     }
 
-    var newerActivityRow: SessionRow? {
-        guard let selected = selectedSession, let newest = newestVisibleRow else { return nil }
-        guard LiveFollow.newerActivity(
-            live: !pinned, selectedId: selected.sessionId,
-            selectedLastTsMs: selected.lastTsMs,
-            newestId: newest.id, newestLastTsMs: newest.lastTsMs)
-        else { return nil }
-        return newest
-    }
-
     private func pollTranscript() async {
         guard let sid = selectedSessionId else { return }
-        guard let client = client() else {
+        guard transcriptPageFetcher != nil || client() != nil else {
             daemonDown = true
             transcriptLoading = false
             transcriptUnreachable = true
@@ -984,22 +1124,49 @@ final class TraceBrowserModel {
             }
         }
         do {
-            let resp = try await client.traceTranscript(sessionId: sid, limit: 500)
-            daemonDown = false
-            guard resp.sessionId == selectedSessionId else { return }
-            transcriptLoadedSessionId = sid
-            transcriptLoading = false
-            transcriptUnreachable = false
-            transcriptTabCounts = resp.tabCounts
-            let fingerprint = TraceFingerprint.turns(resp.turns)
-            if fingerprint != turnsFingerprint {
-                turnsFingerprint = fingerprint
-                BarLog.measure(.browser, label: "transcript apply \(sid) turns=\(resp.turns.count)") {
-                    allTurns = resp.turns
+            var fetched: [TranscriptTurnMetadata] = []
+            var cursor: TranscriptCursor?
+            repeat {
+                let page: TranscriptPageResponse
+                if let transcriptPageFetcher {
+                    page = try await transcriptPageFetcher(sid, 50, cursor)
+                } else if let client = client() {
+                    page = try await client.traceTranscriptPage(
+                        sessionId: sid, limit: 50, cursor: cursor)
+                } else {
+                    return
                 }
-                applyTurnFilter()
-                ensureFirstTraceDetail()
+                try Task.checkCancellation()
+                guard page.sessionId == sid, selectedSessionId == sid else { return }
+                fetched.append(contentsOf: page.turns)
+                cursor = page.nextCursor
+                if !page.hasMore { break }
+            } while cursor != nil
+            daemonDown = false
+            guard selectedSessionId == sid else { return }
+            let previous = Dictionary(uniqueKeysWithValues: transcriptMetadata.map {
+                ($0.traceId, $0)
+            })
+            let changed = Set(fetched.compactMap { metadata in
+                previous[metadata.traceId] == metadata ? nil : metadata.traceId
+            })
+            let validIds = Set(fetched.map(\.traceId))
+            expandedTurns = expandedTurns.filter { validIds.contains($0.key) }
+            transcriptMetadata = fetched
+            transcriptLoadedSessionId = sid
+            transcriptLoading = !fetched.isEmpty
+            transcriptUnreachable = false
+            transcriptTabCounts = nil
+            if fetched.isEmpty {
+                rebuildExpandedTurns()
+                return
             }
+            let start = max(0, fetched.count - TranscriptApplyPolicy.initialTurnCount)
+            requestTurnWindow(indices: start..<fetched.count)
+            for traceId in changed where expandedTurns[traceId] != nil {
+                requestTurn(traceId: traceId, sessionId: sid, replacing: true)
+            }
+            ensureFirstTraceDetail()
         } catch {
             guard !(error is CancellationError) else { return }
             daemonDown = true
@@ -1008,8 +1175,86 @@ final class TraceBrowserModel {
         }
     }
 
-    func retrySessions() { Task { await pollSessions() } }
-    func retryTranscript() { Task { await pollTranscript() } }
+    func retrySessions() { launchAction { [weak self] in await self?.pollSessions() } }
+    func retryTranscript() { startTranscriptPolling() }
+
+    func transcriptTurnBecameVisible(_ traceId: String) {
+        guard !userAtBottom else { return }
+        guard let index = transcriptMetadata.firstIndex(where: { $0.traceId == traceId }) else {
+            return
+        }
+        requestTurnWindow(
+            indices: max(0, index - TranscriptApplyPolicy.earlierTurnPageCount)..<index)
+    }
+
+    private func requestTurnWindow(indices: Range<Int>) {
+        guard let sid = selectedSessionId else { return }
+        for index in indices where transcriptMetadata.indices.contains(index) {
+            requestTurn(traceId: transcriptMetadata[index].traceId, sessionId: sid)
+        }
+    }
+
+    private func requestTurn(traceId: String, sessionId: String, replacing: Bool = false) {
+        if !replacing, expandedTurns[traceId] != nil { return }
+        turnFetchTasks[traceId]?.cancel()
+        turnFetchTasks[traceId] = Task { [weak self] in
+            guard let self else { return }
+            let interval = TraceBrowserSignpost.begin(.turnFetch, "trace_id=\(traceId)")
+            var fetchEnded = false
+            do {
+                let turn: TranscriptTurn
+                let byteCount: Int
+                if let traceTurnFetcher {
+                    turn = try await traceTurnFetcher(traceId)
+                    byteCount = (try? JSONEncoder().encode(turn).count) ?? 0
+                } else if let client = client() {
+                    let payload = try await client.traceTurnPayload(id: traceId)
+                    turn = payload.turn
+                    byteCount = payload.byteCount
+                } else {
+                    TraceBrowserSignpost.end(interval, "bytes=0 unavailable=true")
+                    return
+                }
+                TraceBrowserSignpost.end(interval, "bytes=\(byteCount)")
+                fetchEnded = true
+                try Task.checkCancellation()
+                guard selectedSessionId == sessionId, turn.traceId == traceId else { return }
+                expandedTurns[traceId] = turn
+                turnFetchTasks[traceId] = nil
+                scheduleExpandedRebuild()
+            } catch is CancellationError {
+                if !fetchEnded { TraceBrowserSignpost.end(interval, "cancelled=true") }
+                turnFetchTasks[traceId] = nil
+            } catch {
+                if !fetchEnded { TraceBrowserSignpost.end(interval, "error=true") }
+                turnFetchTasks[traceId] = nil
+                guard selectedSessionId == sessionId else { return }
+                transcriptUnreachable = true
+            }
+        }
+    }
+
+    private func scheduleExpandedRebuild() {
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(15))
+            guard !Task.isCancelled else { return }
+            self?.rebuildExpandedTurns()
+        }
+    }
+
+    private func rebuildExpandedTurns() {
+        let loaded = transcriptMetadata.compactMap { expandedTurns[$0.traceId] }
+        allTurns = loaded
+        if let first = transcriptMetadata.firstIndex(where: { expandedTurns[$0.traceId] != nil }) {
+            metadataHiddenTurnCount = first
+        } else {
+            metadataHiddenTurnCount = transcriptMetadata.count
+        }
+        transcriptLoading = !transcriptMetadata.isEmpty && loaded.isEmpty
+        turnsFingerprint = TraceFingerprint.turns(loaded)
+        applyTurnFilter()
+    }
 
     private func queryChanged() {
         searchTask?.cancel()
@@ -1040,10 +1285,84 @@ final class TraceBrowserModel {
             ? allTurns
             : allTurns.filter(parsedQuery.matches)
         defer { retargetInspector() }
-        guard filtered != turns else { return }
-        turns = filtered
-        renderState = nil
+        turnApplyTask?.cancel()
+        turnApplyGeneration += 1
+        let generation = turnApplyGeneration
+        let requiresIncremental = TranscriptApplyPolicy.requiresIncrementalApply(filtered)
+        transcriptRendering = !filtered.isEmpty && requiresIncremental
+        forceChunkedPaneUpdate = requiresIncremental
+        turnApplyTask = Task { [weak self] in
+            let capped = await Task.detached(priority: .userInitiated) {
+                filtered.map(TranscriptInlineDisplay.capped)
+            }.value
+            guard let self, !Task.isCancelled, generation == self.turnApplyGeneration else {
+                return
+            }
+            if capped == self.turns {
+                self.transcriptRendering = false
+                self.forceChunkedPaneUpdate = false
+                return
+            }
+            self.lastTurnApplyBatchCharacterCounts = []
+            guard requiresIncremental else {
+                self.commitDisplayTurns(
+                    capped,
+                    batchChars: capped.reduce(0) {
+                        $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+                    }, resetRenderState: true)
+                return
+            }
+            let existing = self.turns
+            let prepending = !existing.isEmpty
+                && capped.count >= existing.count
+                && Array(capped.suffix(existing.count)) == existing
+            let appending = capped.count >= existing.count
+                && Array(capped.prefix(existing.count)) == existing
+            var applied = appending || prepending ? existing : []
+            let pending: [TranscriptTurn]
+            if appending {
+                pending = Array(capped.dropFirst(existing.count))
+            } else if prepending {
+                pending = Array(capped.dropLast(existing.count))
+            } else {
+                pending = capped
+            }
+            let batches = TranscriptApplyPolicy.turnBatches(pending)
+            let orderedBatches = prepending ? Array(batches.reversed()) : batches
+            for batch in orderedBatches {
+                guard !Task.isCancelled, generation == self.turnApplyGeneration else { return }
+                if prepending {
+                    applied.insert(contentsOf: batch, at: 0)
+                } else {
+                    applied.append(contentsOf: batch)
+                }
+                self.commitDisplayTurns(
+                    applied,
+                    batchChars: batch.reduce(0) {
+                        $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+                    }, resetRenderState: prepending || (!appending && applied.count == batch.count))
+                if applied.count < capped.count {
+                    await Task.yield()
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+            }
+        }
+    }
+
+    private func commitDisplayTurns(
+        _ value: [TranscriptTurn], batchChars: Int, resetRenderState: Bool
+    ) {
+        let totalChars = value.reduce(0) {
+            $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+        }
+        let interval = TraceBrowserSignpost.begin(
+            .transcriptApply,
+            "turns=\(value.count) total_chars=\(totalChars) batch_chars=\(batchChars)")
+        turns = value
+        lastTurnApplyBatchCharacterCounts.append(batchChars)
+        if resetRenderState { renderState = nil }
         scheduleRender()
+        DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
     }
 
     private func runSearch(_ query: OmniQuery) async {
@@ -1110,7 +1429,7 @@ final class TraceBrowserModel {
             showSimulationNotice("Cannot simulate: no session id")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Simulation failed: daemon unavailable")
@@ -1133,7 +1452,7 @@ final class TraceBrowserModel {
             showSimulationNotice("Cannot clear: no session id")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Clear failed: daemon unavailable")
@@ -1171,15 +1490,16 @@ final class TraceBrowserModel {
             showSimulationNotice("Fixture name is required")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Save failed: daemon unavailable")
                 return
             }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                guard let errorTrace = transcript.turns.reversed().first(where: {
+                let metadata = try await self.allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                guard let errorTrace = metadata.reversed().first(where: {
                     TraceClassification.isError(
                         status: $0.status, errorKind: $0.errorKind, error: $0.error)
                 }) else {
@@ -1212,7 +1532,7 @@ final class TraceBrowserModel {
             showSimulationNotice("This rejected credential cannot be safely approved")
             return
         }
-        Task { [weak self] in
+        launchAction { [weak self] in
             guard let self else { return }
             guard let client = self.client() else {
                 self.showSimulationNotice("Approval failed: daemon unavailable")
@@ -1232,11 +1552,13 @@ final class TraceBrowserModel {
     }
 
     func copyLastReply(_ session: TraceSession) {
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
-                guard let last = transcript.turns.last else { return }
+                let metadata = try await allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                guard let last = metadata.last else { return }
                 let markdown = try await client.traceReplyMarkdown(traceId: last.traceId)
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(markdown, forType: .string)
@@ -1252,12 +1574,19 @@ final class TraceBrowserModel {
         panel.allowedContentTypes = [.init(filenameExtension: "md") ?? .plainText]
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let dest = panel.url else { return }
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             do {
-                let transcript = try await client.traceTranscript(sessionId: session.sessionId)
+                let metadata = try await allTranscriptMetadata(
+                    client: client, sessionId: session.sessionId)
+                var turns: [TranscriptTurn] = []
+                for item in metadata {
+                    turns.append(try await client.traceTurn(id: item.traceId))
+                    try Task.checkCancellation()
+                }
                 let markdown = Self.exportMarkdown(
-                    sessionId: session.sessionId, turns: transcript.turns)
+                    sessionId: session.sessionId, turns: turns)
                 try markdown.write(to: dest, atomically: true, encoding: .utf8)
             } catch {
                 NSSound.beep()
@@ -1333,7 +1662,8 @@ final class TraceBrowserModel {
         // scrolls back to row 0 every time.
         let anchorId = Self.nearestSurvivor(deletedIds: deletedIds, in: visibleRows)
 
-        Task {
+        launchAction { [weak self] in
+            guard let self else { return }
             guard let client = client() else { return }
             var completedSessionIds = Set<String>()
             var deletionFailures = 0
@@ -1344,9 +1674,9 @@ final class TraceBrowserModel {
                 while true {
                     let ids: Set<String>
                     do {
-                        let transcript = try await client.traceTranscript(
-                            sessionId: session.sessionId)
-                        ids = Set(transcript.turns.map(\.traceId))
+                        let metadata = try await allTranscriptMetadata(
+                            client: client, sessionId: session.sessionId)
+                        ids = Set(metadata.map(\.traceId))
                     } catch {
                         transcriptFailures += 1
                         break
@@ -1539,24 +1869,29 @@ struct TraceBrowserView: View {
                                 SplitStore.saveLeftWidth(width)
                             }
                         })
+                    .background(DefaultArrowCursorRegion())
                 TranscriptView(model: model)
                     .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
+                    .background(DefaultArrowCursorRegion())
                 if model.detailsVisible {
                     if let route = model.inspectorToolBody {
                         ToolBodyInspectorView(route: route, model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     } else if let traceId = model.inspectorTraceId {
                         TraceInspectorView(traceId: traceId, model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     } else {
                         TraceInspectorPlaceholderView(model: model)
                             .frame(
                                 minWidth: 300, idealWidth: 340, maxWidth: 520,
                                 maxHeight: .infinity)
+                            .background(DefaultArrowCursorRegion())
                     }
                 }
             }
@@ -1663,6 +1998,34 @@ struct TraceBrowserView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(.orange.opacity(0.12))
+    }
+}
+
+/// SwiftUI's macOS `HSplitView` can install a resize cursor rect that extends
+/// beyond its divider after the hosted panes are resized. Giving each pane an
+/// explicit arrow cursor rect lets AppKit's more-specific controls (including
+/// links) keep their own cursors while leaving only the uncovered divider hit
+/// areas with the split view's resize cursor.
+private struct DefaultArrowCursorRegion: NSViewRepresentable {
+    func makeNSView(context: Context) -> CursorRegionView { CursorRegionView() }
+
+    func updateNSView(_ nsView: CursorRegionView, context: Context) {
+        nsView.window?.invalidateCursorRects(for: nsView)
+    }
+
+    final class CursorRegionView: NSView {
+        private static let dividerHotZoneInset: CGFloat = 4
+
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            addCursorRect(
+                bounds.insetBy(dx: Self.dividerHotZoneInset, dy: 0), cursor: .arrow)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            window?.invalidateCursorRects(for: self)
+        }
     }
 }
 
@@ -1881,7 +2244,8 @@ private struct SessionListView: View {
             secondaryColumns
         }
         .contextMenu(forSelectionType: SessionRow.ID.self) { ids in
-            let selected = model.sessions.filter { ids.contains($0.sessionId) }
+            let selected = SessionContextMenuSelection.resolve(
+                ids: ids, fallbackIds: model.multiSelection, sessions: model.sessions)
             if selected.count > 1 {
                 bulkContextMenu(selected)
             } else if let session = selected.first {
@@ -2132,19 +2496,34 @@ private struct SessionListView: View {
             Button("Save as fixture…") { model.promptSaveFixture(from: session) }
         }
         Divider()
-        Button {
-            model.copyForkCommand(session)
-        } label: {
-            Label("Fork session with…", systemImage: "doc.on.doc")
+        // A data-driven group avoids the macOS Table context-menu bridge
+        // truncating a large heterogeneous ViewBuilder tuple. Keep every
+        // standard single-session command in this one flattened group.
+        ForEach(SessionContextMenuAction.standard) { action in
+            contextMenuItem(action, session: session, hasSessionId: hasSessionId)
         }
-        .disabled(!hasSessionId)
-        Button("Copy Session ID") { model.copySessionId(session) }
-        Button("Copy Last Reply as Markdown") { model.copyLastReply(session) }
-        Button("Export Session…") { model.exportSession(session) }
-        Button("Reveal Bodies in Finder") { model.revealSessionBodies(session) }
-        Divider()
-        Button("Delete Session's Traces…", role: .destructive) {
-            model.deleteSessionTraces(session)
+    }
+
+    @ViewBuilder
+    private func contextMenuItem(
+        _ action: SessionContextMenuAction, session: TraceSession, hasSessionId: Bool
+    ) -> some View {
+        switch action {
+        case .fork:
+            Button(action.title) { model.copyForkCommand(session) }
+                .disabled(!hasSessionId)
+        case .copySessionId:
+            Button(action.title) { model.copySessionId(session) }
+        case .copyLastReply:
+            Button(action.title) { model.copyLastReply(session) }
+        case .export:
+            Button(action.title) { model.exportSession(session) }
+        case .revealBodies:
+            Button(action.title) { model.revealSessionBodies(session) }
+        case .destructiveDivider:
+            Divider()
+        case .delete:
+            Button(action.title, role: .destructive) { model.deleteSessionTraces(session) }
         }
     }
 
@@ -2159,6 +2538,45 @@ private struct SessionListView: View {
         Button("Delete \(selected.count) Sessions' Traces…", role: .destructive) {
             model.deleteSelectedSessions()
         }
+    }
+}
+
+enum SessionContextMenuAction: String, CaseIterable, Identifiable {
+    case fork
+    case copySessionId
+    case copyLastReply
+    case export
+    case revealBodies
+    case destructiveDivider
+    case delete
+
+    var id: Self { self }
+
+    static let standard = allCases
+
+    var title: String {
+        switch self {
+        case .fork: "Fork session with…"
+        case .copySessionId: "Copy Session ID"
+        case .copyLastReply: "Copy Last Reply as Markdown"
+        case .export: "Export Session…"
+        case .revealBodies: "Reveal Bodies in Finder"
+        case .destructiveDivider: ""
+        case .delete: "Delete Session's Traces…"
+        }
+    }
+}
+
+enum SessionContextMenuSelection {
+    static func resolve(
+        ids: Set<String>, fallbackIds: Set<String>, sessions: [TraceSession]
+    ) -> [TraceSession] {
+        let requested = ids.isEmpty ? fallbackIds : ids
+        guard !requested.isEmpty else { return [] }
+        let byId = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0) })
+        let resolved = requested.sorted().compactMap { byId[$0] }
+        if !resolved.isEmpty || requested == fallbackIds { return resolved }
+        return fallbackIds.sorted().compactMap { byId[$0] }
     }
 }
 
@@ -2399,23 +2817,19 @@ private struct TranscriptView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
-                VStack(spacing: 6) {
-                    if let newer = model.newerActivityRow {
-                        Button {
-                            model.selectFromFollow(newer.id)
-                        } label: {
-                            Label(
-                                "newer activity — \(newer.sessionShort)",
-                                systemImage: "bolt.fill")
-                                .font(.system(size: 11, weight: .medium))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Capsule().fill(.thinMaterial))
-                                .overlay(Capsule().strokeBorder(.quaternary))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Switch to the session with newer activity")
+                if model.transcriptRendering, !model.turns.isEmpty {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("rendering…")
                     }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.regularMaterial))
+                    .padding(.bottom, 48)
+                }
+                VStack(spacing: 6) {
                     if !model.userAtBottom, !model.turns.isEmpty {
                         Button {
                             model.setUserAtBottom(true)
@@ -2672,7 +3086,8 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
     ///   already holds a `TraceBrowserWindowController`: pass the session id
     ///   here instead of calling `show(harness:)` alone.
     func show(
-        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil
+        harness: String? = nil, query: String? = nil, selectSessionId: String? = nil,
+        above relativeWindow: NSWindow? = nil
     ) {
         if window == nil {
             let model = TraceBrowserModel(
@@ -2727,6 +3142,17 @@ final class TraceBrowserWindowController: NSObject, NSWindowDelegate {
         if let window {
             DockIconManager.shared.track(window)
             window.makeKeyAndOrderFront(nil)
+            if let relativeWindow, relativeWindow.isVisible {
+                window.order(.above, relativeTo: relativeWindow.windowNumber)
+                // The originating button can make its window key again as
+                // AppKit finishes dispatching the click. Reassert on the next
+                // run-loop turn so the browser remains visibly in front.
+                DispatchQueue.main.async { [weak window, weak relativeWindow] in
+                    guard let window, let relativeWindow, relativeWindow.isVisible else { return }
+                    window.makeKeyAndOrderFront(nil)
+                    window.order(.above, relativeTo: relativeWindow.windowNumber)
+                }
+            }
             NSApp.activate(ignoringOtherApps: true)
         }
     }

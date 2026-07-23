@@ -14,5 +14,6 @@ export { expect };
 
 export async function openUi(page: Page, runtime: TestRuntime) {
   await page.goto(`${runtime.baseUrl}/ui`);
-  await expect(page.locator('#daemon-status')).toContainText('Daemon ');
+  await expect(page.locator('#app-shell')).toBeVisible();
+  await expect(page.locator('#daemon-status')).toContainText('Online');
 }

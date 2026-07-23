@@ -69,6 +69,7 @@ pub const CLIPROXYAPI_REVERSE_CAPABILITIES: &[&str] = &[
     "trace-correlation",
 ];
 const ALEX_ROUTE_CHAIN_HEADER: &str = "x-alex-route-chain";
+const ALEX_PING_ACCOUNT_HEADER: &str = "x-alex-ping-account";
 
 /// Cross-model substitution is deliberately opt-in. Same-provider account
 /// failover is independent of this setting and remains enabled by default.
@@ -682,6 +683,7 @@ pub struct AppState {
     pub anthropic_usage: std::sync::Mutex<UsageCache>,
     pub xai_usage: std::sync::Mutex<UsageCache>,
     pub amp_usage: std::sync::Mutex<UsageCache>,
+    pub openrouter_usage: std::sync::Mutex<UsageCache>,
     /// Backoff guard for on-demand Kimi `/usages` probes triggered from the
     /// limits snapshot (the recorded routing-limits act as the value cache).
     pub kimi_usage: std::sync::Mutex<UsageCache>,
@@ -724,9 +726,163 @@ pub struct AppState {
     middleware_leases: std::sync::Mutex<HashMap<String, middleware::MiddlewareRouteLease>>,
     fixture_dir: std::sync::RwLock<Option<PathBuf>>,
     pending_injections: std::sync::Mutex<HashMap<String, Vec<PendingInjection>>>,
+    transcript_cache: std::sync::Mutex<TranscriptCache>,
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
+    /// Daemon-configured low-cost models used by both scheduled heartbeats and
+    /// user-requested credential tests from the Web UI.
+    ping_models: std::sync::RwLock<PingModels>,
+    /// Keep manual tests serialized: each one can make a real billed provider
+    /// request and update shared account-health state.
+    credential_test_lock: tokio::sync::Mutex<()>,
+    /// Password-backed browser access. The password hash is persisted beside
+    /// the daemon store; bearer session material exists only in memory.
+    web_auth: WebAuthState,
+}
+
+const WEB_SESSION_COOKIE: &str = "alex_web_session";
+const WEB_SESSION_TTL_S: i64 = 12 * 60 * 60;
+const WEB_LOGIN_WINDOW_MS: i64 = 60_000;
+const WEB_LOGIN_MAX_FAILURES: usize = 8;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WebAuthConfig {
+    #[serde(default)]
+    password_hash: Option<String>,
+    #[serde(default)]
+    onboarding_completed: bool,
+    /// SHA-256(session token) -> expiry ms. Persisted so browser sessions
+    /// survive daemon restarts; raw tokens are never stored.
+    #[serde(default)]
+    sessions: HashMap<String, i64>,
+}
+
+#[derive(Debug, Default)]
+struct WebAuthState {
+    path: PathBuf,
+    config: std::sync::RwLock<WebAuthConfig>,
+    /// SHA-256(session token) -> expiry. Raw bearer tokens are never retained.
+    sessions: std::sync::Mutex<HashMap<String, i64>>,
+    failed_logins: std::sync::Mutex<HashMap<String, Vec<i64>>>,
+}
+
+impl WebAuthState {
+    fn load(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("web-auth.json");
+        let config = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(path = %path.display(), "failed to parse web auth settings: {error}");
+                    WebAuthConfig::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => WebAuthConfig::default(),
+            Err(error) => {
+                tracing::error!(path = %path.display(), "failed to read web auth settings: {error}");
+                WebAuthConfig::default()
+            }
+        };
+        Self {
+            path,
+            sessions: std::sync::Mutex::new(
+                config
+                    .sessions
+                    .iter()
+                    .filter(|(_, expires_at_ms)| **expires_at_ms > now_ms())
+                    .map(|(hash, expires_at_ms)| (hash.clone(), *expires_at_ms))
+                    .collect(),
+            ),
+            config: std::sync::RwLock::new(config),
+            failed_logins: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Write the current in-memory session hashes into the persisted config.
+    /// Best-effort: cookie sessions still work in memory if the write fails.
+    fn persist_sessions(&self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let config = {
+            let mut guard = self
+                .config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.sessions = sessions;
+            guard.clone()
+        };
+        if let Err(error) = self.persist(&config) {
+            tracing::warn!("could not persist web sessions: {error}");
+        }
+    }
+
+    fn persist(&self, config: &WebAuthConfig) -> std::result::Result<(), String> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "web auth path has no parent".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let temp = self
+            .path
+            .with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec_pretty(config).map_err(|error| error.to_string())?;
+        std::fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Err(error) = std::fs::rename(&temp, &self.path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn authenticated(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = web_session_token(headers) else {
+            return false;
+        };
+        let token_hash = key_hash_hex(token);
+        let now = now_ms();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.retain(|_, expires_at_ms| *expires_at_ms > now);
+        sessions
+            .get(&token_hash)
+            .is_some_and(|expires_at_ms| *expires_at_ms > now)
+    }
+
+    fn create_session(&self) -> String {
+        use base64::Engine;
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key_hash_hex(&token), now_ms() + WEB_SESSION_TTL_S * 1_000);
+        self.persist_sessions();
+        token
+    }
+
+    fn remove_session(&self, headers: &HeaderMap) {
+        if let Some(token) = web_session_token(headers) {
+            self.sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key_hash_hex(token));
+            self.persist_sessions();
+        }
+    }
 }
 
 impl AppState {
@@ -1078,6 +1234,7 @@ pub fn build_state_with_substitution(
         anthropic_usage: std::sync::Mutex::new(UsageCache::default()),
         xai_usage: std::sync::Mutex::new(UsageCache::default()),
         amp_usage: std::sync::Mutex::new(UsageCache::default()),
+        openrouter_usage: std::sync::Mutex::new(UsageCache::default()),
         kimi_usage: std::sync::Mutex::new(UsageCache::default()),
         openrouter_models: std::sync::Mutex::new(Vec::new()),
         openrouter_exposed: std::sync::RwLock::new(default_openrouter_exposed_models()),
@@ -1116,7 +1273,11 @@ pub fn build_state_with_substitution(
         middleware_leases: std::sync::Mutex::new(middleware_leases),
         fixture_dir: std::sync::RwLock::new(None),
         pending_injections: std::sync::Mutex::new(HashMap::new()),
+        transcript_cache: std::sync::Mutex::new(TranscriptCache::new(512)),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
+        ping_models: std::sync::RwLock::new(PingModels::default()),
+        credential_test_lock: tokio::sync::Mutex::new(()),
+        web_auth: WebAuthState::load(&store.data_dir),
     })
 }
 
@@ -1247,6 +1408,14 @@ pub fn set_protection_policy_persister(
 pub fn set_exo_config(state: &Arc<AppState>, config: ExoConfig) {
     if let Ok(mut slot) = state.exo.write() {
         *slot = config;
+    }
+}
+
+/// Replaces the low-cost models used by scheduled and user-requested provider
+/// probes. The CLI owns these values because they are part of daemon config.
+pub fn set_ping_models(state: &Arc<AppState>, models: PingModels) {
+    if let Ok(mut slot) = state.ping_models.write() {
+        *slot = models;
     }
 }
 
@@ -1780,11 +1949,10 @@ pub fn parse_kimi_usage_payload(payload: &Value) -> Value {
 
 /// Fetch and record Kimi usage for the active account. Returns a short human
 /// summary for the health line. Degrades gracefully when usage is unavailable.
-async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, String) {
-    let account = match state.vault.account_for(Provider::Kimi, true).await {
-        Ok(account) => account,
-        Err(e) => return (false, None, e.to_string()),
-    };
+async fn kimi_usage_probe_for_account(
+    state: &Arc<AppState>,
+    account: &Account,
+) -> (bool, Option<String>, String) {
     let Some(token) = account.access_token.clone() else {
         return (
             false,
@@ -1842,6 +2010,14 @@ async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, Strin
             format!("usage endpoint unreachable: {e}"),
         ),
     }
+}
+
+async fn kimi_usage_probe(state: &Arc<AppState>) -> (bool, Option<String>, String) {
+    let account = match state.vault.account_for(Provider::Kimi, true).await {
+        Ok(account) => account,
+        Err(e) => return (false, None, e.to_string()),
+    };
+    kimi_usage_probe_for_account(state, &account).await
 }
 
 fn exo_model_enabled(state: &AppState, model: &str) -> bool {
@@ -1963,18 +2139,277 @@ pub fn set_reset_handler(state: &Arc<AppState>, handler: Arc<dyn ResetHandler>) 
     }
 }
 
+fn web_session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == WEB_SESSION_COOKIE).then_some(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn local_admin_key_valid(state: &AppState, headers: &HeaderMap) -> bool {
+    client_key(headers)
+        .map(|provided| {
+            state
+                .local_key
+                .read()
+                .map(|expected| provided == *expected)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Shared authentication boundary for daemon-owned admin routers that are
+/// merged outside this crate (for example harness configuration routes).
+pub fn admin_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    local_admin_key_valid(state, headers) || state.web_auth.authenticated(headers)
+}
+
+fn web_session_cookie(token: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{WEB_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={WEB_SESSION_TTL_S}"
+    ))
+    .expect("random web session token is a valid cookie value")
+}
+
+fn clear_web_session_cookie() -> HeaderValue {
+    HeaderValue::from_static("alex_web_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+}
+
+async fn web_auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let config = state
+        .web_auth
+        .config
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    axum::Json(json!({
+        "password_configured": config.password_hash.is_some(),
+        "onboarding_completed": config.onboarding_completed,
+        "authenticated": local_admin_key_valid(&state, &headers)
+            || state.web_auth.authenticated(&headers),
+        "session_ttl_seconds": WEB_SESSION_TTL_S,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WebLoginRequest {
+    password: String,
+}
+
+async fn web_auth_login(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebLoginRequest>,
+) -> Response {
+    // Axum's connect-info extension is not present in every embedding (notably
+    // Router unit tests), so keep the small anti-bruteforce window global.
+    let client_id = "web-login".to_string();
+    let now = now_ms();
+    {
+        let mut attempts = state
+            .web_auth
+            .failed_logins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recent = attempts.entry(client_id.clone()).or_default();
+        recent.retain(|timestamp| now.saturating_sub(*timestamp) < WEB_LOGIN_WINDOW_MS);
+        if recent.len() >= WEB_LOGIN_MAX_FAILURES {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many password attempts; wait one minute and try again",
+            );
+        }
+    }
+
+    let password_hash = state
+        .web_auth
+        .config
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .password_hash
+        .clone();
+    let Some(password_hash) = password_hash else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "a web password has not been configured yet",
+        );
+    };
+    let password = body.password;
+    let valid = tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::PasswordHash;
+        use argon2::PasswordVerifier;
+        PasswordHash::new(&password_hash)
+            .ok()
+            .is_some_and(|parsed| {
+                argon2::Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            })
+    })
+    .await
+    .unwrap_or(false);
+    if !valid {
+        state
+            .web_auth
+            .failed_logins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(client_id)
+            .or_default()
+            .push(now);
+        return error_response(StatusCode::UNAUTHORIZED, "incorrect password");
+    }
+    state
+        .web_auth
+        .failed_logins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&client_id);
+    let token = state.web_auth.create_session();
+    let mut response = axum::Json(json!({"authenticated": true})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, web_session_cookie(&token));
+    response
+}
+
+async fn web_auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.web_auth.remove_session(&headers);
+    let mut response = axum::Json(json!({"authenticated": false})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, clear_web_session_cookie());
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct WebPasswordRequest {
+    password: String,
+}
+
+async fn admin_web_password(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebPasswordRequest>,
+) -> Response {
+    let password = body.password;
+    if password.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "password must not be empty");
+    }
+    if password.len() > 256 {
+        return error_response(StatusCode::BAD_REQUEST, "password is too long");
+    }
+    let password_hash = match tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        let salt = SaltString::generate(&mut OsRng);
+        argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(error)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not secure password: {error}"),
+            )
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("password worker failed: {error}"),
+            )
+        }
+    };
+
+    let next = {
+        let current = state
+            .web_auth
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WebAuthConfig {
+            password_hash: Some(password_hash),
+            onboarding_completed: current.onboarding_completed,
+            // Replacing the password revokes every existing session.
+            sessions: HashMap::new(),
+        }
+    };
+    if let Err(error) = state.web_auth.persist(&next) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save web password: {error}"),
+        );
+    }
+    *state
+        .web_auth
+        .config
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    state
+        .web_auth
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    let token = state.web_auth.create_session();
+    let mut response = axum::Json(json!({"password_configured": true})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, web_session_cookie(&token));
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct WebOnboardingRequest {
+    completed: bool,
+}
+
+async fn admin_web_onboarding(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebOnboardingRequest>,
+) -> Response {
+    let next = {
+        let current = state
+            .web_auth
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WebAuthConfig {
+            password_hash: current.password_hash.clone(),
+            onboarding_completed: body.completed,
+            sessions: current.sessions.clone(),
+        }
+    };
+    if let Err(error) = state.web_auth.persist(&next) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save onboarding state: {error}"),
+        );
+    }
+    *state
+        .web_auth
+        .config
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    axum::Json(json!({"onboarding_completed": body.completed})).into_response()
+}
+
 async fn require_local_key(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let ok = client_key(req.headers())
-        .map(|k| state.local_key.read().map(|key| k == *key).unwrap_or(false))
-        .unwrap_or(false);
+    let ok = admin_request_authenticated(&state, req.headers());
     if !ok {
         return error_response(
             StatusCode::UNAUTHORIZED,
-            "admin routes require x-api-key: <local_key>",
+            "admin routes require a signed-in web session or x-api-key: <local_key>",
         );
     }
     next.run(req).await
@@ -2008,6 +2443,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // bind doesn't expose them. Run keys are NOT accepted here — a worker's
     // run key must not mint/revoke run keys or read the trace store.
     let gated = Router::new()
+        .route("/admin/web/password", post(admin_web_password))
+        .route("/admin/web/onboarding", post(admin_web_onboarding))
         .route(
             "/admin/run-keys",
             get(admin_run_keys_list).post(admin_run_keys_create),
@@ -2050,6 +2487,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin_session_injections).delete(admin_session_injections_clear),
         )
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/accounts/test", post(admin_accounts_test))
         .route("/admin/providers", get(admin_providers))
         .route(
             "/admin/providers/{provider}/pause",
@@ -2245,8 +2683,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/", get(web::index))
         .route("/ui/app.js", get(web::app_js))
         .route("/ui/styles.css", get(web::styles))
+        .route("/ui/assets/{file}", get(web::static_asset))
         .route("/health", get(health))
         .route("/connect", get(connect_info))
+        .route("/web/auth/status", get(web_auth_status))
+        .route("/web/auth/login", post(web_auth_login))
+        .route("/web/auth/logout", post(web_auth_logout))
         .route("/v1/models", get(models))
         .route(
             "/v1/alex/capabilities",
@@ -4614,6 +5056,87 @@ async fn amp_usage_entry(state: &Arc<AppState>) -> Option<Value> {
     .await
 }
 
+pub fn parse_openrouter_credits_payload(payload: &Value) -> Option<f64> {
+    let data = payload.get("data")?;
+    let total = data.get("total_credits")?.as_f64()?;
+    let used = data.get("total_usage")?.as_f64()?;
+    (total.is_finite() && used.is_finite()).then_some((total - used).max(0.0))
+}
+
+async fn openrouter_usage_entry(state: &Arc<AppState>) -> Option<Value> {
+    let account = state
+        .vault
+        .account_for(Provider::Openrouter, false)
+        .await
+        .ok()?;
+    let headers = openrouter_auth_headers(&account).ok()?;
+    cached_usage_fetch(
+        &state.openrouter_usage,
+        USAGE_CACHE_TTL_MS,
+        UsageCacheSource::Entry,
+        || async move {
+            let result = state
+                .http
+                .get(format!(
+                    "{}/credits",
+                    upstream_base(state, Provider::Openrouter, OPENROUTER_BASE)
+                ))
+                .headers(headers)
+                .header("accept", "application/json")
+                .header("user-agent", "alex-openrouter-usage")
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(raw) => match parse_openrouter_credits_payload(&raw) {
+                        Some(remaining) => UsageFetchOutcome::Fresh(Some(json!({
+                            "provider": "openrouter",
+                            "account_id": account.id,
+                            "source": "openrouter credits API",
+                            "plan": account.label,
+                            "individual_credits_usd": remaining,
+                        }))),
+                        None => UsageFetchOutcome::Failed {
+                            retry_after_ms: None,
+                            fallback: None,
+                            log: UsageFailureLog::Error {
+                                error: "missing total_credits or total_usage".into(),
+                                message: "openrouter credits parse failed",
+                            },
+                        },
+                    },
+                    Err(e) => UsageFetchOutcome::Failed {
+                        retry_after_ms: None,
+                        fallback: None,
+                        log: UsageFailureLog::Error {
+                            error: e.to_string(),
+                            message: "openrouter credits parse failed",
+                        },
+                    },
+                },
+                Ok(resp) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Status {
+                        status: resp.status().as_u16(),
+                        message: "openrouter credits endpoint unavailable; backing off",
+                    },
+                },
+                Err(e) => UsageFetchOutcome::Failed {
+                    retry_after_ms: None,
+                    fallback: None,
+                    log: UsageFailureLog::Error {
+                        error: e.to_string(),
+                        message: "openrouter credits request failed",
+                    },
+                },
+            }
+        },
+    )
+    .await
+}
+
 /// Fetch SuperGrok weekly credits from grok.com gRPC-web billing RPC.
 /// Uses the vault's xAI OAuth access token. Degrades gracefully on any failure.
 async fn xai_usage_entry(state: &Arc<AppState>) -> Option<Value> {
@@ -4808,6 +5331,9 @@ pub async fn limits_snapshot(state: &Arc<AppState>) -> Value {
         providers.push(entry);
     }
     if let Some(entry) = amp_usage_entry(state).await {
+        providers.push(entry);
+    }
+    if let Some(entry) = openrouter_usage_entry(state).await {
         providers.push(entry);
     }
     if let Some(entry) = kimi_usage_entry(state).await {
@@ -5193,7 +5719,12 @@ async fn admin_storage_prune(
     let report =
         tokio::task::spawn_blocking(move || store.prune(cutoff, bodies_only, dry_run)).await;
     match report {
-        Ok(Ok(r)) => axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response(),
+        Ok(Ok(r)) => {
+            if !dry_run {
+                state.transcript_cache.lock().unwrap().clear();
+            }
+            axum::Json(serde_json::to_value(r).unwrap_or_default()).into_response()
+        }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -5644,6 +6175,10 @@ static TEST_BODY_FILE_READS: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> 
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 #[cfg(test)]
+static TEST_STORED_TRACE_BODY_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 fn test_body_file_reads_under(root: &std::path::Path) -> Vec<String> {
     TEST_BODY_FILE_READS
         .lock()
@@ -5883,6 +6418,10 @@ fn stored_trace_body(
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
     let trace_id = row["id"].as_str()?;
+    #[cfg(test)]
+    if trace_id.starts_with("trace-browser-long-") {
+        TEST_STORED_TRACE_BODY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     match store.read_trace_body(trace_id, kind, max_bytes) {
         Ok(Some(body)) => Some(body.bytes),
         Ok(None) => {
@@ -6603,24 +7142,138 @@ fn codex_user_history_signature(store: &Store, row: &Value) -> Option<String> {
     openai_responses_user_history_signature(&stored_trace_json(store, row, TraceBodyKind::Request)?)
 }
 
-fn build_session_transcript(
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TranscriptCacheKey {
+    trace_id: String,
+    completed_ms: i64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TranscriptCacheValue {
+    inherited: Option<Vec<Value>>,
+    signature: Option<String>,
+    turn: Value,
+}
+
+struct TranscriptCache {
+    entries: HashMap<TranscriptCacheKey, (TranscriptCacheValue, u64)>,
+    capacity: usize,
+    tick: u64,
+}
+
+impl TranscriptCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, key: &TranscriptCacheKey) -> Option<TranscriptCacheValue> {
+        self.tick = self.tick.wrapping_add(1);
+        let (value, used) = self.entries.get_mut(key)?;
+        *used = self.tick;
+        Some(value.clone())
+    }
+
+    fn insert(&mut self, key: TranscriptCacheKey, value: TranscriptCacheValue) {
+        self.tick = self.tick.wrapping_add(1);
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, self.tick));
+    }
+
+    fn remove_trace(&mut self, trace_id: &str) {
+        self.entries.retain(|key, _| key.trace_id != trace_id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|(value, _)| serde_json::to_vec(value).map_or(0, |bytes| bytes.len()))
+            .sum()
+    }
+}
+
+struct TranscriptCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TranscriptCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn transcript_cache_value(
+    store: &Store,
+    row: &Value,
+    include_inherited: bool,
+) -> TranscriptCacheValue {
+    TranscriptCacheValue {
+        inherited: include_inherited.then(|| transcript_inherited_turns(store, row)),
+        signature: codex_user_history_signature(store, row),
+        turn: transcript_turn(store, row),
+    }
+}
+
+fn build_session_transcript_cached(
     store: &Store,
     rows: &[Value],
     tools: &[Value],
     limit: usize,
+    cache: Option<&std::sync::Mutex<TranscriptCache>>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Vec<Value> {
     let mut previous_codex_user_history: Option<String> = None;
     let mut turns = Vec::new();
     for (index, row) in rows.iter().take(limit).enumerate() {
-        if index == 0 {
-            turns.extend(transcript_inherited_turns(store, row));
+        if cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed)) {
+            break;
         }
-        let signature = codex_user_history_signature(store, row);
+        let key = row["id"].as_str().zip(row["ts_response_ms"].as_i64()).map(
+            |(trace_id, completed_ms)| TranscriptCacheKey {
+                trace_id: trace_id.to_string(),
+                completed_ms,
+            },
+        );
+        let cached = key
+            .as_ref()
+            .and_then(|key| cache.and_then(|cache| cache.lock().unwrap().get(key)));
+        let mut value = cached.unwrap_or_else(|| {
+            let value = transcript_cache_value(store, row, index == 0);
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+            value
+        });
+        if index == 0 && value.inherited.is_none() {
+            value.inherited = Some(transcript_inherited_turns(store, row));
+            if let (Some(cache), Some(key)) = (cache, key.as_ref()) {
+                cache.lock().unwrap().insert(key.clone(), value.clone());
+            }
+        }
+        if index == 0 {
+            turns.extend(value.inherited.unwrap_or_default());
+        }
+        let signature = value.signature;
         let replayed_user = signature.is_some() && signature == previous_codex_user_history;
         if signature.is_some() {
             previous_codex_user_history = signature;
         }
-        let mut turn = transcript_turn(store, row);
+        let mut turn = value.turn;
         // Pi emits a tool start after the model response that requested it
         // and before the next provider request. Associate by explicit
         // trace_id when available, otherwise by that session-local time
@@ -6650,6 +7303,16 @@ fn build_session_transcript(
     turns
 }
 
+#[cfg(test)]
+fn build_session_transcript(
+    store: &Store,
+    rows: &[Value],
+    tools: &[Value],
+    limit: usize,
+) -> Vec<Value> {
+    build_session_transcript_cached(store, rows, tools, limit, None, None)
+}
+
 async fn traces_session_transcript(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -6660,18 +7323,36 @@ async fn traces_session_transcript(
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| q.get("since").and_then(|s| parse_since(s, now_ms())));
     let limit: usize = q.get("limit").and_then(|s| s.parse().ok()).unwrap_or(500);
-    let rows = match state.store.session_traces(&session_id, since) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let tools = match state.store.session_tool_calls(&session_id) {
-        Ok(rows) => rows,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
-    let turns = build_session_transcript(&state.store, &rows, &tools, limit);
-    let tab_counts = transcript_tab_counts(&turns);
-    axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
-        .into_response()
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = TranscriptCancellation(cancelled.clone());
+    let response = spawn_blocking_response(move || {
+        let rows = match state.store.session_traces(&session_id, since) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let tools = match state.store.session_tool_calls(&session_id) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            }
+        };
+        let turns = build_session_transcript_cached(
+            &state.store,
+            &rows,
+            &tools,
+            limit,
+            Some(&state.transcript_cache),
+            Some(&cancelled),
+        );
+        let tab_counts = transcript_tab_counts(&turns);
+        axum::Json(json!({"session_id": session_id, "turns": turns, "tab_counts": tab_counts}))
+            .into_response()
+    })
+    .await;
+    drop(guard);
+    response
 }
 
 const TRANSCRIPT_PAGE_DEFAULT: usize = 20;
@@ -6792,6 +7473,10 @@ fn expanded_turn_tool(mut tool: Value) -> Value {
 /// bodies and explicitly trace-linked tool bodies are read here—and nowhere in
 /// the page endpoint—so an unrelated turn can never be pulled into the read.
 async fn trace_turn(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_turn_blocking(state, id)).await
+}
+
+fn trace_turn_blocking(state: Arc<AppState>, id: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -6902,6 +7587,10 @@ async fn trace_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || trace_body_blocking(state, id, kind)).await
+}
+
+fn trace_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, &format!("unknown trace '{id}'")),
@@ -6984,6 +7673,10 @@ async fn tool_body(
     State(state): State<Arc<AppState>>,
     Path((id, kind)): Path<(String, String)>,
 ) -> Response {
+    spawn_blocking_response(move || tool_body_blocking(state, id, kind)).await
+}
+
+fn tool_body_blocking(state: Arc<AppState>, id: String, kind: String) -> Response {
     let row = match state.store.get_tool_call(&id) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -7010,6 +7703,10 @@ async fn tool_body(
 }
 
 async fn trace_reply_md(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    spawn_blocking_response(move || trace_reply_md_blocking(state, id)).await
+}
+
+fn trace_reply_md_blocking(state: Arc<AppState>, id: String) -> Response {
     use alex_core::translate;
     let row = match state.store.get_trace(&id) {
         Ok(Some(row)) => row,
@@ -7043,6 +7740,7 @@ async fn trace_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>
     }
     match state.store.delete_trace(&id) {
         Ok(paths) => {
+            state.transcript_cache.lock().unwrap().remove_trace(&id);
             let removed = paths
                 .iter()
                 .filter(|p| std::fs::remove_file(p).is_ok())
@@ -8632,10 +9330,68 @@ pub struct PingModels {
     pub kimi: String,
 }
 
+impl Default for PingModels {
+    fn default() -> Self {
+        Self {
+            anthropic: "claude-sonnet-5".into(),
+            openai: "gpt-5.5".into(),
+            xai: "grok-code-fast-1".into(),
+            gemini: "gemini-2.5-flash".into(),
+            openrouter: "google/gemma-4-26b-a4b-it:free".into(),
+            kimi: "k3".into(),
+        }
+    }
+}
+
+async fn admin_accounts_test(State(state): State<Arc<AppState>>) -> Response {
+    let Ok(_guard) = state.credential_test_lock.try_lock() else {
+        return error_response(StatusCode::CONFLICT, "a credential test is already running");
+    };
+    let models = state
+        .ping_models
+        .read()
+        .map(|models| models.clone())
+        .unwrap_or_default();
+    let accounts: Vec<Account> = state
+        .vault
+        .list()
+        .await
+        .into_iter()
+        .filter(|account| {
+            account.status == "active" && !account.paused && heartbeat_provider(account.provider)
+        })
+        .collect();
+    let mut results = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        if state.is_shutting_down() {
+            break;
+        }
+        let result = ping_provider_account(&state, account.provider, &models, Some(&account)).await;
+        record_heartbeat_result(&state, &result).await;
+        results.push(result);
+    }
+    let healthy = results.iter().filter(|result| result.ok).count();
+    axum::Json(json!({
+        "healthy": healthy,
+        "total": results.len(),
+        "results": results,
+    }))
+    .into_response()
+}
+
 pub async fn ping_provider(
     state: &Arc<AppState>,
     provider: Provider,
     models: &PingModels,
+) -> PingResult {
+    ping_provider_account(state, provider, models, None).await
+}
+
+async fn ping_provider_account(
+    state: &Arc<AppState>,
+    provider: Provider,
+    models: &PingModels,
+    target_account: Option<&Account>,
 ) -> PingResult {
     let start = now_ms();
     let prompt = "Health check: what time is it? If you cannot know, just reply: creds ok";
@@ -8694,7 +9450,10 @@ pub async fn ping_provider(
             }),
         ),
         Provider::Cliproxyapi => {
-            let account = state.vault.account_for(Provider::Cliproxyapi, false).await;
+            let account = match target_account {
+                Some(account) => Ok(account.clone()),
+                None => state.vault.account_for(Provider::Cliproxyapi, false).await,
+            };
             let Ok(account) = account else {
                 return PingResult {
                     provider: "cliproxyapi",
@@ -8750,7 +9509,10 @@ pub async fn ping_provider(
         Provider::Kimi => {
             // Kimi's usage endpoint doubles as a cheap credential check: it needs
             // a valid Bearer token and returns the subscription's quota windows.
-            let (ok, account_id, message) = kimi_usage_probe(state).await;
+            let (ok, account_id, message) = match target_account {
+                Some(account) => kimi_usage_probe_for_account(state, account).await,
+                None => kimi_usage_probe(state).await,
+            };
             return PingResult {
                 provider: "kimi",
                 account_id,
@@ -8761,6 +9523,62 @@ pub async fn ping_provider(
             };
         }
         Provider::Amp => {
+            if let Some(account) = target_account {
+                let account_id = Some(account.id.clone());
+                let Some(token) = account
+                    .api_key
+                    .as_deref()
+                    .or(account.access_token.as_deref())
+                else {
+                    return PingResult {
+                        provider: "amp",
+                        account_id,
+                        ok: false,
+                        status: None,
+                        latency_ms: now_ms() - start,
+                        message: "amp account has no credential".into(),
+                    };
+                };
+                let response = state
+                    .http
+                    .post(format!(
+                        "{}/api/internal?userDisplayBalanceInfo",
+                        upstream_base(state, Provider::Amp, AMP_BASE)
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("accept", "application/json")
+                    .header("content-type", "application/json")
+                    .header("user-agent", "alex-amp-ping")
+                    .json(&json!({ "method": "userDisplayBalanceInfo", "params": {} }))
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await;
+                return match response {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        PingResult {
+                            provider: "amp",
+                            account_id,
+                            ok: (200..300).contains(&status),
+                            status: Some(status),
+                            latency_ms: now_ms() - start,
+                            message: if (200..300).contains(&status) {
+                                "creds ok".into()
+                            } else {
+                                format!("usage HTTP {status}")
+                            },
+                        }
+                    }
+                    Err(error) => PingResult {
+                        provider: "amp",
+                        account_id,
+                        ok: false,
+                        status: None,
+                        latency_ms: now_ms() - start,
+                        message: format!("usage endpoint unreachable: {error}"),
+                    },
+                };
+            }
             let account_id = state
                 .vault
                 .account_for(Provider::Amp, false)
@@ -8791,18 +9609,28 @@ pub async fn ping_provider(
             };
         }
     };
-    let account_id = state
-        .vault
-        .account_for(provider, true)
-        .await
-        .ok()
-        .map(|a| a.id);
+    let account_id = match target_account {
+        Some(account) => Some(account.id.clone()),
+        None => state
+            .vault
+            .account_for(provider, true)
+            .await
+            .ok()
+            .map(|a| a.id),
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-api-key",
         HeaderValue::from_str(&state.local_key.read().unwrap()).expect("key header"),
     );
     headers.insert("user-agent", HeaderValue::from_static("alex-ping"));
+    if let Some(account) = target_account {
+        headers.insert(
+            ALEX_PING_ACCOUNT_HEADER,
+            HeaderValue::from_str(&account.id).expect("account id header"),
+        );
+        headers.insert("x-alex-no-substitute", HeaderValue::from_static("true"));
+    }
     let resp = proxy(
         state.clone(),
         format,
@@ -8937,23 +9765,25 @@ fn snippet(text: &str) -> String {
     t.replace('\n', " ")
 }
 
+fn heartbeat_provider(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Anthropic
+            | Provider::Openai
+            | Provider::Xai
+            | Provider::Gemini
+            | Provider::Openrouter
+            | Provider::Cliproxyapi
+            | Provider::Amp
+            | Provider::Kimi
+    )
+}
+
 pub async fn heartbeat_once(state: &Arc<AppState>, models: &PingModels) -> Vec<PingResult> {
     let providers: Vec<Provider> = {
         let mut seen = Vec::new();
         for a in state.vault.list().await {
-            if a.status == "active"
-                && matches!(
-                    a.provider,
-                    Provider::Anthropic
-                        | Provider::Openai
-                        | Provider::Xai
-                        | Provider::Gemini
-                        | Provider::Openrouter
-                        | Provider::Cliproxyapi
-                        | Provider::Amp
-                        | Provider::Kimi
-                )
-                && !seen.contains(&a.provider)
+            if a.status == "active" && heartbeat_provider(a.provider) && !seen.contains(&a.provider)
             {
                 seen.push(a.provider);
             }
@@ -9329,6 +10159,15 @@ fn account_selection_error(e: anyhow::Error) -> (StatusCode, String) {
     }
 }
 
+async fn spawn_blocking_response(
+    operation: impl FnOnce() -> Response + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(response) => response,
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
 fn client_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
@@ -9644,7 +10483,7 @@ async fn plan_upstream(
                     RespondAs::Gemini,
                 )),
             };
-            let (base, account, connection_account, dario_guard, dario_capture, dario_fallback_reason, via_dario, dario_generation) = if genuine_claude_code {
+            let (base, account, connection_account, dario_guard, dario_capture, dario_fallback_reason, via_dario, dario_generation) = if genuine_claude_code || client_headers.contains_key(ALEX_PING_ACCOUNT_HEADER) {
                 let account = state
                     .vault
                     .account_for_excluding(provider, true, excluded_accounts)
@@ -13700,7 +14539,19 @@ async fn proxy(
     {
         apply_reasoning_effort(format, &mut body_json, &effort);
     }
-    let mut attempted_accounts = HashSet::new();
+    let mut attempted_accounts: HashSet<String> = headers
+        .get(ALEX_PING_ACCOUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|target_id| {
+            state
+                .vault
+                .list_cached()
+                .into_iter()
+                .filter(|account| account.provider == provider && account.id != target_id)
+                .map(|account| account.id)
+                .collect()
+        })
+        .unwrap_or_default();
     let mut attempt_records = Vec::<Value>::new();
     let mut current_provider = provider;
     let mut current_model = routed_model.clone();
@@ -17246,6 +18097,55 @@ mod tests {
         assert!(snap["credits"].is_null());
     }
 
+    #[test]
+    fn openrouter_credits_payload_calculates_remaining_balance() {
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 42.5, "total_usage": 12.25}
+            })),
+            Some(30.25)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 12.25, "total_usage": 12.25}
+            })),
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 10.0}
+            })),
+            None
+        );
+        assert_eq!(
+            parse_openrouter_credits_payload(&json!({
+                "data": {"total_credits": 5.0, "total_usage": 8.0}
+            })),
+            Some(0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_fakeprov_credits_surface_as_limits_balance() {
+        let server = alex_fakeprov::FakeProv::spawn(alex_fakeprov::Config::default())
+            .await
+            .unwrap();
+        let state = test_state("openrouter-usage-entry");
+        state.vault.upsert(openrouter_account()).await.unwrap();
+        set_upstream_base_override(
+            &state,
+            Provider::Openrouter,
+            format!("{}/openrouter/api/v1", server.base_url()),
+        );
+
+        let entry = openrouter_usage_entry(&state)
+            .await
+            .expect("openrouter usage entry");
+        assert_eq!(entry["provider"], "openrouter");
+        assert_eq!(entry["account_id"], "openrouter-api-key");
+        assert_eq!(entry["individual_credits_usd"], 30.25);
+    }
+
     fn test_kimi_account() -> Account {
         Account {
             id: "kimi-oauth".into(),
@@ -17513,6 +18413,330 @@ mod tests {
             "http://127.0.0.1:4100".into(),
             Duration::from_secs(15 * 60),
         )
+    }
+
+    async fn web_auth_request(
+        state: Arc<AppState>,
+        method: axum::http::Method,
+        path: &str,
+        body: Option<Value>,
+        cookie: Option<&str>,
+        local_key: bool,
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if body.is_some() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header(axum::http::header::COOKIE, cookie);
+        }
+        if local_key {
+            builder = builder.header("x-api-key", "alx-local");
+        }
+        let bytes = body
+            .map(|value| serde_json::to_vec(&value).unwrap())
+            .unwrap_or_default();
+        router(state)
+            .oneshot(builder.body(Body::from(bytes)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn response_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("response sets browser session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn web_auth_unconfigured_status_and_password_validation() {
+        let state = test_state("web-auth-unconfigured");
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/web/auth/status",
+            None,
+            None,
+            false,
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["password_configured"], false);
+        assert_eq!(body["onboarding_completed"], false);
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["session_ttl_seconds"], WEB_SESSION_TTL_S);
+
+        for password in [String::new(), "x".repeat(257)] {
+            let response = web_auth_request(
+                state.clone(),
+                axum::http::Method::POST,
+                "/admin/web/password",
+                Some(json!({"password": password})),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(!state.web_auth.path.exists());
+
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "x"})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.web_auth.path.exists());
+    }
+
+    #[tokio::test]
+    async fn web_password_persists_only_argon_hash_and_login_cookie_grants_admin() {
+        let state = test_state("web-auth-persist-cookie");
+        let password = "correct horse battery staple";
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": password})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Path=/"));
+        assert!(set_cookie.contains(&format!("Max-Age={WEB_SESSION_TTL_S}")));
+        let cookie = response_cookie(&response);
+
+        let persisted = std::fs::read_to_string(&state.web_auth.path).unwrap();
+        assert!(!persisted.contains(password));
+        let persisted_json: Value = serde_json::from_str(&persisted).unwrap();
+        assert!(persisted_json["password_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("$argon2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&state.web_auth.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let gated = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&cookie),
+            false,
+        )
+        .await;
+        assert_eq!(gated.status(), StatusCode::OK);
+
+        let login = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": password})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        assert!(login.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .starts_with("alex_web_session="));
+    }
+
+    #[tokio::test]
+    async fn web_login_rejects_wrong_password_and_throttles_repeated_failures() {
+        let state = test_state("web-auth-throttle");
+        let configured = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "a sufficiently long password"})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(configured.status(), StatusCode::OK);
+        for _ in 0..WEB_LOGIN_MAX_FAILURES {
+            let wrong = web_auth_request(
+                state.clone(),
+                axum::http::Method::POST,
+                "/web/auth/login",
+                Some(json!({"password": "definitely the wrong password"})),
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        }
+        let throttled = web_auth_request(
+            state,
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "a sufficiently long password"})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn web_logout_expiry_and_password_replacement_revoke_old_sessions() {
+        let state = test_state("web-auth-session-lifecycle");
+        let first = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "first strong browser password"})),
+            None,
+            true,
+        )
+        .await;
+        let first_cookie = response_cookie(&first);
+
+        let replacement = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "replacement browser password"})),
+            Some(&first_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let replacement_cookie = response_cookie(&replacement);
+        let old_session = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&first_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(old_session.status(), StatusCode::UNAUTHORIZED);
+        let old_password = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "first strong browser password"})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(old_password.status(), StatusCode::UNAUTHORIZED);
+
+        let logout = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/logout",
+            Some(json!({})),
+            Some(&replacement_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(logout.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        let logged_out = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&replacement_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(logged_out.status(), StatusCode::UNAUTHORIZED);
+
+        let fresh_login = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "replacement browser password"})),
+            None,
+            false,
+        )
+        .await;
+        let expiring_cookie = response_cookie(&fresh_login);
+        state
+            .web_auth
+            .sessions
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|expires_at_ms| *expires_at_ms = now_ms() - 1);
+        let expired = web_auth_request(
+            state,
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&expiring_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn web_onboarding_completion_persists_with_password_hash() {
+        let state = test_state("web-auth-onboarding-persist");
+        let configured = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "onboarding browser password"})),
+            None,
+            true,
+        )
+        .await;
+        let cookie = response_cookie(&configured);
+        let completed = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/onboarding",
+            Some(json!({"completed": true})),
+            Some(&cookie),
+            false,
+        )
+        .await;
+        assert_eq!(completed.status(), StatusCode::OK);
+        let reloaded = WebAuthState::load(&state.store.data_dir);
+        let config = reloaded.config.read().unwrap();
+        assert!(config.password_hash.is_some());
+        assert!(config.onboarding_completed);
     }
 
     #[tokio::test]
@@ -18856,7 +20080,8 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(ui.contains("ALEX LOCAL CONTROL PLANE"));
+        assert!(ui.contains("Local control plane"));
+        assert!(ui.contains("password-login-form"));
 
         let routed_response = client
             .post(format!("{base}/v1/chat/completions"))
@@ -19401,6 +20626,278 @@ mod tests {
         selected_legacy_paths.sort();
         assert_eq!(reads, selected_legacy_paths);
         assert!(unrelated_paths.iter().all(|path| !reads.contains(path)));
+    }
+
+    fn transcript_perf_state(root: &std::path::Path) -> Arc<AppState> {
+        let store = Arc::new(Store::open(root.to_path_buf()).unwrap());
+        let vault = Arc::new(Vault::open(root.join("vault")).unwrap());
+        build_state(
+            "alx-local".into(),
+            vault,
+            store,
+            None,
+            "http://127.0.0.1:4100".into(),
+            Duration::from_secs(15 * 60),
+        )
+    }
+
+    async fn measured_transcript_poll(state: Arc<AppState>) -> u64 {
+        let started = std::time::Instant::now();
+        let response = traces_session_transcript(
+            State(state),
+            Path(alex_lar_scale::BROWSER_SESSION_ID.into()),
+            Query(HashMap::from([("limit".into(), "500".into())])),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn test_peak_rss_bytes() -> u64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(status, 0);
+        let value = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        if cfg!(target_os = "macos") {
+            value
+        } else {
+            value.saturating_mul(1024)
+        }
+    }
+
+    fn transcript_cache_entry_count(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().entries.len()
+    }
+
+    fn transcript_cache_retained_bytes(state: &AppState) -> usize {
+        state.transcript_cache.lock().unwrap().retained_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_browser_transcript_perf_budgets() {
+        const WARM_P95_BUDGET_MS: u64 = 750;
+        const ABORT_BUDGET_MS: u64 = 250;
+        const STORE_WAIT_BUDGET_MS: u64 = 100;
+        const CACHE_ENTRY_CEILING: usize = 512;
+        const CACHE_BYTES_CEILING: usize = 16 * 1024 * 1024;
+        const RSS_GROWTH_CEILING: u64 = 128 * 1024 * 1024;
+
+        let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/trace-browser-perf-corpus-v1");
+        let manifest_path = corpus_root.join(alex_lar_scale::BROWSER_MANIFEST_FILE);
+        let (manifest, generation) = if manifest_path.is_file() {
+            (
+                serde_json::from_reader(std::fs::File::open(manifest_path).unwrap()).unwrap(),
+                Duration::ZERO,
+            )
+        } else {
+            if corpus_root.exists() {
+                std::fs::remove_dir_all(&corpus_root).unwrap();
+            }
+            alex_lar_scale::generate_browser_corpus(&corpus_root).unwrap()
+        };
+        assert_eq!(manifest.long_turns, 500);
+        let state = transcript_perf_state(&corpus_root);
+        let cold_ms = measured_transcript_poll(state.clone()).await;
+        let mut warm_samples = Vec::new();
+        for _ in 0..3 {
+            warm_samples.push(measured_transcript_poll(state.clone()).await);
+        }
+        warm_samples.sort_unstable();
+        let warm_p95_ms = *warm_samples.last().unwrap();
+
+        state.transcript_cache.lock().unwrap().clear();
+        TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let abandoned_state = state.clone();
+        let abandoned = tokio::spawn(async move {
+            measured_transcript_poll(abandoned_state).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let abort_started = std::time::Instant::now();
+        abandoned.abort();
+        let store_started = std::time::Instant::now();
+        let session_count = state.store.sessions(None, 100).unwrap().len();
+        let store_wait_ms = store_started.elapsed().as_millis() as u64;
+        let _ = abandoned.await;
+        let abort_ms = abort_started.elapsed().as_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let abandoned_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(session_count, 51);
+
+        let mut rss_growth = u64::MAX;
+        let mut cache_entries = transcript_cache_entry_count(&state);
+        let mut cache_bytes_before = usize::MAX;
+        let mut cache_bytes_after = usize::MAX;
+        if warm_p95_ms <= WARM_P95_BUDGET_MS {
+            measured_transcript_poll(state.clone()).await;
+            TEST_STORED_TRACE_BODY_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..20 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            cache_bytes_before = transcript_cache_retained_bytes(&state);
+            let rss_before = test_peak_rss_bytes();
+            for _ in 0..100 {
+                measured_transcript_poll(state.clone()).await;
+            }
+            let rss_after = test_peak_rss_bytes();
+            rss_growth = rss_after.saturating_sub(rss_before);
+            cache_entries = transcript_cache_entry_count(&state);
+            cache_bytes_after = transcript_cache_retained_bytes(&state);
+        }
+        let warm_body_reads =
+            TEST_STORED_TRACE_BODY_READS.load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "T2 trace-browser generation_ms={} cold_ms={cold_ms} warm_p95_ms={warm_p95_ms} abort_ms={abort_ms} abandoned_body_reads={abandoned_body_reads} store_wait_ms={store_wait_ms} rss_growth_bytes={rss_growth} cache_entries={cache_entries} cache_bytes_before={cache_bytes_before} cache_bytes_after={cache_bytes_after} warm_body_reads={warm_body_reads}",
+            generation.as_millis()
+        );
+
+        assert!(
+            warm_p95_ms <= WARM_P95_BUDGET_MS,
+            "warm transcript p95 {warm_p95_ms}ms exceeds {WARM_P95_BUDGET_MS}ms"
+        );
+        assert!(abort_ms <= ABORT_BUDGET_MS, "abort took {abort_ms}ms");
+        assert!(
+            abandoned_body_reads <= 3,
+            "abandoned transcript read {abandoned_body_reads} bodies"
+        );
+        assert!(
+            store_wait_ms <= STORE_WAIT_BUDGET_MS,
+            "concurrent store query waited {store_wait_ms}ms"
+        );
+        assert!(
+            cache_entries > 0 && cache_entries <= CACHE_ENTRY_CEILING,
+            "cache entries {cache_entries} exceed bounded range"
+        );
+        assert_eq!(
+            cache_bytes_after, cache_bytes_before,
+            "cache retained bytes grew"
+        );
+        assert!(
+            cache_bytes_after <= CACHE_BYTES_CEILING,
+            "cache retains {cache_bytes_after} bytes"
+        );
+        assert_eq!(warm_body_reads, 0, "warm polls reopened trace bodies");
+        // Peak RSS in the shared cargo-test process is polluted by concurrently
+        // running tests; boundedness is asserted via the deterministic cache
+        // metrics above, and RSS stays logged for humans.
+        if rss_growth > RSS_GROWTH_CEILING {
+            eprintln!(
+                "T2 advisory: 100 warm polls grew peak RSS by {rss_growth} bytes (ceiling {RSS_GROWTH_CEILING})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_cache_refreshes_and_invalidates_on_delete_and_prune() {
+        let state = test_state("transcript-cache-invalidation");
+        let session_id = "cache-session";
+        for (id, completed_ms, assistant) in [("cached-a", 2, "first"), ("cached-b", 4, "second")] {
+            let request_path = state
+                .store
+                .write_body(
+                    id,
+                    "request.json",
+                    br#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                )
+                .unwrap();
+            let response_path = state
+                .store
+                .write_body(
+                    id,
+                    "response.json",
+                    json!({"choices": [{"message": {"content": assistant}}]})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: id.into(),
+                    ts_request_ms: completed_ms - 1,
+                    ts_response_ms: Some(completed_ms),
+                    session_id: Some(session_id.into()),
+                    client_format: Some("openai-chat".into()),
+                    upstream_format: Some("openai-chat".into()),
+                    req_body_path: Some(request_path),
+                    resp_body_path: Some(response_path),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let (_, first) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["turns"][0]["assistant"], "first");
+        assert_eq!(transcript_cache_entry_count(&state), 2);
+
+        let response_path = state
+            .store
+            .write_body(
+                "cached-a",
+                "response.json",
+                br#"{"choices":[{"message":{"content":"updated"}}]}"#,
+            )
+            .unwrap();
+        state
+            .store
+            .insert_trace(&TraceRecord {
+                id: "cached-a".into(),
+                ts_request_ms: 1,
+                ts_response_ms: Some(5),
+                session_id: Some(session_id.into()),
+                client_format: Some("openai-chat".into()),
+                upstream_format: Some("openai-chat".into()),
+                resp_body_path: Some(response_path),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, refreshed) = response_json(
+            traces_session_transcript(
+                State(state.clone()),
+                Path(session_id.into()),
+                Query(HashMap::new()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(refreshed["turns"][0]["assistant"], "updated");
+        assert_eq!(refreshed["turns"][1]["assistant"], "second");
+
+        assert_eq!(
+            trace_delete(State(state.clone()), Path("cached-a".into()))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(state
+            .transcript_cache
+            .lock()
+            .unwrap()
+            .entries
+            .keys()
+            .all(|key| key.trace_id != "cached-a"));
+        assert_eq!(
+            admin_storage_prune(
+                State(state.clone()),
+                axum::Json(json!({
+                    "older_than_ms": now_ms(),
+                    "bodies_only": true,
+                })),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(transcript_cache_entry_count(&state), 0);
     }
 
     #[tokio::test]
@@ -25714,6 +27211,86 @@ mod tests {
             latency_ms: 12,
             message: "probe".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn credential_test_is_key_gated_and_handles_an_empty_vault() {
+        use tower::ServiceExt;
+
+        let state = test_state("credential-test-empty");
+        let unauthorized = axum::http::Request::post("/admin/accounts/test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let authorized = axum::http::Request::post("/admin/accounts/test")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = response_json(router(state).oneshot(authorized).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["healthy"], 0);
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["results"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn credential_test_pings_every_active_account_for_the_same_provider() {
+        use alex_fakeprov::{Config as FakeProvConfig, FakeProv};
+        use tower::ServiceExt;
+
+        let upstream = FakeProv::spawn(FakeProvConfig::default()).await.unwrap();
+        let state = test_state("credential-test-multi-account");
+        set_upstream_base_override(
+            &state,
+            Provider::Xai,
+            format!("{}/xai/v1", upstream.base_url()),
+        );
+        for id in ["xai-first", "xai-second"] {
+            state
+                .vault
+                .upsert(test_api_account(id, Provider::Xai))
+                .await
+                .unwrap();
+        }
+
+        let request = axum::http::Request::post("/admin/accounts/test")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = response_json(router(state).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["healthy"], 2);
+        assert_eq!(body["total"], 2);
+        let account_ids: HashSet<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|result| result["account_id"].as_str())
+            .collect();
+        assert_eq!(account_ids, HashSet::from(["xai-first", "xai-second"]));
+
+        let authorizations: HashSet<String> = upstream
+            .requests()
+            .await
+            .into_iter()
+            .filter(|request| request.path.ends_with("/chat/completions"))
+            .filter_map(|request| request.headers.get("authorization").cloned())
+            .collect();
+        assert_eq!(
+            authorizations,
+            HashSet::from([
+                "Bearer secret-xai-first".to_string(),
+                "Bearer secret-xai-second".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]
