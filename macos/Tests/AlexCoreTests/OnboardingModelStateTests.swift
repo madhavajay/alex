@@ -143,22 +143,25 @@ import Testing
     }
 
     @Test func networkStepFollowsCredentialsAndPrecedesNotifications() {
+        // Merged order: the network-access choice sits BEFORE harness connect,
+        // because the connect step and remote 1-liners depend on the bind
+        // address chosen there.
         #expect(OnboardingModel.stepTitles.count == 8)
         #expect(OnboardingModel.stepTitles == [
-            "Meet Alex", "Pick a provider", "Connect and test",
-            "Credentials for compatible apps", "Network", "Never lose a login",
+            "Meet Alex", "Pick a provider", "Network access", "Connect and test",
+            "Credentials for compatible apps", "Never lose a login",
             "Keep your agents running", "Beyond single provider",
         ])
+        #expect(OnboardingModel.stepTitles[OnboardingModel.networkStep] == "Network access")
+        #expect(OnboardingModel.networkStep < OnboardingModel.connectStep)
 
         let model = makeModel()
-        model.step = 3
-        model.next()
-        #expect(model.step == 4)
+        model.step = OnboardingModel.networkStep
         #expect(model.canAdvance)
         model.next()
-        #expect(model.step == 5)
+        #expect(model.step == OnboardingModel.connectStep)
         model.back()
-        #expect(model.step == 4)
+        #expect(model.step == OnboardingModel.networkStep)
     }
 
     @Test func supportedOnboardingWidthUsesThreeProviderColumnsAndRoomyChips() {
