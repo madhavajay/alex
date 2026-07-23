@@ -1,6 +1,11 @@
 /* 1. State, escaping, formatting, API, and toast helpers. */
 const TURN_PAGE_SIZE = 20;
 const TRACE_PAGE_SIZE = 25;
+const ONBOARDING_STEP_TITLES = [
+  "Web access", "Meet Alex", "Pick a provider", "Connect and test",
+  "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
+  "Beyond single provider",
+];
 const REFRESH_STORAGE_KEY = "alex.web.refresh-seconds";
 const PROVIDERS = [
   ["claude", "Anthropic", "oauth"],
@@ -9,6 +14,8 @@ const PROVIDERS = [
   ["grok", "xAI", "oauth"],
   ["kimi", "Moonshot Kimi", "oauth"],
   ["amp", "Amp", "import"],
+  ["openrouter", "OpenRouter", "form"],
+  ["exo", "Exo", "form"],
   ["cliproxyapi", "CLIProxyAPI", "form"],
 ];
 const LOGIN_PROVIDERS = {
@@ -59,6 +66,22 @@ const state = {
   traceCursor: null,
   traceFilters: {},
   loginPoll: null,
+  networkFailures: 0,
+  sessionRecovery: false,
+  importCandidates: [],
+  selectedProvider: null,
+  selectedProviderAccount: null,
+  selectedImports: new Set(),
+  selectedHarness: null,
+  harnessPlan: [],
+  harnessPlanStatus: "idle",
+  harnessStatus: "idle",
+  harnessSummary: null,
+  harnessTraceStartedMs: null,
+  harnessTrace: null,
+  harnessTraceStatus: "idle",
+  harnessTracePoll: null,
+  manualHarnessResult: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -100,8 +123,17 @@ async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (state.adminKey && !state.sessionAuthenticated) headers.set("x-api-key", state.adminKey);
   if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  const response = await fetch(path, { credentials: "same-origin", ...options, headers });
+  let response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", ...options, headers });
+    state.networkFailures = 0;
+  } catch {
+    state.networkFailures += 1;
+    if (state.sessionAuthenticated && state.networkFailures >= 2) endExpiredSession();
+    throw new Error(state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help.");
+  }
   const payload = response.status === 204 ? null : await response.json().catch(() => null);
+  if (response.status === 401 && state.sessionAuthenticated) endExpiredSession();
   if (!response.ok) throw new Error(errorMessage(payload, response));
   return payload;
 }
@@ -109,14 +141,39 @@ async function api(path, options = {}) {
 async function apiText(path, options = {}) {
   const headers = new Headers(options.headers || {});
   if (state.adminKey && !state.sessionAuthenticated) headers.set("x-api-key", state.adminKey);
-  const response = await fetch(path, { credentials: "same-origin", ...options, headers });
+  let response;
+  try {
+    response = await fetch(path, { credentials: "same-origin", ...options, headers });
+    state.networkFailures = 0;
+  } catch {
+    state.networkFailures += 1;
+    if (state.sessionAuthenticated && state.networkFailures >= 2) endExpiredSession();
+    throw new Error(state.networkFailures >= 2 ? sessionEndedMessage() : "The daemon is temporarily unreachable. Retrying may help.");
+  }
   const text = await response.text();
+  if (response.status === 401 && state.sessionAuthenticated) endExpiredSession();
   if (!response.ok) {
     let payload = null;
     try { payload = JSON.parse(text); } catch { /* plain-text response */ }
     throw new Error(errorMessage(payload, response));
   }
   return text;
+}
+
+function sessionEndedMessage() {
+  return "Session ended — the daemon restarted or your session expired; sign in again.";
+}
+
+function endExpiredSession() {
+  if (state.sessionRecovery) return;
+  state.sessionRecovery = true;
+  if (state.currentView && location.hash !== `#${state.currentView}`) history.replaceState(null, "", `#${state.currentView}`);
+  state.sessionAuthenticated = false;
+  state.adminKey = null;
+  clearInterval(state.refreshTimer);
+  clearTimeout(state.loginPoll);
+  stopHarnessTracePolling();
+  showAuthState("password-login", sessionEndedMessage());
 }
 
 let toastTimer = null;
@@ -226,10 +283,17 @@ async function submitAdminKey(event) {
 }
 
 function enterApplication() {
+  state.sessionRecovery = false;
+  state.networkFailures = 0;
   $("#auth-screen").hidden = true;
   $("#app-shell").hidden = false;
   configureRefreshInterval();
   updatePasswordStep();
+  const sharedHarnessFilter = new URLSearchParams(location.search).get("harness");
+  if (sharedHarnessFilter) {
+    state.traceFilters.harness = sharedHarnessFilter;
+    $("#trace-filters").elements.harness.value = sharedHarnessFilter;
+  }
   const requested = location.hash.slice(1);
   selectView(state.auth?.onboarding_completed ? (VIEW_COPY[requested] ? requested : "dashboard") : "onboarding", false);
   refreshSharedData().catch((error) => toast(error.message, "danger"));
@@ -239,8 +303,6 @@ function updatePasswordStep() {
   const configured = Boolean(state.auth?.password_configured);
   $("#password-configured").hidden = !configured;
   $("#password-config-form").hidden = configured;
-  const next = $('[data-next-step="1"]', $('[data-onboarding-step="0"]'));
-  if (next) next.disabled = !configured;
 }
 
 async function submitWebPassword(event, onboarding = false) {
@@ -267,50 +329,391 @@ async function submitWebPassword(event, onboarding = false) {
 }
 
 function showOnboardingStep(step) {
-  state.onboardingStep = clamp(step, 0, 3);
+  const previous = state.onboardingStep;
+  state.onboardingStep = clamp(step, 0, ONBOARDING_STEP_TITLES.length - 1);
   $$('[data-onboarding-step]').forEach((node) => { node.hidden = Number(node.dataset.onboardingStep) !== state.onboardingStep; });
-  $$('[data-step-button]').forEach((node) => {
-    const nodeStep = Number(node.dataset.stepButton);
-    node.classList.toggle("active", nodeStep === state.onboardingStep);
-    node.classList.toggle("complete", nodeStep < state.onboardingStep);
-    node.disabled = nodeStep > state.onboardingStep || (!state.auth?.password_configured && nodeStep > 0);
-  });
-  if (state.onboardingStep >= 1) renderOnboardingData();
+  $("#onboarding-title").textContent = ONBOARDING_STEP_TITLES[state.onboardingStep];
+  $("#onboarding-count").textContent = `${state.onboardingStep + 1} of ${ONBOARDING_STEP_TITLES.length}`;
+  $("#onboarding-back").disabled = state.onboardingStep === 0;
+  $("#onboarding-next").textContent = state.onboardingStep === ONBOARDING_STEP_TITLES.length - 1 ? "Get started" : "Next";
+  $("#onboarding-dots").innerHTML = ONBOARDING_STEP_TITLES.map((_, index) => `<i class="${index === state.onboardingStep ? "active" : ""}"></i>`).join("");
+  inlineMessage($("#onboarding-error"), "");
+  if (previous === 3 && state.onboardingStep !== 3) stopHarnessTracePolling();
+  if (state.onboardingStep === 2) {
+    renderOnboardingProviders();
+    loadOnboardingImports();
+  }
+  if (state.onboardingStep === 3) {
+    renderOnboardingHarnessStages();
+    if (state.harnessStatus === "success" && !state.harnessTrace) beginHarnessTracePolling(false);
+  }
+  $("#onboarding-view").closest(".content")?.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 function renderOnboardingData() {
-  const accounts = state.accounts;
-  $("#onboarding-accounts").innerHTML = accounts.length ? accounts.map((account) => `<div class="mini-row"><span class="status-dot ${escapeHtml(account.health || "unknown")}"></span><strong>${escapeHtml(account.email || account.label || account.name)}</strong><small>${escapeHtml(account.provider)}</small></div>`).join("") : '<p class="muted">No providers connected yet.</p>';
-  renderProviderPicker($("#onboarding-providers"), false);
-  const harnesses = state.harnesses.filter((harness) => harness.installed).slice(0, 6);
-  $("#onboarding-harnesses").innerHTML = harnesses.length ? harnesses.map((harness) => `<div class="mini-row"><strong>${escapeHtml(harness.display_name || harness.name)}</strong><span class="pill ${harness.connected ? "success" : "neutral"}">${harness.connected ? "Connected" : "Detected"}</span></div>`).join("") : '<p class="muted">No supported coding harness was detected on this machine.</p>';
-  $("#ready-summary").innerHTML = statCards([
-    ["Accounts", accounts.length],
-    ["Connected harnesses", state.harnesses.filter((harness) => harness.connected).length],
-    ["Middleware rules", state.middleware?.rules?.length || 0],
-    ["Daemon", state.health?.status || "online"],
-  ]);
+  if (state.onboardingStep === 2) renderOnboardingProviders();
+  if (state.onboardingStep === 3) renderOnboardingHarnessStages();
 }
 
 async function finishOnboarding() {
-  const button = $("#finish-onboarding");
+  const button = $("#onboarding-next");
   button.disabled = true;
+  inlineMessage($("#onboarding-error"), "");
   try {
     await api("/admin/web/onboarding", { method: "POST", body: JSON.stringify({ completed: true }) });
     state.auth.onboarding_completed = true;
     toast("Onboarding complete.");
     selectView("dashboard", true);
-  } catch (error) { toast(error.message, "danger"); }
+  } catch (error) { inlineMessage($("#onboarding-error"), error.message); }
   finally { button.disabled = false; }
+}
+
+function nextOnboardingStep() {
+  if (state.onboardingStep === ONBOARDING_STEP_TITLES.length - 1) finishOnboarding();
+  else showOnboardingStep(state.onboardingStep + 1);
+}
+
+function skipOnboardingStep() {
+  clearTimeout(state.loginPoll);
+  if (state.onboardingStep === 3) stopHarnessTracePolling();
+  nextOnboardingStep();
 }
 
 async function restartOnboarding() {
   try {
     await api("/admin/web/onboarding", { method: "POST", body: JSON.stringify({ completed: false }) });
     state.auth.onboarding_completed = false;
+    resetOnboardingFlow();
     showOnboardingStep(0);
     selectView("onboarding", true);
   } catch (error) { toast(error.message, "danger"); }
+}
+
+function resetOnboardingFlow() {
+  stopHarnessTracePolling();
+  state.onboardingStep = 0;
+  state.selectedProvider = null;
+  state.selectedProviderAccount = null;
+  state.selectedHarness = null;
+  state.harnessPlan = [];
+  state.harnessPlanStatus = "idle";
+  state.harnessStatus = "idle";
+  state.harnessSummary = null;
+  state.harnessTraceStartedMs = null;
+  state.harnessTrace = null;
+  state.harnessTraceStatus = "idle";
+  state.manualHarnessResult = null;
+}
+
+function onboardingProviderDefinition(id) {
+  return PROVIDERS.find(([provider]) => provider === id);
+}
+
+function providerAccounts(id) {
+  const canonical = providerCanonical(id);
+  return state.accounts.filter((account) => providerCanonical(account.provider) === canonical);
+}
+
+function providerCandidates(id) {
+  const canonical = providerCanonical(id);
+  return state.importCandidates.filter((candidate) => providerCanonical(candidate.provider) === canonical);
+}
+
+function renderOnboardingProviders() {
+  const grid = $("#onboarding-providers");
+  if (!grid) return;
+  grid.innerHTML = PROVIDERS.map(([id, label]) => {
+    const connected = providerAccounts(id).length;
+    const detected = providerCandidates(id).length;
+    const selected = state.selectedProvider === id;
+    const status = selected ? "Selected" : connected ? `${connected} connected` : detected ? "Detected login" : "Connect";
+    return `<button class="onboarding-choice ${selected ? "selected" : ""}" data-onboarding-provider="${escapeHtml(id)}"><span class="provider-monogram">${escapeHtml(label.charAt(0))}</span><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(status)}</small></span>${selected ? '<b aria-hidden="true">✓</b>' : ""}</button>`;
+  }).join("");
+  bindActions(grid, "[data-onboarding-provider]", (event) => {
+    clearTimeout(state.loginPoll);
+    state.selectedProvider = event.currentTarget.dataset.onboardingProvider;
+    state.selectedProviderAccount = null;
+    loginFlowNodes().forEach((node) => { node.hidden = true; node.replaceChildren(); });
+    renderOnboardingProviders();
+    renderOnboardingProviderDetail();
+  });
+  renderOnboardingProviderDetail();
+}
+
+function renderOnboardingProviderDetail(message = "", kind = "success") {
+  const node = $("#onboarding-provider-detail");
+  const id = state.selectedProvider;
+  if (!node || !id) { if (node) node.replaceChildren(); return; }
+  const definition = onboardingProviderDefinition(id);
+  const label = definition?.[1] || id;
+  const mode = definition?.[2] || "oauth";
+  const accounts = providerAccounts(id);
+  const candidates = providerCandidates(id);
+  const accountRows = accounts.map((account) => `<button class="provider-account-choice ${state.selectedProviderAccount === account.id ? "selected" : ""}" data-use-provider-account="${escapeHtml(account.id)}"><span class="status-dot ${escapeHtml(account.health || account.status || "unknown")}"></span><span><strong>${escapeHtml(accountTitle(account))}</strong><small>${escapeHtml(account.kind === "oauth" ? "Connected subscription" : account.kind)}</small></span><b>${state.selectedProviderAccount === account.id ? "✓" : "Use"}</b></button>`).join("");
+  const candidateRows = candidates.map((candidate) => `<label class="import-choice"><input class="square-check" type="checkbox" value="${escapeHtml(candidate.source)}" ${state.selectedImports.has(candidate.source) ? "checked" : ""}><span><strong>${escapeHtml(candidate.label)}</strong><small>${escapeHtml(`${candidate.kind.replaceAll("_", " ")} · ${candidate.source_path}`)}</small></span></label>`).join("");
+  const freshAction = mode === "oauth" ? `Add another ${label} account` : mode === "import" ? "Import another detected credential" : `Configure another ${label} account`;
+  node.innerHTML = `<div class="onboarding-provider-card"><h3>${accounts.length ? "Choose an existing account or add a new one" : candidates.length ? "Existing login detected" : `Connect ${escapeHtml(label)}`}</h3>${accountRows}${candidates.length ? `<div class="detected-heading"><strong>Detected outside Alex</strong><small>These remain owned by their original apps. Alex imports only the credentials you leave checked.</small></div>${candidateRows}<button data-import-checked>Import checked credential</button>` : ""}<button data-add-provider-account>${escapeHtml(freshAction)}</button>${message ? `<p class="inline-message ${escapeHtml(kind)}">${escapeHtml(message)}</p>` : ""}</div>`;
+  bindActions(node, "[data-use-provider-account]", (event) => {
+    state.selectedProviderAccount = event.currentTarget.dataset.useProviderAccount;
+    renderOnboardingProviderDetail(`${label} account selected.`, "success");
+    renderOnboardingProviders();
+  });
+  $$(".square-check", node).forEach((input) => input.addEventListener("change", () => {
+    if (input.checked) state.selectedImports.add(input.value); else state.selectedImports.delete(input.value);
+  }));
+  $("[data-import-checked]", node)?.addEventListener("click", importOnboardingCredentials);
+  $("[data-add-provider-account]", node)?.addEventListener("click", () => {
+    if (mode === "oauth") startLogin(id);
+    else if (mode === "import") loadOnboardingImports(true);
+    else { selectView("providers", true); $(`#${id}-form`)?.scrollIntoView({ behavior: "smooth" }); }
+  });
+}
+
+async function loadOnboardingImports(force = false) {
+  if (state.importCandidates.length && !force) return;
+  try {
+    const data = await api("/admin/auth/import-candidates");
+    state.importCandidates = data.candidates || [];
+    state.importCandidates.forEach((candidate) => state.selectedImports.add(candidate.source));
+    renderOnboardingProviders();
+  } catch (error) {
+    renderOnboardingProviderDetail(`Could not scan external credentials: ${error.message}`, "warning");
+  }
+}
+
+async function importOnboardingCredentials(event) {
+  const button = event.currentTarget;
+  const selected = providerCandidates(state.selectedProvider).filter((candidate) => state.selectedImports.has(candidate.source));
+  if (!selected.length) { renderOnboardingProviderDetail("Select a detected credential to import, or connect a new account.", "danger"); return; }
+  button.disabled = true;
+  try {
+    let imported = [];
+    let note = "";
+    for (const candidate of selected) {
+      const result = await api("/admin/auth/import", { method: "POST", body: JSON.stringify({ source: candidate.source }) });
+      imported = imported.concat(...(result.outcomes || []).map((outcome) => outcome.imported || []));
+      note ||= (result.outcomes || []).find((outcome) => outcome.note)?.note || "";
+    }
+    await loadAccounts();
+    const account = imported.map((id) => state.accounts.find((item) => item.id === id)).find(Boolean) || providerAccounts(state.selectedProvider).at(-1);
+    state.selectedProviderAccount = account?.id || null;
+    renderOnboardingProviders();
+    renderOnboardingProviderDetail(account ? `${accountTitle(account)} imported and selected.` : (note || "Import completed."), account ? "success" : "warning");
+  } catch (error) { renderOnboardingProviderDetail(error.message, "danger"); }
+  finally { button.disabled = false; }
+}
+
+function harnessDisplayName(name) {
+  return ({ pi: "Pi", codex: "Codex", claude: "Claude Code", grok: "Grok", amp: "Amp", kimi: "Kimi" })[name] || String(name || "Harness").replace(/(^|-)([a-z])/g, (_, separator, letter) => `${separator}${letter.toUpperCase()}`);
+}
+
+function onboardingModel() {
+  return ({ claude: "alex/claude-haiku-4-5", anthropic: "alex/claude-haiku-4-5", codex: "alex/gpt-5.6-sol", openai: "alex/gpt-5.6-sol", gemini: "alex/gemini-2.5-flash", grok: "alex/grok-code-fast-1", xai: "alex/grok-code-fast-1", kimi: "alex/kimi/k3" })[state.selectedProvider] || "alex/gpt-5.6-sol";
+}
+
+function harnessTestCommand(name) {
+  const model = onboardingModel();
+  return ({
+    claude: `claude --settings ~/.claude/alex-settings.json -p "test" --model ${model}`,
+    kimi: `kimi -m ${model} -p "test"`,
+    codex: `codex --profile alex exec --skip-git-repo-check -m ${model} "test"`,
+    pi: `pi --model ${model} -p "test"`,
+    amp: 'alex wrap amp -- -x "test"',
+  })[name] || `${name} -m ${model} -p "test"`;
+}
+
+function operationMarkup(status, message) {
+  if (status === "idle") return "";
+  const icon = status === "working" ? '<span class="spinner"></span>' : status === "success" ? "✓" : "×";
+  return `<div class="onboarding-operation ${escapeHtml(status)}"><b>${icon}</b><span>${escapeHtml(message)}</span></div>`;
+}
+
+function stageHeader(number, title, completed, summary = "", action = "") {
+  return `<div class="stage-head"><span class="stage-number ${completed ? "complete" : ""}">${completed ? "✓" : number}</span><strong>${escapeHtml(title)}</strong>${completed ? `<small>${escapeHtml(summary)}</small>${action ? `<button data-stage-action="${escapeHtml(action)}">Change harness</button>` : ""}` : ""}</div>`;
+}
+
+function renderHarnessPlan() {
+  if (state.harnessPlanStatus === "working") return operationMarkup("working", "Previewing changes…");
+  if (state.harnessPlanStatus === "failure") return operationMarkup("failure", state.harnessPlanMessage || "Could not preview changes.");
+  if (state.harnessPlanStatus !== "success") return "";
+  const about = state.harnessPlan.find((item) => item.action === "about")?.detail;
+  const changes = state.harnessPlan.filter((item) => item.action !== "about");
+  return `<div class="files-changed"><span>FILES CHANGED</span>${about ? `<p class="about-change"><b>ABOUT</b>${escapeHtml(about)}</p>` : ""}${changes.length ? changes.map((item) => `<div class="file-change"><b class="${escapeHtml(item.action)}">${escapeHtml(String(item.action || "change").toUpperCase())}</b><code>${escapeHtml(item.path)}</code><small>${escapeHtml(item.detail)}</small></div>`).join("") : '<p class="muted">No file changes are needed; Connect will refresh the harness model list.</p>'}<button class="primary" data-connect-onboarding-harness>Connect</button>${operationMarkup(state.harnessStatus, state.harnessStatus === "working" ? `Connecting ${harnessDisplayName(state.selectedHarness)}…` : state.harnessStatus === "failure" ? (state.harnessStatusMessage || "Connection failed.") : "")}</div>`;
+}
+
+function traceStatusMessage() {
+  if (state.harnessTraceStatus === "working") return "Waiting for a new traced request…";
+  if (state.harnessTraceStatus === "checking") return "Checking for a new matching request…";
+  if (state.harnessTraceStatus === "failure") return state.harnessTraceMessage || "The matching request returned an error.";
+  return "Run the command above, then Alex will match the new trace to this harness.";
+}
+
+function renderTraceSummary(trace) {
+  const input = finite(trace.input_tokens);
+  const output = finite(trace.output_tokens);
+  const cost = trace.total_cost_usd ?? trace.cost_usd;
+  const status = trace.error || finite(trace.status) >= 400 ? `Error · ${trace.status || "unknown"}` : trace.status || "Complete";
+  const timestamp = trace.ts_response_ms || trace.ts_request_ms;
+  const age = Math.max(0, Math.round((Date.now() - finite(timestamp)) / 1000));
+  return `<dl class="trace-summary"><div><dt>Model</dt><dd>${escapeHtml(trace.model || trace.served_model || "Unknown")}</dd></div><div><dt>Tokens</dt><dd>${escapeHtml(`${formatInteger(input)} in · ${formatInteger(output)} out`)}</dd></div><div><dt>Cost</dt><dd>${escapeHtml(cost === undefined || cost === null ? "Not recorded" : formatMoney(cost))}</dd></div><div><dt>Status</dt><dd>${escapeHtml(status)}</dd></div><div><dt>Time</dt><dd>${escapeHtml(age < 10 ? "now" : `${formatAge(age)} ago`)}</dd></div></dl>`;
+}
+
+function renderOnboardingHarnessStages() {
+  const node = $("#onboarding-harness-stages");
+  if (!node) return;
+  const connectable = state.harnesses.filter((harness) => harness.supports_connect);
+  const installed = connectable.filter((harness) => harness.installed);
+  const stageOneComplete = state.harnessStatus === "success";
+  const stageTwoComplete = Boolean(state.harnessTrace);
+  const cards = installed.map((harness) => `<button class="harness-choice ${state.selectedHarness === harness.name ? "selected" : ""}" data-onboarding-harness="${escapeHtml(harness.name)}"><span class="harness-logo">${escapeHtml(harnessDisplayName(harness.name).charAt(0))}</span><span><strong>${escapeHtml(harnessDisplayName(harness.name))}</strong><small>${state.selectedHarness === harness.name && state.harnessPlanStatus === "success" ? "Plan loaded" : "Preview plan"}</small></span>${state.selectedHarness === harness.name ? "<b>✓</b>" : ""}</button>`).join("");
+  const manualOptions = connectable.map((harness) => `<option value="${escapeHtml(harness.name)}" ${state.selectedHarness === harness.name ? "selected" : ""}>${escapeHtml(harnessDisplayName(harness.name))}</option>`).join("");
+  const manualResult = state.manualHarnessResult ? `<p class="inline-message ${escapeHtml(state.manualHarnessResult.kind)}">${escapeHtml(state.manualHarnessResult.message)}</p>` : "";
+  const stageOneBody = stageOneComplete ? "" : `<div class="harness-choice-grid">${cards || '<p class="muted">No installed, connectable harnesses were detected. Add one manually or skip this page and continue.</p>'}</div>${renderHarnessPlan()}<details class="manual-harness" ${state.manualHarnessResult ? "open" : ""}><summary>Add harness manually</summary><p>Choose the harness and enter its binary path. Alex saves the existing override, refreshes detection, and reports the detected version.</p><form id="manual-harness-form" class="manual-harness-form"><select name="harness" required>${manualOptions}</select><input name="binary" required placeholder="/absolute/path/to/binary" spellcheck="false"><button>Check binary</button></form><div id="manual-harness-result">${manualResult}</div></details>`;
+  const command = state.selectedHarness ? harnessTestCommand(state.selectedHarness) : "";
+  const stageTwoBody = stageOneComplete && !stageTwoComplete ? `<p>Use the connected profile and send one real request through Alex.</p><div class="copy-code"><code>${escapeHtml(command)}</code><button data-copy-harness-command>Copy</button></div>${operationMarkup(state.harnessTraceStatus === "failure" ? "failure" : "working", traceStatusMessage())}<button data-check-harness-trace>Check for Request</button>` : "";
+  const traceLink = safeUrl(state.selectedHarness ? `/ui/?harness=${encodeURIComponent(state.selectedHarness)}#traces` : "/ui/#traces");
+  const stageThreeBody = stageTwoComplete ? `${renderTraceSummary(state.harnessTrace)}<a class="primary button-link" href="${escapeHtml(traceLink)}" target="_blank" rel="noopener">Open Trace Browser</a><p class="micro">Opens in a new tab filtered with <code>harness:${escapeHtml(state.selectedHarness)}</code>.</p>` : '<p class="locked-copy">Complete the previous stage to unlock this one.</p>';
+  node.innerHTML = `<section class="onboarding-stage ${stageOneComplete ? "collapsed" : ""}">${stageHeader(1, "Pick your harness", stageOneComplete, state.harnessSummary ? `${state.harnessSummary.models_total || 0} models ready ✓` : "Connected", "change")}${stageOneBody}</section><section class="onboarding-stage ${!stageOneComplete ? "locked" : ""} ${stageTwoComplete ? "collapsed" : ""}">${stageHeader(2, "Send a test request", stageTwoComplete, stageTwoComplete ? `${state.harnessTrace.model || "alex model"} · ${finite(state.harnessTrace.input_tokens) + finite(state.harnessTrace.output_tokens)} tokens` : "")}${!stageOneComplete ? '<p class="locked-copy">Complete the previous stage to unlock this one.</p>' : stageTwoBody}</section><section class="onboarding-stage ${!stageTwoComplete ? "locked" : ""}">${stageHeader(3, "See your trace", false)}${stageThreeBody}</section>`;
+  bindActions(node, "[data-onboarding-harness]", (event) => selectOnboardingHarness(event.currentTarget.dataset.onboardingHarness));
+  $("[data-connect-onboarding-harness]", node)?.addEventListener("click", connectOnboardingHarness);
+  $("[data-stage-action='change']", node)?.addEventListener("click", changeOnboardingHarness);
+  $("#manual-harness-form", node)?.addEventListener("submit", checkManualHarness);
+  $("[data-copy-harness-command]", node)?.addEventListener("click", async (event) => {
+    await copyLoginText(command, $("code", event.currentTarget.parentElement));
+    event.currentTarget.textContent = "Copied";
+  });
+  $("[data-check-harness-trace]", node)?.addEventListener("click", () => pollForHarnessTrace(true));
+}
+
+async function selectOnboardingHarness(name) {
+  stopHarnessTracePolling();
+  state.selectedHarness = name;
+  state.harnessPlan = [];
+  state.harnessPlanStatus = "working";
+  state.harnessStatus = "idle";
+  state.harnessSummary = null;
+  state.harnessTrace = null;
+  state.harnessTraceStatus = "idle";
+  state.manualHarnessResult = null;
+  renderOnboardingHarnessStages();
+  try {
+    const preview = await api(`/admin/harnesses/${encodeURIComponent(name)}/connect?dry_run=true`, { method: "POST" });
+    if (state.selectedHarness !== name) return;
+    state.harnessPlan = preview.plan || [];
+    state.harnessPlanStatus = "success";
+  } catch (error) {
+    if (state.selectedHarness !== name) return;
+    state.harnessPlanStatus = "failure";
+    state.harnessPlanMessage = error.message;
+  }
+  renderOnboardingHarnessStages();
+}
+
+async function connectOnboardingHarness(event) {
+  const name = state.selectedHarness;
+  if (!name) return;
+  event.currentTarget.disabled = true;
+  state.harnessStatus = "working";
+  renderOnboardingHarnessStages();
+  try {
+    state.harnessSummary = await api(`/admin/harnesses/${encodeURIComponent(name)}/connect`, { method: "POST" });
+    if (state.selectedHarness !== name) return;
+    state.harnessStatus = "success";
+    await loadHarnessesData(true);
+    beginHarnessTracePolling(true);
+  } catch (error) {
+    if (state.selectedHarness !== name) return;
+    state.harnessStatus = "failure";
+    state.harnessStatusMessage = error.message;
+  }
+  renderOnboardingHarnessStages();
+}
+
+function changeOnboardingHarness() {
+  stopHarnessTracePolling();
+  state.selectedHarness = null;
+  state.harnessPlan = [];
+  state.harnessPlanStatus = "idle";
+  state.harnessStatus = "idle";
+  state.harnessSummary = null;
+  state.harnessTrace = null;
+  state.harnessTraceStatus = "idle";
+  renderOnboardingHarnessStages();
+}
+
+async function checkManualHarness(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = new FormData(form);
+  const name = String(values.get("harness") || "");
+  const binary = String(values.get("binary") || "").trim();
+  const output = $("#manual-harness-result");
+  const button = $("button", form);
+  button.disabled = true;
+  inlineMessage(output, "Checking the binary and refreshing detection…", "neutral");
+  try {
+    await api(`/admin/harnesses/${encodeURIComponent(name)}/override`, { method: "PUT", body: JSON.stringify({ binary, config_dir: null }) });
+    const harnesses = await loadHarnessesData(true);
+    const harness = harnesses.find((item) => item.name === name);
+    if (!harness?.installed || !harness.binary) throw new Error("Binary not found or invalid for this harness.");
+    const foundMessage = `✓ Found ${harnessDisplayName(name)}${harness.version ? ` · ${harness.version}` : ""}`;
+    state.selectedHarness = name;
+    await selectOnboardingHarness(name);
+    state.manualHarnessResult = { kind: "success", message: foundMessage };
+    renderOnboardingHarnessStages();
+  } catch (error) {
+    state.manualHarnessResult = { kind: "danger", message: `× ${error.message}` };
+    inlineMessage(output, state.manualHarnessResult.message, state.manualHarnessResult.kind);
+  }
+  finally { button.disabled = false; }
+}
+
+function beginHarnessTracePolling(resetStart = true) {
+  stopHarnessTracePolling();
+  if (resetStart || !state.harnessTraceStartedMs) state.harnessTraceStartedMs = Date.now();
+  state.harnessTraceStatus = "working";
+  renderOnboardingHarnessStages();
+  pollForHarnessTrace(false);
+  state.harnessTracePoll = setInterval(() => pollForHarnessTrace(false), 2000);
+}
+
+function stopHarnessTracePolling() {
+  clearInterval(state.harnessTracePoll);
+  state.harnessTracePoll = null;
+}
+
+async function pollForHarnessTrace(manual = false) {
+  if (!state.selectedHarness || !state.harnessTraceStartedMs || state.harnessTrace) return;
+  if (manual) state.harnessTraceStatus = "checking";
+  renderOnboardingHarnessStages();
+  try {
+    const params = new URLSearchParams({ limit: "100", harness: state.selectedHarness, since: new Date(state.harnessTraceStartedMs).toISOString() });
+    const data = await api(`/traces/summaries?${params}`);
+    const trace = (data.traces || []).filter((item) => finite(item.ts_request_ms) >= state.harnessTraceStartedMs).sort((left, right) => finite(right.ts_request_ms) - finite(left.ts_request_ms))[0];
+    if (!trace) {
+      state.harnessTraceStatus = "working";
+      state.harnessTraceMessage = manual ? "No new matching request yet — run the command, then check again." : "";
+      renderOnboardingHarnessStages();
+      return;
+    }
+    if (finite(trace.status) >= 400 || trace.error) {
+      state.harnessTraceStatus = "failure";
+      state.harnessTraceMessage = `Your request reached Alex but the provider rejected it: ${trace.error || `HTTP ${trace.status}`}`;
+      stopHarnessTracePolling();
+      renderOnboardingHarnessStages();
+      return;
+    }
+    const metadata = await api(`/traces/${encodeURIComponent(trace.id)}/metadata`).catch(() => null);
+    state.harnessTrace = { ...trace, ...(metadata?.trace || metadata || {}) };
+    state.harnessTraceStatus = "success";
+    stopHarnessTracePolling();
+    renderOnboardingHarnessStages();
+  } catch (error) {
+    if (state.sessionRecovery) return;
+    state.harnessTraceStatus = manual ? "failure" : "working";
+    state.harnessTraceMessage = manual ? error.message : "";
+    renderOnboardingHarnessStages();
+  }
 }
 
 async function logout() {
@@ -383,23 +786,53 @@ function setRefreshInterval(event) {
 
 /* 4. Shared data loaders. */
 async function loadHealth() {
-  const response = await fetch("/health", { credentials: "same-origin" });
-  if (!response.ok) throw new Error(`Daemon health returned HTTP ${response.status}`);
-  state.health = await response.json();
+  state.health = await api("/health");
   const health = state.health;
   $("#daemon-status").className = "pill success";
   $("#daemon-status").textContent = `Online · ${health.version}`;
-  $("#sidebar-dot").className = "status-dot healthy";
+  $("#sidebar-dot").className = "status-dot ok";
   $("#sidebar-status").textContent = "Daemon online";
-  $("#sidebar-uptime").textContent = `Up ${formatAge(health.uptime_s)}`;
+  $("#sidebar-uptime").textContent = `daemon v${health.version} · up ${formatAge(health.uptime_s)}`;
   $("#sidebar-version").textContent = `v${health.version}`;
   $("#about-version").textContent = health.version;
   return health;
 }
 
+function renderSidebarUpdate(update) {
+  const button = $("#sidebar-update");
+  button.hidden = !update?.update_available;
+  button.title = update?.update_available ? `Update daemon to ${update.latest}` : "Daemon is up to date";
+}
+
+async function loadSidebarUpdate() {
+  state.update = await api("/admin/update");
+  renderSidebarUpdate(state.update);
+  return state.update;
+}
+
+async function refreshSidebarStatus() {
+  const button = $("#sidebar-refresh");
+  button.disabled = true;
+  try { await Promise.all([loadHealth(), loadSidebarUpdate()]); }
+  catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
+  finally { button.disabled = false; }
+}
+
+async function applySidebarUpdate() {
+  const button = $("#sidebar-update");
+  button.disabled = true;
+  try {
+    const result = await api("/admin/update", { method: "POST" });
+    toast(result.applying ? "Daemon update started. It may restart briefly." : (result.message || "Daemon is already up to date."));
+    await loadSidebarUpdate();
+  } catch (error) { if (!state.sessionRecovery) toast(error.message, "danger"); }
+  finally { button.disabled = false; }
+}
+
 async function loadAccounts() {
   const data = await api("/admin/accounts");
   state.accounts = data.accounts || [];
+  if (state.onboardingStep === 2) renderOnboardingProviders();
   return state.accounts;
 }
 
@@ -412,7 +845,7 @@ async function loadHarnessesData(refresh = false) {
 async function refreshSharedData() {
   const results = await Promise.allSettled([
     loadHealth(), loadAccounts(), loadHarnessesData(false),
-    api("/admin/middleware"), api("/admin/analytics?since_minutes=60"),
+    api("/admin/middleware"), api("/admin/analytics?since_minutes=60"), loadSidebarUpdate(),
   ]);
   if (results[3].status === "fulfilled") state.middleware = results[3].value;
   if (results[4].status === "fulfilled") state.analytics = results[4].value;
@@ -466,6 +899,7 @@ async function loadDashboard() {
   state.limits = limits.status === "fulfilled" ? limits.value : { providers: [] };
   state.dario = darioResult.status === "fulfilled" ? darioResult.value : null;
   state.update = update.status === "fulfilled" ? update.value : null;
+  renderSidebarUpdate(state.update);
   const hourTotals = analyticsTotals(hour.value);
   const dayTotals = analyticsTotals(day.value);
   $("#dashboard-lede").textContent = `Alex ${state.health.version} has been online ${formatAge(state.health.uptime_s)} with ${formatInteger(state.health.in_flight)} request${state.health.in_flight === 1 ? "" : "s"} in flight.`;
@@ -497,6 +931,7 @@ async function loadGeneral() {
   ]);
   if (health.status === "rejected") throw health.reason;
   state.update = update.status === "fulfilled" ? update.value : null;
+  renderSidebarUpdate(state.update);
   const updateSummary = $("#update-summary");
   updateSummary.textContent = state.update ? `${state.update.current}${state.update.update_available ? ` → ${state.update.latest} available` : " is current"}` : (update.reason?.message || "Update status unavailable");
   if (channel.status === "fulfilled") $("#update-form").elements.channel.value = channel.value.channel;
@@ -1499,16 +1934,19 @@ function bindStaticEvents() {
   $("#remote-auth-form").addEventListener("submit", submitAdminKey);
   $("#password-config-form").addEventListener("submit", (event) => submitWebPassword(event, true));
   $("#web-password-form").addEventListener("submit", (event) => submitWebPassword(event, false));
-  $("#finish-onboarding").addEventListener("click", finishOnboarding);
+  $("#skip-onboarding").addEventListener("click", finishOnboarding);
+  $("#skip-onboarding-step").addEventListener("click", skipOnboardingStep);
+  $("#onboarding-back").addEventListener("click", () => showOnboardingStep(state.onboardingStep - 1));
+  $("#onboarding-next").addEventListener("click", nextOnboardingStep);
   $("#restart-onboarding").addEventListener("click", restartOnboarding);
   $("#logout").addEventListener("click", logout);
-  $$('[data-next-step]').forEach((button) => button.addEventListener("click", () => showOnboardingStep(Number(button.dataset.nextStep))));
-  $$('[data-step-button]').forEach((button) => button.addEventListener("click", () => { if (!button.disabled) showOnboardingStep(Number(button.dataset.stepButton)); }));
   $$('nav [data-view]').forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view, true)));
   $$('[data-go]').forEach((button) => button.addEventListener("click", () => selectView(button.dataset.go, true)));
   $$('[data-refresh-card]').forEach((button) => button.addEventListener("click", refreshCurrentView));
   $("#mobile-menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
   $("#global-refresh").addEventListener("click", refreshCurrentView);
+  $("#sidebar-refresh").addEventListener("click", refreshSidebarStatus);
+  $("#sidebar-update").addEventListener("click", applySidebarUpdate);
   $("#quick-refresh").addEventListener("click", refreshCurrentView);
   $("#refresh-interval").addEventListener("change", setRefreshInterval);
   $("#run-ping").addEventListener("click", testCredentials);

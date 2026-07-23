@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 const INDEX: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const STYLES: &str = include_str!("../web/styles.css");
+const ALEX_ICON: &[u8] = include_bytes!("../web/assets/alex-icon.png");
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
@@ -41,6 +42,21 @@ pub async fn app_js() -> Response {
 
 pub async fn styles() -> Response {
     asset("text/css; charset=utf-8", STYLES)
+}
+
+pub async fn alex_icon() -> Response {
+    let mut response = (StatusCode::OK, ALEX_ICON).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -184,6 +200,7 @@ mod tests {
             assert_html_id(id);
         }
         assert_local_script_and_style_assets();
+        assert!(INDEX.contains("src=\"/ui/assets/alex-icon.png\""));
 
         for endpoint in [
             "/web/auth/status",
@@ -208,6 +225,8 @@ mod tests {
             "/admin/auth/login/complete",
             "/admin/auth/reauth/start",
             "/admin/auth/reauth/submit",
+            "/admin/auth/import-candidates",
+            "/admin/auth/import",
             "/admin/openrouter/exposed",
             "/admin/exo/models",
             "/admin/auth/cliproxyapi",
@@ -226,6 +245,13 @@ mod tests {
         }
         assert!(APP_JS.contains("data-reauth-id"));
         assert!(APP_JS.contains("dry_run=true"));
+        assert!(APP_JS.contains("/override"));
+        assert!(APP_JS.contains("target=\"_blank\""));
+        assert!(INDEX.contains("id=\"skip-onboarding\""));
+        assert!(INDEX.contains("id=\"skip-onboarding-step\""));
+        assert!(INDEX.contains("id=\"onboarding-error\""));
+        assert_eq!(INDEX.matches("data-onboarding-step=").count(), 8);
+        assert!(!INDEX.contains("<span class=\"nav-icon\">"));
         assert!(INDEX.contains("id=\"cliproxyapi-form\""));
         assert_eq!(INDEX.matches("data-refresh-card").count(), 5);
 
@@ -282,5 +308,17 @@ mod tests {
         assert!(page_loader.contains("replaceTranscriptPage"));
         assert!(!page_loader.contains("/turn`"));
         assert!(javascript_function(APP_JS, "replaceTranscriptPage").contains("replaceChildren"));
+    }
+
+    #[tokio::test]
+    async fn alex_icon_is_embedded_and_immutable() {
+        let response = alex_icon().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(ALEX_ICON.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }

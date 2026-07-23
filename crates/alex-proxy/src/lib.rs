@@ -2473,6 +2473,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/", get(web::index))
         .route("/ui/app.js", get(web::app_js))
         .route("/ui/styles.css", get(web::styles))
+        .route("/ui/assets/alex-icon.png", get(web::alex_icon))
         .route("/health", get(health))
         .route("/connect", get(connect_info))
         .route("/web/auth/status", get(web_auth_status))
