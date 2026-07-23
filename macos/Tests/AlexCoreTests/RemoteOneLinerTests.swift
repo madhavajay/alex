@@ -48,4 +48,36 @@ import Testing
             config: local, availableLANHosts: ["192.168.50.4"]).absoluteString
             == "http://localhost:4100")
     }
+
+    @Test func optionsControlInstallKeyAndModel() {
+        let bare = RemoteOneLiner.build(
+            options: .init(
+                harness: "claude", model: "alex/gpt-5.6-sol",
+                includeInstall: false, includeKey: false),
+            baseURL: "http://192.168.1.42:4100", key: nil)
+        #expect(!bare.contains("curl"))
+        #expect(!bare.contains("--key"))
+        #expect(bare.contains("--model alex/gpt-5.6-sol"))
+        #expect(bare.hasSuffix(
+            "alex up claude --url http://192.168.1.42:4100 --model alex/gpt-5.6-sol\""))
+
+        let keyed = RemoteOneLiner.build(
+            options: .init(harness: "codex"),
+            baseURL: "http://192.168.1.42:4100", key: "alxk-fresh")
+        #expect(keyed.contains("command -v alex >/dev/null || curl"))
+        #expect(keyed.hasSuffix(
+            "alex up codex --url http://192.168.1.42:4100 --key alxk-fresh\""))
+    }
+
+    @Test func remoteAccessRankingPrefersPrimaryLANOverVirtualInterfaces() {
+        let ranked = NetworkInterfaces.rankedForRemoteAccess([
+            .init(name: "bridge100", address: "192.168.64.1"),
+            .init(name: "utun3", address: "100.101.102.103"),
+            .init(name: "en0", address: "192.168.1.150"),
+            .init(name: "en5", address: "192.168.2.9"),
+        ])
+        #expect(ranked.map(\.address) == [
+            "192.168.1.150", "192.168.2.9", "100.101.102.103", "192.168.64.1",
+        ])
+    }
 }

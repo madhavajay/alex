@@ -31,10 +31,14 @@ final class OnboardingModel {
     static let completedDefaultsKey = OnboardingLaunchPolicy.completedDefaultsKey
     static let currentVersion = OnboardingLaunchPolicy.currentVersion
     static let stepTitles = [
-        "Meet Alex", "Pick a provider", "Connect and test",
+        "Meet Alex", "Pick a provider", "Network access", "Connect and test",
         "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
         "Beyond single provider",
     ]
+    // Named indices for the steps other logic branches on.
+    static let providerStep = 1
+    static let networkStep = 2
+    static let connectStep = 3
 
     let store: SnapshotStore
     let openProviderSettings: @MainActor () -> Void
@@ -67,6 +71,11 @@ final class OnboardingModel {
     var exampleModelLoading = false
     var traceState: OperationState = .idle
     var discoveredTrace: TraceSession?
+    var networkChoice = "loopback"
+    var networkInterfaces: [NetworkInterfaceAddress] = []
+    var selectedInterfaceAddress = ""
+    var networkSaveState: OperationState = .idle
+    var networkChoiceLoaded = false
     var mintedOnboardingKey: MintedRunKey?
     var onboardingKeyFingerprint: String?
     var credentialMintState: OperationState = .idle
@@ -104,10 +113,10 @@ final class OnboardingModel {
 
     var canAdvance: Bool {
         switch step {
-        case 1:
+        case Self.providerStep:
             if case .success = providerState { return true }
             return false
-        case 2:
+        case Self.connectStep:
             return false
         default: return true
         }
@@ -570,19 +579,19 @@ final class OnboardingModel {
         // again. Do not preserve an expanded OAuth flow (Gemini loopback in
         // particular can otherwise leave the provider grid above the retained
         // scroll position), and do the same when leaving the picker backward.
-        if step == 1 || step == 2 {
+        if step == Self.providerStep || step == Self.connectStep {
             clearProviderSelection()
         }
         go(to: step - 1)
     }
 
     func skipStep() {
-        if step == 1 {
+        if step == Self.providerStep {
             authModel?.cancel()
             authModel = nil
             selectedProvider = nil
             providerState = .idle
-        } else if step == 2 {
+        } else if step == Self.connectStep {
             selectedHarness = nil
             harnessPlanState = .idle
             harnessPlan = []
@@ -603,7 +612,7 @@ final class OnboardingModel {
     func go(to next: Int) {
         pollTask?.cancel()
         step = min(max(next, 0), Self.stepTitles.count - 1)
-        if step == 2, harnessState.isSuccess, !traceState.isSuccess {
+        if step == Self.connectStep, harnessState.isSuccess, !traceState.isSuccess {
             beginTracePolling()
         }
     }
@@ -818,7 +827,76 @@ final class OnboardingModel {
 
     func openBrowser() {
         openTraceBrowser(selectedHarness.map { "harness:\($0)" })
-        if step == 2 { go(to: 3) }
+        if step == Self.connectStep { go(to: Self.connectStep + 1) }
+    }
+
+    func loadNetworkChoice() {
+        guard !networkChoiceLoaded else { return }
+        networkChoiceLoaded = true
+        networkInterfaces = NetworkInterfaces.rankedForRemoteAccess(
+            NetworkInterfaces.addresses())
+        switch store.config?.host ?? "" {
+        case "127.0.0.1", "localhost", "::1", "[::1]", "":
+            networkChoice = "loopback"
+        case "0.0.0.0", "::", "*":
+            networkChoice = "all"
+        case let host:
+            networkChoice = "interface"
+            selectedInterfaceAddress = host
+        }
+        if selectedInterfaceAddress.isEmpty {
+            selectedInterfaceAddress = networkInterfaces.first?.address ?? ""
+        }
+    }
+
+    /// Applies the chosen bind target through `alex service bind` and restarts
+    /// the daemon service so the choice is live before harness connect.
+    func saveNetworkChoice() {
+        guard !networkSaveState.isWorking else { return }
+        let target: String
+        switch networkChoice {
+        case "all": target = "all"
+        case "interface":
+            guard !selectedInterfaceAddress.isEmpty else {
+                networkSaveState = .failure("Choose an interface address first.")
+                return
+            }
+            target = selectedInterfaceAddress
+        default: target = "loopback"
+        }
+        networkSaveState = .working("Saving network access…")
+        Task {
+            let currentHost = store.config?.host ?? "127.0.0.1"
+            let currentTarget: String
+            switch currentHost {
+            case "127.0.0.1", "localhost", "::1", "[::1]", "": currentTarget = "loopback"
+            case "0.0.0.0", "::", "*": currentTarget = "all"
+            default: currentTarget = currentHost
+            }
+            if currentTarget == target {
+                networkSaveState = .success(target == "loopback"
+                    ? "Alex is reachable from this Mac only."
+                    : "Alex already listens on \(target == "all" ? "all interfaces" : target).")
+                return
+            }
+            let bind = await DaemonController.run(args: ["service", "bind", target])
+            guard bind.ok else {
+                networkSaveState = .failure(bind.combined.isEmpty
+                    ? "Could not save the network access choice." : bind.combined)
+                return
+            }
+            networkSaveState = .working("Restarting the daemon service…")
+            let restart = await DaemonController.run(args: ["service", "restart"])
+            if restart.ok {
+                await store.refresh()
+                networkSaveState = .success(target == "loopback"
+                    ? "Alex is reachable from this Mac only."
+                    : "Alex now listens on \(target == "all" ? "all interfaces" : target).")
+            } else {
+                networkSaveState = .failure(restart.combined.isEmpty
+                    ? "Could not restart the daemon service." : restart.combined)
+            }
+        }
     }
 
     func cancel() {
@@ -906,11 +984,12 @@ struct OnboardingView: View {
     @ViewBuilder private var stepContent: some View {
         switch model.step {
         case 0: meetAlex
-        case 1: providerPicker
-        case 2: stagedConnect
-        case 3: credentials
-        case 4: notifications
-        case 5: failover
+        case OnboardingModel.providerStep: providerPicker
+        case OnboardingModel.networkStep: networkAccess
+        case OnboardingModel.connectStep: stagedConnect
+        case 4: credentials
+        case 5: notifications
+        case 6: failover
         default: beyondSingleProvider
         }
     }
@@ -918,7 +997,7 @@ struct OnboardingView: View {
     private var meetAlex: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let image = HarnessIconLoader.image(
-                resource: "header-v2", extension: "jpg", subdirectory: "onboarding")
+                resource: "header", extension: "jpg", subdirectory: "onboarding")
             {
                 Image(nsImage: image)
                     .resizable().aspectRatio(contentMode: .fill)
@@ -1230,6 +1309,116 @@ struct OnboardingView: View {
             }
             .toggleStyle(.checkbox)
         }
+    }
+
+    private var networkAccess: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intro(
+                "Who can reach Alex?",
+                "Alex is an HTTP proxy. Harnesses on other machines — a Linux box, a homelab server, a laptop on your tailnet — can only connect if Alex listens beyond this Mac.")
+            VStack(alignment: .leading, spacing: 10) {
+                networkChoiceRow(
+                    value: "loopback",
+                    title: "This Mac only (recommended)",
+                    subtitle: "Listens on 127.0.0.1. Nothing else on your network can reach Alex.",
+                    icon: "lock.shield")
+                networkChoiceRow(
+                    value: "interface",
+                    title: "A specific network",
+                    subtitle: "Pick one interface — your LAN or Tailscale. Remote 1-liners embed this address.",
+                    icon: "network")
+                networkChoiceRow(
+                    value: "all",
+                    title: "All interfaces",
+                    subtitle: "Listens on 0.0.0.0 — every network this Mac joins, now and later.",
+                    icon: "globe")
+            }
+            if model.networkChoice == "interface" {
+                if model.networkInterfaces.isEmpty {
+                    Text("No non-loopback interface addresses are available.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.textTertiary)
+                } else {
+                    HStack {
+                        Text("Interface")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        Picker("", selection: $model.selectedInterfaceAddress) {
+                            ForEach(model.networkInterfaces) { interface in
+                                Text(interface.displayName).tag(interface.address)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 300)
+                    }
+                    .padding(12)
+                    .cardStyle()
+                }
+            }
+            if model.networkChoice != "loopback" {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Anyone on that network with your local key gains admin access", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(AlexTheme.Colors.warningOrange)
+                    Text("Model calls still require a scoped key, but the admin API — credential vault, key minting, data reset — is protected only by your local key. Prefer a trusted network such as Tailscale, and rotate the local key if you share this network.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AlexTheme.Colors.warningOrange.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: AlexTheme.Radius.md))
+            }
+            PillButton(
+                title: "Apply network access", variant: .solidAccent,
+                isEnabled: !model.networkSaveState.isWorking,
+                isBusy: model.networkSaveState.isWorking
+            ) { model.saveNetworkChoice() }
+            operation(model.networkSaveState)
+            Text("You can change this anytime in Settings → General → Network exposure.")
+                .font(.system(size: 11))
+                .foregroundStyle(AlexTheme.Colors.textTertiary)
+        }
+        .onAppear { model.loadNetworkChoice() }
+    }
+
+    private func networkChoiceRow(
+        value: String, title: String, subtitle: String, icon: String
+    ) -> some View {
+        Button {
+            model.networkChoice = value
+            model.networkSaveState = .idle
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundStyle(AlexTheme.Colors.primary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AlexTheme.Colors.foreground)
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(AlexTheme.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                if model.networkChoice == value {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(AlexTheme.Colors.primary)
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .fill(model.networkChoice == value
+                    ? AlexTheme.Colors.primary.opacity(0.10) : AlexTheme.Colors.card))
+            .overlay(RoundedRectangle(cornerRadius: AlexTheme.Radius.md)
+                .strokeBorder(model.networkChoice == value
+                    ? AlexTheme.Colors.primary.opacity(0.45) : AlexTheme.Colors.cardBorder))
+        }
+        .buttonStyle(.plain)
     }
 
     private var stagedConnect: some View {

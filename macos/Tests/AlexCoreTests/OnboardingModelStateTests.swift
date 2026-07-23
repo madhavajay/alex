@@ -29,7 +29,7 @@ import Testing
 
     @Test func backwardAndForwardNavigationAllowsAProviderReselection() {
         let model = makeModel()
-        model.step = 2
+        model.step = OnboardingModel.connectStep
         model.selectedProvider = "openai"
         model.selectedProviderAccountID = "stale-account"
         model.selectedHarness = "pi"
@@ -40,7 +40,7 @@ import Testing
 
         model.back()
 
-        #expect(model.step == 1)
+        #expect(model.step == OnboardingModel.networkStep)
         #expect(model.selectedProvider == nil)
         #expect(model.selectedProviderAccountID == nil)
         #expect(model.traceState == .idle)
@@ -51,7 +51,7 @@ import Testing
         model.selectedProviderAccountID = "new-account"
         model.providerState = .success("new@example.com")
         model.next()
-        #expect(model.step == 2)
+        #expect(model.step == OnboardingModel.connectStep)
         #expect(model.selectedProvider == "anthropic")
         #expect(model.selectedProviderAccountID == "new-account")
     }
