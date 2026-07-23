@@ -5,13 +5,13 @@ const ruleId = 'alex.fable-5-to-gpt-5.6-sol';
 
 test('middleware renders readable rules, persists toggles, and dry-runs a fixture', async ({ page, runtime }) => {
   await openUi(page, runtime);
-  await page.getByRole('button', { name: 'Middleware' }).click();
+  await page.locator('nav [data-view="middleware"]').click();
 
   const card = page.locator(`[data-rule-card="${ruleId}"]`);
   await expect(card).toBeVisible();
   await expect(card).toContainText('Fable 5 → GPT-5.6 Sol');
-  await expect(card.locator('.explanation')).toContainText('model regex: ^claude-fable-5$');
-  await expect(card.locator('.explanation')).toContainText('reroute to gpt-5.6-sol');
+  await expect(card.locator('p.muted')).toContainText('model regex: ^claude-fable-5$');
+  await expect(card.locator('p.muted')).toContainText('reroute to gpt-5.6-sol');
 
   const toggle = card.locator(`[data-rule-toggle="${ruleId}"]`);
   const initial = await toggle.getAttribute('aria-pressed');
@@ -33,6 +33,7 @@ test('middleware renders readable rules, persists toggles, and dry-runs a fixtur
 
   await card.locator('select[name="fixture"]').selectOption('anthropic-fable-refusal-200');
   await card.getByRole('button', { name: 'Run dry test' }).click();
-  await expect(card.locator('.dry-run-result')).toContainText('Decision: reroute');
-  await expect(card.locator('.dry-run-result')).toContainText(`Matched: ${ruleId}`);
+  const result = card.locator(`[data-rule-result="${ruleId}"]`);
+  await expect(result).toContainText('Decision: reroute');
+  await expect(result).toContainText(`Matched: ${ruleId}`);
 });

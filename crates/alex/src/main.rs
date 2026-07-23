@@ -26,6 +26,7 @@ mod resume;
 mod selfupdate;
 mod status;
 mod telegram;
+mod tray;
 mod tui;
 mod ui;
 #[cfg(windows)]
@@ -295,6 +296,11 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// Run or manage the Linux desktop status tray
+    Tray {
+        #[command(subcommand)]
+        command: Option<TrayCommand>,
+    },
     /// Mint, list, and revoke ephemeral run keys (requires a running daemon)
     Keys {
         #[command(subcommand)]
@@ -389,6 +395,18 @@ enum ServiceCommand {
     /// Stop + remove the OS user service
     Uninstall,
     /// Show service state
+    Status,
+}
+
+#[derive(Subcommand)]
+enum TrayCommand {
+    /// Run the status tray in this desktop session (the default)
+    Run,
+    /// Start the status tray automatically at graphical login
+    Install,
+    /// Remove graphical-login autostart
+    Uninstall,
+    /// Show whether graphical-login autostart is installed
     Status,
 }
 
@@ -2687,23 +2705,11 @@ fn harness_admin_router(state: Arc<alex_proxy::AppState>) -> axum::Router {
         req: axum::extract::Request,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
-        let presented = req
-            .headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| {
-                req.headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-                    .map(str::to_string)
-            });
-        if presented.as_deref() != state.local_key.read().ok().as_deref().map(String::as_str) {
+        if !alex_proxy::admin_request_authenticated(&state, req.headers()) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 axum::Json(
-                    serde_json::json!({"error": "admin routes require x-api-key: <local_key>"}),
+                    serde_json::json!({"error": "admin routes require a signed-in web session or x-api-key: <local_key>"}),
                 ),
             )
                 .into_response();
@@ -3776,6 +3782,7 @@ async fn main() -> Result<()> {
                 config.upstream_stream_idle_timeout(),
                 config.substitution.clone(),
             );
+            alex_proxy::set_ping_models(&state, config.ping_models());
             alex_proxy::apply_upstream_env_overrides(&state);
             alex_proxy::set_notifications(&state, config.notification_settings());
             glue.set_notification_state(state.clone());
@@ -5039,6 +5046,12 @@ async fn main() -> Result<()> {
                 println!("opened Alex web UI at {url}");
             }
         }
+        Command::Tray { command } => match command.unwrap_or(TrayCommand::Run) {
+            TrayCommand::Run => tray::run(&config).await?,
+            TrayCommand::Install => tray::install()?,
+            TrayCommand::Uninstall => tray::uninstall()?,
+            TrayCommand::Status => tray::status()?,
+        },
         Command::Credentials { json, host } => {
             let base = match host {
                 Some(h) => format!("http://{h}:{}", config.port),
@@ -14126,6 +14139,55 @@ local_key = "alx-test"
             .as_str()
             .unwrap()
             .contains("does not support connect"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_session_cookie_grants_harness_admin_routes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tmpdir("harness-browser-session");
+        std::env::set_var("ALEX_HOME", &home);
+        save_config(&test_config(home.clone())).unwrap();
+        let state = test_state("harness-browser-session-state");
+        let app = alex_proxy::router(state.clone()).merge(harness_admin_router(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let configured = client
+            .post(format!("http://{address}/admin/web/password"))
+            .header("x-api-key", "alx-local")
+            .json(&serde_json::json!({
+                "password": "harness browser session password"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(configured.status(), StatusCode::OK);
+        let cookie = configured
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let harnesses = client
+            .get(format!("http://{address}/admin/harnesses"))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+            .await
+            .unwrap();
+        let status = harnesses.status();
+        let body: serde_json::Value = harnesses.json().await.unwrap();
+        server.abort();
+        std::env::remove_var("ALEX_HOME");
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["harnesses"].is_array());
     }
 
     #[test]

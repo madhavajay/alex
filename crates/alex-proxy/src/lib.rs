@@ -711,6 +711,159 @@ pub struct AppState {
     /// Deliberately transient provider-wide fault injection for exercising
     /// failover and re-auth notifications. It is intentionally not persisted.
     paused_providers: std::sync::Mutex<HashMap<String, PauseMode>>,
+    /// Daemon-configured low-cost models used by both scheduled heartbeats and
+    /// user-requested credential tests from the Web UI.
+    ping_models: std::sync::RwLock<PingModels>,
+    /// Keep manual tests serialized: each one can make a real billed provider
+    /// request and update shared account-health state.
+    credential_test_lock: tokio::sync::Mutex<()>,
+    /// Password-backed browser access. The password hash is persisted beside
+    /// the daemon store; bearer session material exists only in memory.
+    web_auth: WebAuthState,
+}
+
+const WEB_SESSION_COOKIE: &str = "alex_web_session";
+const WEB_SESSION_TTL_S: i64 = 12 * 60 * 60;
+const WEB_LOGIN_WINDOW_MS: i64 = 60_000;
+const WEB_LOGIN_MAX_FAILURES: usize = 8;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WebAuthConfig {
+    #[serde(default)]
+    password_hash: Option<String>,
+    #[serde(default)]
+    onboarding_completed: bool,
+    /// SHA-256(session token) -> expiry ms. Persisted so browser sessions
+    /// survive daemon restarts; raw tokens are never stored.
+    #[serde(default)]
+    sessions: HashMap<String, i64>,
+}
+
+#[derive(Debug, Default)]
+struct WebAuthState {
+    path: PathBuf,
+    config: std::sync::RwLock<WebAuthConfig>,
+    /// SHA-256(session token) -> expiry. Raw bearer tokens are never retained.
+    sessions: std::sync::Mutex<HashMap<String, i64>>,
+    failed_logins: std::sync::Mutex<HashMap<String, Vec<i64>>>,
+}
+
+impl WebAuthState {
+    fn load(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("web-auth.json");
+        let config = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(path = %path.display(), "failed to parse web auth settings: {error}");
+                    WebAuthConfig::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => WebAuthConfig::default(),
+            Err(error) => {
+                tracing::error!(path = %path.display(), "failed to read web auth settings: {error}");
+                WebAuthConfig::default()
+            }
+        };
+        Self {
+            path,
+            sessions: std::sync::Mutex::new(
+                config
+                    .sessions
+                    .iter()
+                    .filter(|(_, expires_at_ms)| **expires_at_ms > now_ms())
+                    .map(|(hash, expires_at_ms)| (hash.clone(), *expires_at_ms))
+                    .collect(),
+            ),
+            config: std::sync::RwLock::new(config),
+            failed_logins: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Write the current in-memory session hashes into the persisted config.
+    /// Best-effort: cookie sessions still work in memory if the write fails.
+    fn persist_sessions(&self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let config = {
+            let mut guard = self
+                .config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.sessions = sessions;
+            guard.clone()
+        };
+        if let Err(error) = self.persist(&config) {
+            tracing::warn!("could not persist web sessions: {error}");
+        }
+    }
+
+    fn persist(&self, config: &WebAuthConfig) -> std::result::Result<(), String> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "web auth path has no parent".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let temp = self
+            .path
+            .with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec_pretty(config).map_err(|error| error.to_string())?;
+        std::fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Err(error) = std::fs::rename(&temp, &self.path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn authenticated(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = web_session_token(headers) else {
+            return false;
+        };
+        let token_hash = key_hash_hex(token);
+        let now = now_ms();
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions.retain(|_, expires_at_ms| *expires_at_ms > now);
+        sessions
+            .get(&token_hash)
+            .is_some_and(|expires_at_ms| *expires_at_ms > now)
+    }
+
+    fn create_session(&self) -> String {
+        use base64::Engine;
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key_hash_hex(&token), now_ms() + WEB_SESSION_TTL_S * 1_000);
+        self.persist_sessions();
+        token
+    }
+
+    fn remove_session(&self, headers: &HeaderMap) {
+        if let Some(token) = web_session_token(headers) {
+            self.sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key_hash_hex(token));
+            self.persist_sessions();
+        }
+    }
 }
 
 impl AppState {
@@ -1099,6 +1252,9 @@ pub fn build_state_with_substitution(
         pending_injections: std::sync::Mutex::new(HashMap::new()),
         transcript_cache: std::sync::Mutex::new(TranscriptCache::new(512)),
         paused_providers: std::sync::Mutex::new(HashMap::new()),
+        ping_models: std::sync::RwLock::new(PingModels::default()),
+        credential_test_lock: tokio::sync::Mutex::new(()),
+        web_auth: WebAuthState::load(&store.data_dir),
     })
 }
 
@@ -1229,6 +1385,14 @@ pub fn set_protection_policy_persister(
 pub fn set_exo_config(state: &Arc<AppState>, config: ExoConfig) {
     if let Ok(mut slot) = state.exo.write() {
         *slot = config;
+    }
+}
+
+/// Replaces the low-cost models used by scheduled and user-requested provider
+/// probes. The CLI owns these values because they are part of daemon config.
+pub fn set_ping_models(state: &Arc<AppState>, models: PingModels) {
+    if let Ok(mut slot) = state.ping_models.write() {
+        *slot = models;
     }
 }
 
@@ -1890,18 +2054,280 @@ pub fn set_reset_handler(state: &Arc<AppState>, handler: Arc<dyn ResetHandler>) 
     }
 }
 
+fn web_session_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == WEB_SESSION_COOKIE).then_some(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn local_admin_key_valid(state: &AppState, headers: &HeaderMap) -> bool {
+    client_key(headers)
+        .map(|provided| {
+            state
+                .local_key
+                .read()
+                .map(|expected| provided == *expected)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Shared authentication boundary for daemon-owned admin routers that are
+/// merged outside this crate (for example harness configuration routes).
+pub fn admin_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    local_admin_key_valid(state, headers) || state.web_auth.authenticated(headers)
+}
+
+fn web_session_cookie(token: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{WEB_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={WEB_SESSION_TTL_S}"
+    ))
+    .expect("random web session token is a valid cookie value")
+}
+
+fn clear_web_session_cookie() -> HeaderValue {
+    HeaderValue::from_static("alex_web_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+}
+
+async fn web_auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let config = state
+        .web_auth
+        .config
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    axum::Json(json!({
+        "password_configured": config.password_hash.is_some(),
+        "onboarding_completed": config.onboarding_completed,
+        "authenticated": local_admin_key_valid(&state, &headers)
+            || state.web_auth.authenticated(&headers),
+        "session_ttl_seconds": WEB_SESSION_TTL_S,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WebLoginRequest {
+    password: String,
+}
+
+async fn web_auth_login(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebLoginRequest>,
+) -> Response {
+    // Axum's connect-info extension is not present in every embedding (notably
+    // Router unit tests), so keep the small anti-bruteforce window global.
+    let client_id = "web-login".to_string();
+    let now = now_ms();
+    {
+        let mut attempts = state
+            .web_auth
+            .failed_logins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recent = attempts.entry(client_id.clone()).or_default();
+        recent.retain(|timestamp| now.saturating_sub(*timestamp) < WEB_LOGIN_WINDOW_MS);
+        if recent.len() >= WEB_LOGIN_MAX_FAILURES {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many password attempts; wait one minute and try again",
+            );
+        }
+    }
+
+    let password_hash = state
+        .web_auth
+        .config
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .password_hash
+        .clone();
+    let Some(password_hash) = password_hash else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "a web password has not been configured yet",
+        );
+    };
+    let password = body.password;
+    let valid = tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::PasswordHash;
+        use argon2::PasswordVerifier;
+        PasswordHash::new(&password_hash)
+            .ok()
+            .is_some_and(|parsed| {
+                argon2::Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            })
+    })
+    .await
+    .unwrap_or(false);
+    if !valid {
+        state
+            .web_auth
+            .failed_logins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(client_id)
+            .or_default()
+            .push(now);
+        return error_response(StatusCode::UNAUTHORIZED, "incorrect password");
+    }
+    state
+        .web_auth
+        .failed_logins
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&client_id);
+    let token = state.web_auth.create_session();
+    let mut response = axum::Json(json!({"authenticated": true})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, web_session_cookie(&token));
+    response
+}
+
+async fn web_auth_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.web_auth.remove_session(&headers);
+    let mut response = axum::Json(json!({"authenticated": false})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, clear_web_session_cookie());
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct WebPasswordRequest {
+    password: String,
+}
+
+async fn admin_web_password(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebPasswordRequest>,
+) -> Response {
+    let password = body.password;
+    if password.chars().count() < 10 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "password must be at least 10 characters",
+        );
+    }
+    if password.len() > 256 {
+        return error_response(StatusCode::BAD_REQUEST, "password is too long");
+    }
+    let password_hash = match tokio::task::spawn_blocking(move || {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        let salt = SaltString::generate(&mut OsRng);
+        argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(error)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not secure password: {error}"),
+            )
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("password worker failed: {error}"),
+            )
+        }
+    };
+
+    let next = {
+        let current = state
+            .web_auth
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WebAuthConfig {
+            password_hash: Some(password_hash),
+            onboarding_completed: current.onboarding_completed,
+            // Replacing the password revokes every existing session.
+            sessions: HashMap::new(),
+        }
+    };
+    if let Err(error) = state.web_auth.persist(&next) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save web password: {error}"),
+        );
+    }
+    *state
+        .web_auth
+        .config
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    state
+        .web_auth
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    let token = state.web_auth.create_session();
+    let mut response = axum::Json(json!({"password_configured": true})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, web_session_cookie(&token));
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct WebOnboardingRequest {
+    completed: bool,
+}
+
+async fn admin_web_onboarding(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<WebOnboardingRequest>,
+) -> Response {
+    let next = {
+        let current = state
+            .web_auth
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WebAuthConfig {
+            password_hash: current.password_hash.clone(),
+            onboarding_completed: body.completed,
+            sessions: current.sessions.clone(),
+        }
+    };
+    if let Err(error) = state.web_auth.persist(&next) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save onboarding state: {error}"),
+        );
+    }
+    *state
+        .web_auth
+        .config
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    axum::Json(json!({"onboarding_completed": body.completed})).into_response()
+}
+
 async fn require_local_key(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let ok = client_key(req.headers())
-        .map(|k| state.local_key.read().map(|key| k == *key).unwrap_or(false))
-        .unwrap_or(false);
+    let ok = admin_request_authenticated(&state, req.headers());
     if !ok {
         return error_response(
             StatusCode::UNAUTHORIZED,
-            "admin routes require x-api-key: <local_key>",
+            "admin routes require a signed-in web session or x-api-key: <local_key>",
         );
     }
     next.run(req).await
@@ -1935,6 +2361,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // bind doesn't expose them. Run keys are NOT accepted here — a worker's
     // run key must not mint/revoke run keys or read the trace store.
     let gated = Router::new()
+        .route("/admin/web/password", post(admin_web_password))
+        .route("/admin/web/onboarding", post(admin_web_onboarding))
         .route(
             "/admin/run-keys",
             get(admin_run_keys_list).post(admin_run_keys_create),
@@ -1977,6 +2405,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin_session_injections).delete(admin_session_injections_clear),
         )
         .route("/admin/accounts", get(admin_accounts))
+        .route("/admin/accounts/test", post(admin_accounts_test))
         .route("/admin/providers", get(admin_providers))
         .route(
             "/admin/providers/{provider}/pause",
@@ -2169,8 +2598,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui/", get(web::index))
         .route("/ui/app.js", get(web::app_js))
         .route("/ui/styles.css", get(web::styles))
+        .route("/ui/assets/{file}", get(web::static_asset))
         .route("/health", get(health))
         .route("/connect", get(connect_info))
+        .route("/web/auth/status", get(web_auth_status))
+        .route("/web/auth/login", post(web_auth_login))
+        .route("/web/auth/logout", post(web_auth_logout))
         .route("/v1/models", get(models))
         .route(
             "/v1/alex/capabilities",
@@ -8604,6 +9037,38 @@ pub struct PingModels {
     pub gemini: String,
     pub openrouter: String,
     pub kimi: String,
+}
+
+impl Default for PingModels {
+    fn default() -> Self {
+        Self {
+            anthropic: "claude-sonnet-5".into(),
+            openai: "gpt-5.5".into(),
+            xai: "grok-code-fast-1".into(),
+            gemini: "gemini-2.5-flash".into(),
+            openrouter: "google/gemma-4-26b-a4b-it:free".into(),
+            kimi: "k3".into(),
+        }
+    }
+}
+
+async fn admin_accounts_test(State(state): State<Arc<AppState>>) -> Response {
+    let Ok(_guard) = state.credential_test_lock.try_lock() else {
+        return error_response(StatusCode::CONFLICT, "a credential test is already running");
+    };
+    let models = state
+        .ping_models
+        .read()
+        .map(|models| models.clone())
+        .unwrap_or_default();
+    let results = heartbeat_once(&state, &models).await;
+    let healthy = results.iter().filter(|result| result.ok).count();
+    axum::Json(json!({
+        "healthy": healthy,
+        "total": results.len(),
+        "results": results,
+    }))
+    .into_response()
 }
 
 pub async fn ping_provider(
@@ -17472,6 +17937,318 @@ mod tests {
         )
     }
 
+    async fn web_auth_request(
+        state: Arc<AppState>,
+        method: axum::http::Method,
+        path: &str,
+        body: Option<Value>,
+        cookie: Option<&str>,
+        local_key: bool,
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let mut builder = axum::http::Request::builder().method(method).uri(path);
+        if body.is_some() {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header(axum::http::header::COOKIE, cookie);
+        }
+        if local_key {
+            builder = builder.header("x-api-key", "alx-local");
+        }
+        let bytes = body
+            .map(|value| serde_json::to_vec(&value).unwrap())
+            .unwrap_or_default();
+        router(state)
+            .oneshot(builder.body(Body::from(bytes)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn response_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("response sets browser session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn web_auth_unconfigured_status_and_password_validation() {
+        let state = test_state("web-auth-unconfigured");
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/web/auth/status",
+            None,
+            None,
+            false,
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["password_configured"], false);
+        assert_eq!(body["onboarding_completed"], false);
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["session_ttl_seconds"], WEB_SESSION_TTL_S);
+
+        for password in ["too-short".to_string(), "x".repeat(257)] {
+            let response = web_auth_request(
+                state.clone(),
+                axum::http::Method::POST,
+                "/admin/web/password",
+                Some(json!({"password": password})),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(!state.web_auth.path.exists());
+    }
+
+    #[tokio::test]
+    async fn web_password_persists_only_argon_hash_and_login_cookie_grants_admin() {
+        let state = test_state("web-auth-persist-cookie");
+        let password = "correct horse battery staple";
+        let response = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": password})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Path=/"));
+        assert!(set_cookie.contains(&format!("Max-Age={WEB_SESSION_TTL_S}")));
+        let cookie = response_cookie(&response);
+
+        let persisted = std::fs::read_to_string(&state.web_auth.path).unwrap();
+        assert!(!persisted.contains(password));
+        let persisted_json: Value = serde_json::from_str(&persisted).unwrap();
+        assert!(persisted_json["password_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("$argon2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&state.web_auth.path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let gated = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&cookie),
+            false,
+        )
+        .await;
+        assert_eq!(gated.status(), StatusCode::OK);
+
+        let login = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": password})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        assert!(login.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .starts_with("alex_web_session="));
+    }
+
+    #[tokio::test]
+    async fn web_login_rejects_wrong_password_and_throttles_repeated_failures() {
+        let state = test_state("web-auth-throttle");
+        let configured = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "a sufficiently long password"})),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(configured.status(), StatusCode::OK);
+        for _ in 0..WEB_LOGIN_MAX_FAILURES {
+            let wrong = web_auth_request(
+                state.clone(),
+                axum::http::Method::POST,
+                "/web/auth/login",
+                Some(json!({"password": "definitely the wrong password"})),
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        }
+        let throttled = web_auth_request(
+            state,
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "a sufficiently long password"})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn web_logout_expiry_and_password_replacement_revoke_old_sessions() {
+        let state = test_state("web-auth-session-lifecycle");
+        let first = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "first strong browser password"})),
+            None,
+            true,
+        )
+        .await;
+        let first_cookie = response_cookie(&first);
+
+        let replacement = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "replacement browser password"})),
+            Some(&first_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let replacement_cookie = response_cookie(&replacement);
+        let old_session = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&first_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(old_session.status(), StatusCode::UNAUTHORIZED);
+        let old_password = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "first strong browser password"})),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(old_password.status(), StatusCode::UNAUTHORIZED);
+
+        let logout = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/logout",
+            Some(json!({})),
+            Some(&replacement_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(logout.status(), StatusCode::OK);
+        assert!(logout.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+        let logged_out = web_auth_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&replacement_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(logged_out.status(), StatusCode::UNAUTHORIZED);
+
+        let fresh_login = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/web/auth/login",
+            Some(json!({"password": "replacement browser password"})),
+            None,
+            false,
+        )
+        .await;
+        let expiring_cookie = response_cookie(&fresh_login);
+        state
+            .web_auth
+            .sessions
+            .lock()
+            .unwrap()
+            .values_mut()
+            .for_each(|expires_at_ms| *expires_at_ms = now_ms() - 1);
+        let expired = web_auth_request(
+            state,
+            axum::http::Method::GET,
+            "/admin/accounts",
+            None,
+            Some(&expiring_cookie),
+            false,
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn web_onboarding_completion_persists_with_password_hash() {
+        let state = test_state("web-auth-onboarding-persist");
+        let configured = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/password",
+            Some(json!({"password": "onboarding browser password"})),
+            None,
+            true,
+        )
+        .await;
+        let cookie = response_cookie(&configured);
+        let completed = web_auth_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/admin/web/onboarding",
+            Some(json!({"completed": true})),
+            Some(&cookie),
+            false,
+        )
+        .await;
+        assert_eq!(completed.status(), StatusCode::OK);
+        let reloaded = WebAuthState::load(&state.store.data_dir);
+        let config = reloaded.config.read().unwrap();
+        assert!(config.password_hash.is_some());
+        assert!(config.onboarding_completed);
+    }
+
     #[tokio::test]
     async fn notification_reset_clears_runtime_activity_and_retires_old_log() {
         let state = test_state("notification-reset");
@@ -18748,7 +19525,8 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(ui.contains("ALEX LOCAL CONTROL PLANE"));
+        assert!(ui.contains("Local control plane"));
+        assert!(ui.contains("password-login-form"));
 
         let routed_response = client
             .post(format!("{base}/v1/chat/completions"))
@@ -25878,6 +26656,34 @@ mod tests {
             latency_ms: 12,
             message: "probe".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn credential_test_is_key_gated_and_handles_an_empty_vault() {
+        use tower::ServiceExt;
+
+        let state = test_state("credential-test-empty");
+        let unauthorized = axum::http::Request::post("/admin/accounts/test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(unauthorized)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let authorized = axum::http::Request::post("/admin/accounts/test")
+            .header("x-api-key", "alx-local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = response_json(router(state).oneshot(authorized).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["healthy"], 0);
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["results"], json!([]));
     }
 
     #[tokio::test]
