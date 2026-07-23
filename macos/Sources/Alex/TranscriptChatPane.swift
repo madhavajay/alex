@@ -98,6 +98,7 @@ struct TranscriptChatPane: View {
                     }
                 }
                 .id(entry.id)
+                .onAppear { model.transcriptTurnBecameVisible(entry.turn.traceId) }
         }
     }
 

@@ -112,6 +112,70 @@ public struct TranscriptResponse: Codable, Sendable {
     }
 }
 
+public struct TranscriptCursor: Codable, Sendable, Equatable {
+    public let afterMs: Int64
+    public let afterId: String
+
+    enum CodingKeys: String, CodingKey {
+        case afterMs = "after_ms"
+        case afterId = "after_id"
+    }
+}
+
+public struct TranscriptTurnMetadata: Codable, Sendable, Identifiable, Equatable {
+    public let traceId: String
+    public let tsRequestMs: Int64
+    public let tsResponseMs: Int64?
+    public let harness: String?
+    public let model: String?
+    public let provider: String?
+    public let status: Int?
+    public let inputTokens: Int64?
+    public let outputTokens: Int64?
+    public let error: String?
+    public let errorKind: String?
+    public let attempts: [TraceAttempt]?
+    public let substituted: Bool?
+    public let substitutionReason: String?
+    public let streamed: Int?
+    public let hasRequest: Bool
+    public let hasResponse: Bool
+
+    public var id: String { traceId }
+
+    enum CodingKeys: String, CodingKey {
+        case harness, model, provider, status, error, attempts, substituted, streamed
+        case traceId = "trace_id"
+        case tsRequestMs = "ts_request_ms"
+        case tsResponseMs = "ts_response_ms"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case errorKind = "error_kind"
+        case substitutionReason = "substitution_reason"
+        case hasRequest = "has_request"
+        case hasResponse = "has_response"
+    }
+}
+
+public struct TranscriptPageResponse: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let turns: [TranscriptTurnMetadata]
+    public let limit: Int
+    public let hasMore: Bool
+    public let nextCursor: TranscriptCursor?
+
+    enum CodingKeys: String, CodingKey {
+        case turns, limit
+        case sessionId = "session_id"
+        case hasMore = "has_more"
+        case nextCursor = "next_cursor"
+    }
+}
+
+public struct TraceTurnResponse: Codable, Sendable, Equatable {
+    public let turn: TranscriptTurn
+}
+
 public struct TranscriptTabCounts: Codable, Sendable, Equatable {
     public let all: Int
     public let user: Int
@@ -790,6 +854,7 @@ public enum BodyPretty {
     public static let displayCap = 200_000
 
     public static func display(_ raw: String, cap: Int = displayCap) -> CappedText {
+        guard raw.count <= cap else { return capped(raw, cap: cap) }
         var text = raw
         if isJSON(raw),
             let data = raw.data(using: .utf8),
@@ -818,6 +883,11 @@ public enum BodyPretty {
         guard let data = trimmed.data(using: .utf8) else { return false }
         return (try? JSONSerialization.jsonObject(with: data)) != nil
     }
+
+    public static func looksLikeJSON(_ text: String) -> Bool {
+        let first = text.first { !$0.isWhitespace }
+        return first == "{" || first == "["
+    }
 }
 
 public struct RequestJSONDiffPresentation: Equatable, Sendable {
@@ -827,6 +897,7 @@ public struct RequestJSONDiffPresentation: Equatable, Sendable {
         case firstRequest
         case invalidCurrent
         case invalidPrevious
+        case truncatedCurrent
     }
 
     public let text: String
@@ -845,6 +916,8 @@ public struct RequestJSONDiffPresentation: Equatable, Sendable {
         case .invalidCurrent: "This request is not valid JSON; showing the full body."
         case .invalidPrevious:
             "The previous request is not valid JSON; showing the full current JSON."
+        case .truncatedCurrent:
+            "The request exceeds the display limit; showing the capped body. Use Load full body to inspect all bytes."
         }
     }
 }
@@ -856,13 +929,21 @@ public enum RequestJSONDiff {
     public static func presentation(
         previous: String?, current: String
     ) -> RequestJSONDiffPresentation {
+        guard current.count <= BodyPretty.displayCap else {
+            return RequestJSONDiffPresentation(
+                text: BodyPretty.capped(current).text, kind: .truncatedCurrent)
+        }
         guard let currentValue = parse(current) else {
             return RequestJSONDiffPresentation(
-                text: BodyPretty.display(current, cap: .max).text, kind: .invalidCurrent)
+                text: BodyPretty.display(current).text, kind: .invalidCurrent)
         }
         guard let previous else {
             return RequestJSONDiffPresentation(
                 text: currentValue.pretty(), kind: .firstRequest)
+        }
+        guard previous.count <= BodyPretty.displayCap else {
+            return RequestJSONDiffPresentation(
+                text: currentValue.pretty(), kind: .invalidPrevious)
         }
         guard let previousValue = parse(previous) else {
             return RequestJSONDiffPresentation(
@@ -2418,7 +2499,7 @@ public enum TurnExport {
         guard let raw, !raw.isEmpty else { return "_not available_" }
         let display = BodyPretty.display(raw)
         return fencedOrMissing(
-            display.text, language: BodyPretty.isJSON(raw) ? "json" : "")
+            display.text, language: BodyPretty.looksLikeJSON(raw) ? "json" : "")
     }
 
     static func fencedOrMissing(_ content: String?, language: String) -> String {

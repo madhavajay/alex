@@ -97,6 +97,10 @@ extension AlexClientTests {
                 return .json(#"{"sessions":[{"session_id":"session-1","first_ts_ms":1783477000000,"last_ts_ms":1783477002000,"trace_count":1,"models":["gpt-5.5"],"providers":["openai"],"harness":"codex","last_status":200}]}"#)
             case "/traces/sessions/session-1/transcript":
                 return .json(#"{"session_id":"session-1","turns":[{"trace_id":"trace-1","ts_request_ms":1783477000000,"ts_response_ms":1783477002000,"model":"gpt-5.5","provider":"openai","status":200,"assistant":"done"}]}"#)
+            case "/traces/sessions/session-1/transcript/page":
+                return .json(#"{"session_id":"session-1","turns":[{"trace_id":"trace-1","ts_request_ms":1783477000000,"ts_response_ms":1783477002000,"model":"gpt-5.5","provider":"openai","status":200,"streamed":1,"has_request":true,"has_response":true}],"limit":50,"has_more":false,"next_cursor":null}"#)
+            case "/traces/trace-1/turn":
+                return .json(#"{"turn":{"trace_id":"trace-1","ts_request_ms":1783477000000,"ts_response_ms":1783477002000,"model":"gpt-5.5","provider":"openai","status":200,"assistant":"done"}}"#)
             case "/traces/trace-1":
                 return .json(#"{"trace":{"id":"trace-1","session_id":"session-1","method":"POST","path":"/v1/responses","status":200,"routed_model":"gpt-5.5","upstream_provider":"openai"},"extras":null}"#)
             case "/traces/trace-1/body/upstream-request":
@@ -117,6 +121,8 @@ extension AlexClientTests {
         let search = try await client.searchTraces(text: "done", since: "7d", filters: filters)
         let sessions = try await client.traceSessions(since: "7d", limit: 25, middlewareId: "retry-529")
         let transcript = try await client.traceTranscript(sessionId: "session-1", limit: 50)
+        let page = try await client.traceTranscriptPage(sessionId: "session-1", limit: 50)
+        let turn = try await client.traceTurn(id: "trace-1")
         let detail = try await client.traceDetail(id: "trace-1")
         let body = try await client.traceBody(id: "trace-1", kind: .upstreamRequest)
         let markdown = try await client.traceReplyMarkdown(traceId: "trace-1")
@@ -125,6 +131,8 @@ extension AlexClientTests {
         #expect(search.traces[0].thinkingBudget == 16_000)
         #expect(sessions[0].models == ["gpt-5.5"])
         #expect(transcript.turns[0].assistant == "done")
+        #expect(page.turns[0].hasResponse)
+        #expect(turn.assistant == "done")
         #expect(detail.trace.upstreamProvider == "openai")
         #expect(body.text.contains("gpt-5.5"))
         #expect(body.diskPath == "/tmp/bodies/trace-1-upstream.json")
@@ -138,7 +146,25 @@ extension AlexClientTests {
         #expect(requests[0].query["status"] == "200")
         #expect(requests[1].query == ["since": "7d", "limit": "25", "middleware_id": "retry-529"])
         #expect(requests[2].query == ["limit": "50"])
+        #expect(requests[3].query == ["limit": "50"])
         for request in requests { #expect(request.header("x-api-key") == "local-test-key") }
+    }
+
+    @Test func traceBodiesAreDisplayCappedWithFullLoadEscape() async throws {
+        AlexClientURLProtocolStub.reset()
+        defer { AlexClientURLProtocolStub.reset() }
+        let bytes = Data(repeating: 120, count: AlexClient.displayBodyByteLimit + 17)
+        AlexClientURLProtocolStub.handler = { _ in
+            AlexClientStubResponse(body: bytes)
+        }
+        let client = makeStubbedAlexClient()
+        let capped = try await client.traceBody(id: "large", kind: .response)
+        let full = try await client.traceBody(id: "large", kind: .response, maxBytes: nil)
+        #expect(capped.isTruncated)
+        #expect(capped.text.utf8.count == AlexClient.displayBodyByteLimit)
+        #expect(capped.fullByteCount == bytes.count)
+        #expect(!full.isTruncated)
+        #expect(full.text.utf8.count == bytes.count)
     }
 
     @Test func modelsCredentialsRunKeyAndUpdateResponsesDecode() async throws {

@@ -106,7 +106,9 @@ struct ToolBodyInspectorView: View {
             phase = .loading
             do {
                 let body = try await model.fetchToolBody(id: route.toolId, kind: route.kind)
-                phase = .loaded(raw: body.text, diskPath: body.diskPath)
+                phase = .loaded(
+                    raw: body.text, diskPath: body.diskPath,
+                    isTruncated: body.isTruncated, fullByteCount: body.fullByteCount)
             } catch {
                 phase = .failed(error.localizedDescription)
             }
@@ -187,14 +189,13 @@ struct ToolBodyInspectorView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.red)
                 .textSelection(.enabled)
-        case let .loaded(raw, diskPath):
-            let displayed = BodyPretty.display(raw, cap: .max).text
-            let capped = BodyPretty.capped(displayed)
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
+            let capped = BodyPretty.capped(raw)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(displayed, forType: .string)
+                        NSPasteboard.general.setString(capped.text, forType: .string)
                     }
                     Button("Reveal in Finder") {
                         guard let diskPath else { return }
@@ -202,7 +203,20 @@ struct ToolBodyInspectorView: View {
                             [URL(fileURLWithPath: diskPath)])
                     }
                     .disabled(diskPath == nil)
-                    if !SSEFrames.isSSE(raw), !BodyPretty.isJSON(raw), capped.isTruncated {
+                    if isTruncated {
+                        Button("Load full body") {
+                            Task {
+                                guard let body = try? await model.fetchToolBody(
+                                    id: route.toolId, kind: route.kind, loadFull: true)
+                                else { return }
+                                phase = .loaded(
+                                    raw: body.text, diskPath: body.diskPath,
+                                    isTruncated: false, fullByteCount: body.fullByteCount)
+                            }
+                        }
+                        .help("Load all \(ByteCountFormatter.string(fromByteCount: Int64(fullByteCount), countStyle: .file))")
+                    }
+                    if !SSEFrames.isSSE(raw), !BodyPretty.looksLikeJSON(raw), capped.isTruncated {
                         Text("truncated to \(BodyPretty.displayCap / 1000)KB")
                             .font(.system(size: 9))
                             .foregroundStyle(.orange)
@@ -212,7 +226,7 @@ struct ToolBodyInspectorView: View {
                 .controlSize(.small)
                 if SSEFrames.isSSE(raw) {
                     SSEBodyView(source: raw)
-                } else if BodyPretty.isJSON(raw) {
+                } else if BodyPretty.looksLikeJSON(raw) {
                     FormattedJSONBody(source: raw)
                 } else {
                     InspectorTextPane(text: capped.text, highlightJSON: false)
@@ -251,7 +265,8 @@ struct TraceInspectorView: View {
         enum Phase {
             case idle
             case loading
-            case loaded(raw: String, diskPath: String?)
+            case loaded(
+                raw: String, diskPath: String?, isTruncated: Bool, fullByteCount: Int)
             case failed(String)
         }
     }
@@ -317,7 +332,9 @@ struct TraceInspectorView: View {
         }
     }
 
-    private func loadBody(_ kind: TraceBodyKind, into load: Binding<BodyLoad>) {
+    private func loadBody(
+        _ kind: TraceBodyKind, into load: Binding<BodyLoad>, loadFull: Bool = false
+    ) {
         // Keep previously loaded content visible while the next turn's body
         // loads so the inspector scroll position survives turn browsing.
         if case .loaded = load.wrappedValue.phase {
@@ -326,7 +343,7 @@ struct TraceInspectorView: View {
         }
         let tid = traceId
         Task {
-            let phase = await fetchBody(tid, kind: kind)
+            let phase = await fetchBody(tid, kind: kind, loadFull: loadFull)
             guard tid == traceId else { return }
             load.wrappedValue.phase = phase
         }
@@ -735,7 +752,7 @@ struct TraceInspectorView: View {
         title: String, kind: TraceBodyKind, load: Binding<BodyLoad>, isExpanded: Binding<Bool>
     ) -> some View {
         DisclosureGroup(isExpanded: isExpanded) {
-            bodyContent(load.wrappedValue.phase)
+            bodyContent(load.wrappedValue.phase, kind: kind, load: load)
         } label: {
             groupLabel(title)
         }
@@ -752,13 +769,15 @@ struct TraceInspectorView: View {
             bodyLoadingView("Loading request body…")
         case let .failed(message):
             bodyErrorView(message)
-        case let .loaded(raw, diskPath):
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
             if fullRequestJSON {
                 bodyViewer(
                     source: raw,
-                    displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
-                    diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
-                    note: nil, showsFullJSONToggle: true)
+                    displayed: BodyPretty.capped(raw).text,
+                    diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.looksLikeJSON(raw),
+                    note: nil, showsFullJSONToggle: true,
+                    sourceTruncated: isTruncated, fullByteCount: fullByteCount,
+                    loadFull: { loadBody(.request, into: $reqBody, loadFull: true) })
             } else if model.previousTraceId(before: traceId) == nil {
                 let presentation = RequestJSONDiff.presentation(previous: nil, current: raw)
                 requestDiffViewer(presentation, source: raw, diskPath: diskPath)
@@ -768,11 +787,13 @@ struct TraceInspectorView: View {
                     bodyLoadingView("Loading previous request for comparison…")
                 case let .failed(message):
                     bodyViewer(
-                        source: raw, displayed: BodyPretty.display(raw, cap: .max).text,
-                        diskPath: diskPath, highlightJSON: BodyPretty.isJSON(raw),
+                        source: raw, displayed: BodyPretty.capped(raw).text,
+                        diskPath: diskPath, highlightJSON: BodyPretty.looksLikeJSON(raw),
                         note: "Previous request unavailable (\(message)); showing the full current body.",
-                        showsFullJSONToggle: true)
-                case let .loaded(previous, _):
+                        showsFullJSONToggle: true, sourceTruncated: isTruncated,
+                        fullByteCount: fullByteCount,
+                        loadFull: { loadBody(.request, into: $reqBody, loadFull: true) })
+                case let .loaded(previous, _, _, _):
                     let presentation = RequestJSONDiff.presentation(
                         previous: previous, current: raw)
                     requestDiffViewer(presentation, source: raw, diskPath: diskPath)
@@ -792,18 +813,22 @@ struct TraceInspectorView: View {
     }
 
     @ViewBuilder
-    private func bodyContent(_ phase: BodyLoad.Phase) -> some View {
+    private func bodyContent(
+        _ phase: BodyLoad.Phase, kind: TraceBodyKind, load: Binding<BodyLoad>
+    ) -> some View {
         switch phase {
         case .idle, .loading:
             bodyLoadingView("Loading body…")
         case let .failed(message):
             bodyErrorView(message)
-        case let .loaded(raw, diskPath):
+        case let .loaded(raw, diskPath, isTruncated, fullByteCount):
             bodyViewer(
                 source: raw,
-                displayed: rawMode ? raw : BodyPretty.display(raw, cap: .max).text,
-                diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.isJSON(raw),
-                note: nil, showsFullJSONToggle: false)
+                displayed: BodyPretty.capped(raw).text,
+                diskPath: diskPath, highlightJSON: !rawMode && BodyPretty.looksLikeJSON(raw),
+                note: nil, showsFullJSONToggle: false, sourceTruncated: isTruncated,
+                fullByteCount: fullByteCount,
+                loadFull: { loadBody(kind, into: load, loadFull: true) })
         }
     }
 
@@ -827,7 +852,8 @@ struct TraceInspectorView: View {
     @ViewBuilder
     private func bodyViewer(
         source: String, displayed: String, diskPath: String?, highlightJSON: Bool,
-        note: String?, showsFullJSONToggle: Bool
+        note: String?, showsFullJSONToggle: Bool, sourceTruncated: Bool = false,
+        fullByteCount: Int = 0, loadFull: (() -> Void)? = nil
     ) -> some View {
         let capped = BodyPretty.capped(displayed)
         VStack(alignment: .leading, spacing: 4) {
@@ -844,6 +870,10 @@ struct TraceInspectorView: View {
                         [URL(fileURLWithPath: diskPath)])
                 }
                 .disabled(diskPath == nil)
+                if sourceTruncated, let loadFull {
+                    Button("Load full body", action: loadFull)
+                        .help("Load all \(ByteCountFormatter.string(fromByteCount: Int64(fullByteCount), countStyle: .file))")
+                }
                 if showsFullJSONToggle {
                     Toggle("Full JSON", isOn: $fullRequestJSON)
                         .toggleStyle(.checkbox)
@@ -889,7 +919,7 @@ struct TraceInspectorView: View {
     /// mirroring the branch above.
     private func usesEnhancedFormatting(source: String) -> Bool {
         guard !rawMode else { return false }
-        return SSEFrames.isSSE(source) || BodyPretty.isJSON(source)
+        return SSEFrames.isSSE(source) || BodyPretty.looksLikeJSON(source)
     }
 
     private func groupLabel(_ text: String) -> some View {
@@ -914,10 +944,15 @@ struct TraceInspectorView: View {
         }
     }
 
-    private func fetchBody(_ id: String, kind: TraceBodyKind) async -> BodyLoad.Phase {
+    private func fetchBody(
+        _ id: String, kind: TraceBodyKind, loadFull: Bool = false
+    ) async -> BodyLoad.Phase {
         do {
-            let content = try await model.fetchTraceBody(id: id, kind: kind)
-            return .loaded(raw: content.text, diskPath: content.diskPath)
+            let content = try await model.fetchTraceBody(
+                id: id, kind: kind, loadFull: loadFull)
+            return .loaded(
+                raw: content.text, diskPath: content.diskPath,
+                isTruncated: content.isTruncated, fullByteCount: content.fullByteCount)
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -1154,7 +1189,7 @@ private enum FormattedJSONBodyBuilder {
             {
                 return AttributedStringBox(attributedString(tokens: tokens, font: font))
             }
-            let displayed = BodyPretty.display(source, cap: .max).text
+            let displayed = BodyPretty.display(source).text
             let capped = BodyPretty.capped(displayed).text
             return AttributedStringBox(
                 JsonHighlight.attributed(capped, font: font, colors: InspectorTextPane.jsonColors))
