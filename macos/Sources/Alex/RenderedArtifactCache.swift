@@ -180,19 +180,28 @@ final class RenderedArtifactCache {
     }
 
     private static func chatByteCost(_ messages: [MessageDisplay]) -> Int {
-        messages.reduce(0) { total, message in
-            total + [
+        var total = 0
+        for message in messages {
+            let fields: [String?] = [
                 message.id, message.turnId, message.roleLabel, message.content,
                 message.model, message.detail, message.timestamp, message.tokenText,
                 message.error, message.event,
-            ].compactMap { $0 }.reduce(0) { $0 + $1.utf8.count }
-                + (message.attributedContent?.characters.count ?? 0) * 4
-                + message.toolCalls.reduce(0) { subtotal, tool in
-                    subtotal + [
-                        tool.id, tool.name, tool.argumentPreview, tool.input, tool.output,
-                        tool.statusText, tool.durationText,
-                    ].compactMap { $0 }.reduce(0) { $0 + $1.utf8.count }
-                } + 128
+            ]
+            for field in fields {
+                total += field?.utf8.count ?? 0
+            }
+            total += (message.attributedContent?.characters.count ?? 0) * 4
+            for tool in message.toolCalls {
+                let toolFields: [String?] = [
+                    tool.id, tool.name, tool.argumentPreview, tool.input, tool.output,
+                    tool.statusText, tool.durationText,
+                ]
+                for field in toolFields {
+                    total += field?.utf8.count ?? 0
+                }
+            }
+            total += 128
         }
+        return total
     }
 }
