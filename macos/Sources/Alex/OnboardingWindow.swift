@@ -1949,15 +1949,18 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private let store: SnapshotStore
     private let openProviderSettings: @MainActor () -> Void
     private let openTraceBrowser: @MainActor (String?) -> Void
+    private let onCompleted: @MainActor () -> Void
 
     init(
         store: SnapshotStore,
         openProviderSettings: @escaping @MainActor () -> Void,
-        openTraceBrowser: @escaping @MainActor (String?) -> Void
+        openTraceBrowser: @escaping @MainActor (String?) -> Void,
+        onCompleted: @escaping @MainActor () -> Void = {}
     ) {
         self.store = store
         self.openProviderSettings = openProviderSettings
         self.openTraceBrowser = openTraceBrowser
+        self.onCompleted = onCompleted
     }
 
     func show() {
@@ -1965,7 +1968,10 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
             let model = OnboardingModel(
                 store: store, openProviderSettings: openProviderSettings,
                 openTraceBrowser: openTraceBrowser,
-                finish: { [weak self] in self?.window?.close() })
+                finish: { [weak self] in
+                    self?.window?.close()
+                    self?.onCompleted()
+                })
             self.model = model
             let win = NSWindow(contentViewController: NSHostingController(rootView: OnboardingView(model: model)))
             win.title = "Welcome to Alex"
