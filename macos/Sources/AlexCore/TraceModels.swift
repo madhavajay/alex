@@ -2264,6 +2264,177 @@ public enum TurnTextCap {
     }
 }
 
+public enum TranscriptInlineDisplay {
+    public static func capped(_ turn: TranscriptTurn) -> TranscriptTurn {
+        var assistantBudget = TurnTextCap.maxChars
+        func takeAssistant(_ value: String?) -> String? {
+            guard let value else { return nil }
+            guard assistantBudget > 0 else { return "" }
+            let capped = TurnTextCap.cap(
+                value, maxChars: assistantBudget, maxLines: TurnTextCap.maxLines).text
+            assistantBudget -= capped.count
+            return capped
+        }
+
+        let hasBlocks = turn.assistantBlocks?.isEmpty == false
+        let assistant = hasBlocks
+            ? turn.assistant.map { TurnTextCap.cap($0).text }
+            : takeAssistant(turn.assistant)
+        let blocks = turn.assistantBlocks?.map {
+            AssistantBlock(
+                type: $0.type, id: $0.id, text: takeAssistant($0.text), name: $0.name,
+                arguments: takeAssistant($0.arguments))
+        }
+        let calls = turn.toolCalls?.map {
+            ToolCall(
+                name: $0.name,
+                arguments: hasBlocks
+                    ? $0.arguments.map { TurnTextCap.cap($0).text }
+                    : takeAssistant($0.arguments),
+                id: $0.id)
+        }
+        var eventBudget = TurnTextCap.maxChars
+        func takeEvent(_ value: String?) -> String? {
+            guard let value else { return nil }
+            guard eventBudget > 0 else { return "" }
+            let capped = TurnTextCap.cap(
+                value, maxChars: eventBudget, maxLines: TurnTextCap.maxLines).text
+            eventBudget -= capped.count
+            return capped
+        }
+        let attempts = turn.attempts?.map { attempt in
+            let error = attempt.error.map {
+                TraceAttemptError(
+                    class: $0.class, kind: $0.kind, code: $0.code,
+                    message: takeEvent($0.message))
+            }
+            let decisions = attempt.middlewareDecisions?.map {
+                TraceMiddlewareDecision(
+                    ruleId: $0.ruleId, ruleName: $0.ruleName, state: $0.state,
+                    action: $0.action, explanation: takeEvent($0.explanation),
+                    suppressed: $0.suppressed, executed: $0.executed)
+            }
+            return TraceAttempt(
+                accountId: attempt.accountId, provider: attempt.provider, model: attempt.model,
+                status: attempt.status, error: error, middlewareDecisions: decisions)
+        }
+        return TranscriptTurn(
+            traceId: turn.traceId, tsRequestMs: turn.tsRequestMs,
+            tsResponseMs: turn.tsResponseMs, model: turn.model, provider: turn.provider,
+            status: turn.status, inputTokens: turn.inputTokens, outputTokens: turn.outputTokens,
+            reasoningEffort: turn.reasoningEffort, thinkingBudget: turn.thinkingBudget,
+            costUsd: turn.costUsd, billingBucket: turn.billingBucket, accountId: turn.accountId,
+            viaDario: turn.viaDario, darioGeneration: turn.darioGeneration,
+            error: turn.error.map { TurnTextCap.cap($0).text }, errorKind: turn.errorKind,
+            errorCode: turn.errorCode, errorClass: turn.errorClass,
+            user: turn.user.map { TurnTextCap.cap($0).text }, assistant: assistant,
+            toolCalls: calls, assistantBlocks: blocks, executedTools: turn.executedTools,
+            attempts: attempts, substituted: turn.substituted,
+            substitutionReason: turn.substitutionReason.map { TurnTextCap.cap($0).text })
+    }
+}
+
+public enum TranscriptApplyPolicy {
+    public static let largeTurnChars = 50_000
+    public static let largeMessageCount = 20
+    public static let maxTurnsPerBatch = 3
+    public static let maxMessagesPerBatch = 6
+    public static let maxCharsPerBatch = 24_000
+    public static let initialTurnCount = 6
+    public static let earlierTurnPageCount = 8
+
+    public static func rawCharacterCount(_ turn: TranscriptTurn) -> Int {
+        (turn.user?.count ?? 0) + (turn.assistant?.count ?? 0) + (turn.error?.count ?? 0)
+            + (turn.assistantBlocks ?? []).reduce(0) {
+                $0 + ($1.text?.count ?? 0) + ($1.arguments?.count ?? 0)
+            }
+            + (turn.toolCalls ?? []).reduce(0) { $0 + ($1.arguments?.count ?? 0) }
+    }
+
+    public static func inlineCharacterCount(_ turn: TranscriptTurn) -> Int {
+        let assistantChars: Int
+        if turn.assistantBlocks?.isEmpty == false {
+            assistantChars = (turn.assistantBlocks ?? []).reduce(0) {
+                $0 + ($1.text?.count ?? 0) + ($1.arguments?.count ?? 0)
+            }
+        } else {
+            assistantChars = (turn.assistant?.count ?? 0)
+                + (turn.toolCalls ?? []).reduce(0) { $0 + ($1.arguments?.count ?? 0) }
+        }
+        let eventChars = (turn.attempts ?? []).reduce(0) {
+            $0 + ($1.error?.message?.count ?? 0)
+                + ($1.middlewareDecisions ?? []).reduce(0) {
+                    $0 + ($1.explanation?.count ?? 0)
+                }
+        }
+        return (turn.user?.count ?? 0) + assistantChars + (turn.error?.count ?? 0)
+            + (turn.substitutionReason?.count ?? 0) + eventChars
+    }
+
+    public static func messageCount(_ turn: TranscriptTurn) -> Int {
+        var count = turn.user?.isEmpty == false ? 1 : 0
+        let hasAssistant = turn.assistant?.isEmpty == false
+            || turn.assistantBlocks?.isEmpty == false
+            || turn.toolCalls?.isEmpty == false
+            || turn.error?.isEmpty == false
+        if hasAssistant { count += 1 }
+        if turn.hasInlineAttemptEvents { count += 1 }
+        return count
+    }
+
+    public static func requiresIncrementalApply(_ turns: [TranscriptTurn]) -> Bool {
+        turns.reduce(0) { $0 + rawCharacterCount($1) } > largeTurnChars
+            || turns.reduce(0) { $0 + messageCount($1) } > largeMessageCount
+    }
+
+    public static func turnBatches(_ turns: [TranscriptTurn]) -> [[TranscriptTurn]] {
+        var batches: [[TranscriptTurn]] = []
+        var batch: [TranscriptTurn] = []
+        var chars = 0
+        var messages = 0
+        for turn in turns {
+            let turnChars = inlineCharacterCount(turn)
+            let turnMessages = messageCount(turn)
+            let exceeds = !batch.isEmpty
+                && (batch.count >= maxTurnsPerBatch
+                    || chars + turnChars > maxCharsPerBatch
+                    || messages + turnMessages > maxMessagesPerBatch)
+            if exceeds {
+                batches.append(batch)
+                batch = []
+                chars = 0
+                messages = 0
+            }
+            batch.append(turn)
+            chars += turnChars
+            messages += turnMessages
+        }
+        if !batch.isEmpty { batches.append(batch) }
+        return batches
+    }
+
+    public static func messageBatchRanges(
+        characterCounts: [Int], forceIncremental: Bool
+    ) -> [Range<Int>] {
+        var ranges: [Range<Int>] = []
+        var start = 0
+        var chars = 0
+        for index in characterCounts.indices {
+            let count = characterCounts[index]
+            let batchCount = index - start
+            let limit = forceIncremental ? 1 : maxMessagesPerBatch
+            if batchCount > 0 && (batchCount >= limit || chars + count > maxCharsPerBatch) {
+                ranges.append(start..<index)
+                start = index
+                chars = 0
+            }
+            chars += count
+        }
+        if start < characterCounts.count { ranges.append(start..<characterCounts.count) }
+        return ranges
+    }
+}
+
 public enum TraceNumberFormat {
     public static func tokens(_ count: Int64?) -> String {
         guard let count else { return "–" }
@@ -2279,8 +2450,8 @@ public enum TraceNumberFormat {
 }
 
 public enum TranscriptWindow {
-    public static let defaultMaxTurns = 200
-    public static let defaultMaxChars = 1_500_000
+    public static let defaultMaxTurns = 24
+    public static let defaultMaxChars = 96_000
 
     public static func startIndex(
         turns: [TranscriptTurn], maxTurns: Int, maxChars: Int = defaultMaxChars
@@ -2546,7 +2717,7 @@ public enum TranscriptRender {
         case append(from: Int)
     }
 
-    public static let maxTurnChars = 100_000
+    public static let maxTurnChars = TurnTextCap.maxChars
 
     public static func state(for turns: [TranscriptTurn], rawMode: Bool = false) -> State {
         State(
@@ -2793,7 +2964,8 @@ public enum TranscriptRender {
             }
         }
         var ranges: [TurnRange] = []
-        for (index, turn) in turns.enumerated() {
+        for (index, sourceTurn) in turns.enumerated() {
+            let turn = TranscriptInlineDisplay.capped(sourceTurn)
             let turnStart = out.length
             let facts = TurnHeader.separatorFacts(
                 turnNumber: firstTurnNumber + index,

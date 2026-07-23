@@ -117,7 +117,13 @@ final class TraceBrowserModel {
     private var transcriptMetadata: [TranscriptTurnMetadata] = []
     private var expandedTurns: [String: TranscriptTurn] = [:]
     private var turnFetchTasks: [String: Task<Void, Never>] = [:]
+    private var expandedRebuildTask: Task<Void, Never>?
     private var turnApplyTask: Task<Void, Never>?
+    private var turnApplyGeneration = 0
+    private var forceChunkedPaneUpdate = false
+    private(set) var transcriptRendering = false
+    private(set) var lastTurnApplyBatchCharacterCounts: [Int] = []
+    private(set) var lastChatPaneBatchCharacterCounts: [Int] = []
     private var actionTasks: [UUID: Task<Void, Never>] = [:]
     private var metadataHiddenTurnCount = 0
 
@@ -131,6 +137,7 @@ final class TraceBrowserModel {
         let turnsSnapshot = turns
         let tab = transcriptFilterTab
         let query = transcriptQuery
+        let forceIncremental = forceChunkedPaneUpdate
         transcriptFilterTask = Task { [weak self] in
             if debounce {
                 try? await Task.sleep(for: .milliseconds(200))
@@ -152,12 +159,56 @@ final class TraceBrowserModel {
                 return (filtered.entries, filtered.totalCount)
             }.value
             guard !Task.isCancelled, let self else { return }
-            let interval = TraceBrowserSignpost.begin(
-                .chatPaneUpdate,
-                "entries=\(result.0.count) turns=\(turnsSnapshot.count)")
-            self.transcriptEntries = self.mapFilterEntries(result.0, turns: turnsSnapshot)
+            let mapped = self.mapFilterEntries(result.0, turns: turnsSnapshot)
+            let characterCounts = mapped.map(Self.entryCharacterCount)
+            let ranges = TranscriptApplyPolicy.messageBatchRanges(
+                characterCounts: characterCounts,
+                forceIncremental: forceIncremental
+                    || mapped.count > TranscriptApplyPolicy.largeMessageCount)
+            self.lastChatPaneBatchCharacterCounts = []
             self.transcriptTotalCount = result.1
-            DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
+            if ranges.isEmpty {
+                self.transcriptEntries = []
+            } else {
+                for range in ranges {
+                    guard !Task.isCancelled else { return }
+                    let batchChars = characterCounts[range].reduce(0, +)
+                    let interval = TraceBrowserSignpost.begin(
+                        .chatPaneUpdate,
+                        "batch_entries=\(range.count) batch_chars=\(batchChars) total_entries=\(mapped.count)")
+                    self.transcriptEntries = Array(mapped[..<range.upperBound])
+                    self.lastChatPaneBatchCharacterCounts.append(batchChars)
+                    DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
+                    if range.upperBound < mapped.count {
+                        await Task.yield()
+                        try? await Task.sleep(for: .milliseconds(1))
+                    }
+                }
+            }
+            guard !Task.isCancelled else { return }
+            self.forceChunkedPaneUpdate = false
+            self.transcriptRendering = false
+        }
+    }
+
+    private nonisolated static func entryCharacterCount(_ entry: TranscriptChatEntry) -> Int {
+        switch entry.role {
+        case .user:
+            entry.turn.user?.count ?? 0
+        case .assistant:
+            max(
+                0,
+                TranscriptApplyPolicy.inlineCharacterCount(entry.turn)
+                    - (entry.turn.user?.count ?? 0))
+        case .event:
+            min(
+                TurnTextCap.maxChars,
+                (entry.turn.attempts ?? []).reduce(0) {
+                    $0 + ($1.error?.message?.count ?? 0)
+                        + ($1.middlewareDecisions ?? []).reduce(0) {
+                            $0 + ($1.explanation?.count ?? 0)
+                        }
+                })
         }
     }
 
@@ -708,8 +759,11 @@ final class TraceBrowserModel {
         transcriptTask = nil
         turnFetchTasks.values.forEach { $0.cancel() }
         turnFetchTasks.removeAll()
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = nil
         turnApplyTask?.cancel()
         turnApplyTask = nil
+        turnApplyGeneration += 1
         actionTasks.values.forEach { $0.cancel() }
         actionTasks.removeAll()
         renderedArtifacts.clear()
@@ -753,8 +807,15 @@ final class TraceBrowserModel {
     private func resetTurns() {
         turnFetchTasks.values.forEach { $0.cancel() }
         turnFetchTasks.removeAll()
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = nil
         turnApplyTask?.cancel()
         turnApplyTask = nil
+        turnApplyGeneration += 1
+        forceChunkedPaneUpdate = false
+        transcriptRendering = false
+        lastTurnApplyBatchCharacterCounts = []
+        lastChatPaneBatchCharacterCounts = []
         transcriptMetadata = []
         expandedTurns = [:]
         metadataHiddenTurnCount = 0
@@ -791,7 +852,8 @@ final class TraceBrowserModel {
         if let first = transcriptMetadata.firstIndex(where: { expandedTurns[$0.traceId] != nil }),
             first > 0
         {
-            requestTurnWindow(indices: max(0, first - 24)..<first)
+            requestTurnWindow(
+                indices: max(0, first - TranscriptApplyPolicy.earlierTurnPageCount)..<first)
             return
         }
         windowMaxTurns += TranscriptWindow.defaultMaxTurns
@@ -1070,7 +1132,7 @@ final class TraceBrowserModel {
                 rebuildExpandedTurns()
                 return
             }
-            let start = max(0, fetched.count - 24)
+            let start = max(0, fetched.count - TranscriptApplyPolicy.initialTurnCount)
             requestTurnWindow(indices: start..<fetched.count)
             for traceId in changed where expandedTurns[traceId] != nil {
                 requestTurn(traceId: traceId, sessionId: sid, replacing: true)
@@ -1088,10 +1150,12 @@ final class TraceBrowserModel {
     func retryTranscript() { startTranscriptPolling() }
 
     func transcriptTurnBecameVisible(_ traceId: String) {
+        guard !userAtBottom else { return }
         guard let index = transcriptMetadata.firstIndex(where: { $0.traceId == traceId }) else {
             return
         }
-        requestTurnWindow(indices: max(0, index - 6)..<min(transcriptMetadata.count, index + 7))
+        requestTurnWindow(
+            indices: max(0, index - TranscriptApplyPolicy.earlierTurnPageCount)..<index)
     }
 
     private func requestTurnWindow(indices: Range<Int>) {
@@ -1142,8 +1206,8 @@ final class TraceBrowserModel {
     }
 
     private func scheduleExpandedRebuild() {
-        turnApplyTask?.cancel()
-        turnApplyTask = Task { [weak self] in
+        expandedRebuildTask?.cancel()
+        expandedRebuildTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(15))
             guard !Task.isCancelled else { return }
             self?.rebuildExpandedTurns()
@@ -1192,14 +1256,82 @@ final class TraceBrowserModel {
             ? allTurns
             : allTurns.filter(parsedQuery.matches)
         defer { retargetInspector() }
-        guard filtered != turns else { return }
-        let totalChars = filtered.reduce(0) {
-            $0 + ($1.user?.count ?? 0) + ($1.assistant?.count ?? 0) + ($1.error?.count ?? 0)
+        turnApplyTask?.cancel()
+        turnApplyGeneration += 1
+        let generation = turnApplyGeneration
+        let requiresIncremental = TranscriptApplyPolicy.requiresIncrementalApply(filtered)
+        transcriptRendering = !filtered.isEmpty && requiresIncremental
+        forceChunkedPaneUpdate = requiresIncremental
+        turnApplyTask = Task { [weak self] in
+            let capped = await Task.detached(priority: .userInitiated) {
+                filtered.map(TranscriptInlineDisplay.capped)
+            }.value
+            guard let self, !Task.isCancelled, generation == self.turnApplyGeneration else {
+                return
+            }
+            if capped == self.turns {
+                self.transcriptRendering = false
+                self.forceChunkedPaneUpdate = false
+                return
+            }
+            self.lastTurnApplyBatchCharacterCounts = []
+            guard requiresIncremental else {
+                self.commitDisplayTurns(
+                    capped,
+                    batchChars: capped.reduce(0) {
+                        $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+                    }, resetRenderState: true)
+                return
+            }
+            let existing = self.turns
+            let prepending = !existing.isEmpty
+                && capped.count >= existing.count
+                && Array(capped.suffix(existing.count)) == existing
+            let appending = capped.count >= existing.count
+                && Array(capped.prefix(existing.count)) == existing
+            var applied = appending || prepending ? existing : []
+            let pending: [TranscriptTurn]
+            if appending {
+                pending = Array(capped.dropFirst(existing.count))
+            } else if prepending {
+                pending = Array(capped.dropLast(existing.count))
+            } else {
+                pending = capped
+            }
+            let batches = TranscriptApplyPolicy.turnBatches(pending)
+            let orderedBatches = prepending ? Array(batches.reversed()) : batches
+            for batch in orderedBatches {
+                guard !Task.isCancelled, generation == self.turnApplyGeneration else { return }
+                if prepending {
+                    applied.insert(contentsOf: batch, at: 0)
+                } else {
+                    applied.append(contentsOf: batch)
+                }
+                self.commitDisplayTurns(
+                    applied,
+                    batchChars: batch.reduce(0) {
+                        $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
+                    }, resetRenderState: prepending || (!appending && applied.count == batch.count))
+                if applied.count < capped.count {
+                    await Task.yield()
+                    try? await Task.sleep(for: .milliseconds(1))
+                }
+            }
+        }
+    }
+
+    private func commitDisplayTurns(
+        _ value: [TranscriptTurn], batchChars: Int, resetRenderState: Bool
+    ) {
+        let totalChars = value.reduce(0) {
+            $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
         }
         let interval = TraceBrowserSignpost.begin(
-            .transcriptApply, "turns=\(filtered.count) total_chars=\(totalChars)")
-        turns = filtered
-        renderState = nil
+            .transcriptApply,
+            "turns=\(value.count) total_chars=\(totalChars) batch_chars=\(batchChars)")
+        turns = value
+        lastTurnApplyBatchCharacterCounts.append(batchChars)
+        if resetRenderState { renderState = nil }
         scheduleRender()
         DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
     }
@@ -2563,6 +2695,18 @@ private struct TranscriptView: View {
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
+                }
+                if model.transcriptRendering, !model.turns.isEmpty {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("rendering…")
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.regularMaterial))
+                    .padding(.bottom, 48)
                 }
                 VStack(spacing: 6) {
                     if let newer = model.newerActivityRow {
