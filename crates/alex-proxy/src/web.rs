@@ -390,10 +390,11 @@ mod tests {
         assert!(!INDEX.contains("credential-test-result"));
         assert_eq!(INDEX.matches("data-refresh-card").count(), 5);
 
-        // Nested settings destinations stay deep-linkable while their bare
-        // hashes retain the all-items view. Credential checks use one shared
-        // native modal from both dashboard and provider entry points.
-        assert!(APP_JS.contains("providerTab: null"));
+        // Nested settings destinations stay deep-linkable; a bare #providers
+        // hash lands on the first provider tab rather than an aggregate view.
+        // Credential checks use one shared native modal from both dashboard
+        // and provider entry points.
+        assert!(APP_JS.contains("providerTab: PROVIDERS[0][0]"));
         assert!(APP_JS.contains("harnessTab: null"));
         assert!(APP_JS.contains(
             "\"pi\", \"claude\", \"codex\", \"grok\", \"amp\", \"gemini\", \"opencode\""
