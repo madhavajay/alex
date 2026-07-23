@@ -11,6 +11,18 @@ const PROVIDERS = [
   ["amp", "Amp", "import"],
   ["cliproxyapi", "CLIProxyAPI", "form"],
 ];
+const LOGIN_PROVIDERS = {
+  claude: ["Claude Code", "Anthropic", "A", "claude"],
+  anthropic: ["Claude Code", "Anthropic", "A", "claude"],
+  codex: ["Codex", "OpenAI", "O", "codex"],
+  openai: ["Codex", "OpenAI", "O", "codex"],
+  gemini: ["Gemini", "Google", "G", "gemini"],
+  google: ["Gemini", "Google", "G", "gemini"],
+  grok: ["Grok", "xAI", "X", "grok"],
+  xai: ["Grok", "xAI", "X", "grok"],
+  kimi: ["Kimi", "Moonshot AI", "K", "kimi"],
+  moonshot: ["Kimi", "Moonshot AI", "K", "kimi"],
+};
 const VIEW_COPY = {
   onboarding: ["Onboarding", "Set up Alex in a few small steps"],
   dashboard: ["Dashboard", "Daemon, providers, tools, and recent activity"],
@@ -1207,6 +1219,71 @@ function setLoginFlow(html) {
   loginFlowNodes().forEach((node) => { node.hidden = false; node.innerHTML = html; });
 }
 
+function loginProvider(provider) {
+  const raw = String(provider || "Provider");
+  const known = LOGIN_PROVIDERS[raw.toLowerCase()];
+  return known ? { name: known[0], vendor: known[1], monogram: known[2], accent: known[3] } : { name: raw, vendor: "Provider", monogram: raw.trim().charAt(0).toUpperCase() || "P", accent: "default" };
+}
+
+function selectLoginText(node) {
+  try {
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } catch { /* Selection is only a last-resort clipboard fallback. */ }
+}
+
+async function copyLoginText(text, selectionNode = null) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(text); return; }
+      catch { /* Plain HTTP and older browsers may deny the Clipboard API. */ }
+    }
+    const helper = document.createElement("textarea");
+    helper.value = text;
+    helper.setAttribute("readonly", "");
+    helper.className = "clipboard-helper";
+    document.body.append(helper);
+    helper.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch { /* Fall through to selecting visible text. */ }
+    helper.remove();
+    if (!copied && selectionNode) selectLoginText(selectionNode);
+  } catch { if (selectionNode) selectLoginText(selectionNode); }
+}
+
+function showLoginCopied(button, label = null) {
+  const icon = $("[data-login-copy-icon]", button);
+  const originalIcon = icon?.textContent;
+  const originalLabel = label?.textContent;
+  button.classList.add("copied");
+  if (icon) icon.textContent = "✓";
+  if (label) label.textContent = "Copied!";
+  clearTimeout(button.loginCopiedTimer);
+  button.loginCopiedTimer = setTimeout(() => {
+    if (!button.isConnected) return;
+    button.classList.remove("copied");
+    if (icon) icon.textContent = originalIcon;
+    if (label) label.textContent = originalLabel;
+  }, 1800);
+}
+
+function bindLoginCard(node, session, reauthProvider) {
+  $("[data-login-copy-link]", node)?.addEventListener("click", (event) => {
+    const button = event.currentTarget;
+    showLoginCopied(button, $("[data-login-copy-label]", button));
+    copyLoginText(button.dataset.loginCopyLink);
+  });
+  $("[data-login-copy-code]", node)?.addEventListener("click", (event) => {
+    const button = event.currentTarget;
+    showLoginCopied(button);
+    copyLoginText(button.dataset.loginCopyCode, $("[data-login-code]", node));
+  });
+  $("[data-login-complete]", node)?.addEventListener("submit", (event) => reauthProvider ? completeReauth(event, reauthProvider) : completeLogin(event, session.login_id));
+}
+
 async function startLogin(provider) {
   clearTimeout(state.loginPoll);
   setLoginFlow("Starting secure provider login…");
@@ -1231,10 +1308,16 @@ async function startReauth(provider, accountId) {
 
 function renderLogin(session, reauthProvider = null) {
   const target = safeUrl(session.verification_uri_complete || session.authorize_url || session.verification_uri);
-  const paste = session.mode === "paste" && session.state === "pending" ? '<form data-login-complete class="form-grid"><label>Authorization code or callback URL<input name="input" required autocomplete="off"></label><button>Complete login</button></form>' : "";
-  const html = `<div class="login-status"><span class="step-kicker">PROVIDER AUTHORIZATION</span><h3>${escapeHtml(session.provider || reauthProvider || "Provider")} · ${escapeHtml(session.state)}</h3>${session.user_code ? `<p>Enter code <code>${escapeHtml(session.user_code)}</code></p>` : ""}${target ? `<a class="primary button-link" href="${escapeHtml(target)}" target="_blank" rel="noopener">Open authorization page</a>` : ""}${paste}${session.state === "pending" ? '<p><span class="spinner"></span> Waiting for authorization…</p>' : ""}${session.error ? `<p class="inline-message danger">${escapeHtml(session.error)}</p>` : ""}</div>`;
+  const provider = loginProvider(session.provider || reauthProvider);
+  const pending = session.state === "pending";
+  const paste = session.mode === "paste";
+  const openStep = target ? `<section class="provider-auth-step"><div class="provider-auth-step-title"><span class="provider-auth-step-badge">1</span><span>Open the authorization page.</span></div><div class="provider-auth-actions"><a class="provider-auth-action" href="${escapeHtml(target)}" target="_blank" rel="noopener"><span aria-hidden="true">↗</span>Open in Browser</a><button type="button" class="provider-auth-action" data-login-copy-link="${escapeHtml(target)}"><span data-login-copy-icon aria-hidden="true">⧉</span><span data-login-copy-label>Copy Link</span></button></div></section>` : "";
+  const codeStep = session.user_code ? `<section class="provider-auth-step"><div class="provider-auth-step-title"><span class="provider-auth-step-badge">2</span><span>Enter this code when ${escapeHtml(provider.name)} asks for it:</span></div><div class="provider-auth-code-row"><div class="provider-auth-code" data-login-code tabindex="0">${escapeHtml(session.user_code)}</div><button type="button" class="provider-auth-code-copy" data-login-copy-code="${escapeHtml(session.user_code)}" aria-label="Copy authorization code"><span data-login-copy-icon aria-hidden="true">⧉</span></button></div></section>` : "";
+  const pasteStep = paste && pending ? `<section class="provider-auth-step"><div class="provider-auth-step-title"><span class="provider-auth-step-badge">2</span><span>Paste the authorization code or callback URL.</span></div><form data-login-complete class="provider-auth-paste"><label><span>Authorization code or callback URL</span><input name="input" required autocomplete="off"></label><button type="submit">Complete login</button></form></section>` : "";
+  const status = session.error ? `<div class="provider-auth-status danger"><span class="provider-auth-status-icon" aria-hidden="true">!</span><span>${escapeHtml(session.error)}</span></div>` : session.state === "done" ? `<div class="provider-auth-status success"><span class="provider-auth-status-icon" aria-hidden="true">✓</span><span>${escapeHtml(session.success_message || "Authorization complete — account connected.")}</span></div>` : pending ? '<div class="provider-auth-status waiting"><span class="spinner" aria-hidden="true"></span><span>Waiting for authorization — keep this window open.</span></div>' : `<div class="provider-auth-status danger"><span class="provider-auth-status-icon" aria-hidden="true">!</span><span>Authorization ${escapeHtml(session.state || "failed")}.</span></div>`;
+  const html = `<div class="provider-auth-card" data-login-accent="${escapeHtml(provider.accent)}"><div class="provider-auth-body"><header class="provider-auth-identity"><div class="provider-auth-logo" aria-hidden="true">${escapeHtml(provider.monogram)}</div><div class="provider-auth-name"><strong>${escapeHtml(provider.name)}</strong><span>by ${escapeHtml(provider.vendor)}</span></div><div class="provider-auth-pill"><i></i><span>${paste ? "Paste code" : "OAuth Device Flow"}</span></div></header><div class="provider-auth-divider"></div>${openStep}${codeStep}${pasteStep}${status}</div></div>`;
   setLoginFlow(html);
-  loginFlowNodes().forEach((node) => $('[data-login-complete]', node)?.addEventListener("submit", (event) => reauthProvider ? completeReauth(event, reauthProvider) : completeLogin(event, session.login_id)));
+  loginFlowNodes().forEach((node) => bindLoginCard(node, session, reauthProvider));
 }
 
 async function completeLogin(event, id) {
@@ -1253,7 +1336,7 @@ async function completeReauth(event, provider) {
   try {
     const result = await api("/admin/auth/reauth/submit", { method: "POST", body: JSON.stringify({ provider, input }) });
     if (result.ok === false) throw new Error(result.error || "Re-authentication did not complete");
-    setLoginFlow(`<strong>${escapeHtml(provider)} login complete</strong><p>Credential updated. Run ping checks to verify it.</p>`);
+    renderLogin({ provider, mode: "paste", state: "done", success_message: "Credential updated. Run ping checks to verify it." }, provider);
     await loadProviders();
   } catch (error) { toast(error.message, "danger"); }
 }

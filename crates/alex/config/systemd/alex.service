@@ -9,6 +9,9 @@ ExecStart=%h/.local/bin/alex daemon
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=info,alex=debug
+# systemd user services get a bare PATH (/usr/local/bin:/usr/bin), which hides
+# harnesses installed under the user's home (claude, codex via mise, grok, …).
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:%h/.grok/bin:%h/bin:/usr/local/bin:/usr/bin
 NoNewPrivileges=true
 ProtectSystem=full
 # A fresh Linux user may not have used npm yet. The leading "-" keeps the
