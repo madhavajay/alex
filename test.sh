@@ -8,6 +8,14 @@ if [ -f "$ROOT/.env" ]; then
   . "$ROOT/.env"
   set +a
 fi
+# Respect a redirected cargo build cache (e.g. Windows CI/VMs keep it outside
+# the synced tree); default to the in-repo target dir.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+# Windows builds emit .exe; bash needs the real filename to exec it.
+BIN_EXT=""
+if [ -f "$TARGET_DIR/debug/alex.exe" ] || { command -v uname >/dev/null && case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) true ;; *) false ;; esac; }; then
+  BIN_EXT=".exe"
+fi
 CONFIG_FILE="${ALEX_CONFIG:-$HOME/.alex/config.toml}"
 PROMPT="Reply with exactly: alex-test-ok"
 
@@ -997,7 +1005,7 @@ run_mock_m5() {
   in_only M5 || return 0
   local home=$1 fake_base=$2 control_key=$3 out="$TMP/mock-m5.json" requests="$TMP/mock-m5-requests.json" t0 t1 msg rc=0
   t0=$(now_ms)
-  mock_env "$home" "$fake_base" "$ROOT/target/debug/alex" ping openai --json \
+  mock_env "$home" "$fake_base" "$TARGET_DIR/debug/alex$BIN_EXT" ping openai --json \
     >"$out" 2>"$TMP/mock-m5.err" || rc=$?
   curl -sS --max-time 10 -H "x-control-key: $control_key" \
     -o "$requests" "$fake_base/_control/requests" 2>/dev/null || true
@@ -1023,7 +1031,7 @@ run_mock_m6() {
   in_only M6 || return 0
   local home=$1 out="$TMP/mock-m6.json" t0 t1 msg rc=0
   t0=$(now_ms)
-  ALEX_HOME="$home" "$ROOT/target/debug/alex" traces search --since 10m --json \
+  ALEX_HOME="$home" "$TARGET_DIR/debug/alex$BIN_EXT" traces search --since 10m --json \
     >"$out" 2>"$TMP/mock-m6.err" || rc=$?
   t1=$(now_ms)
   if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" "mock-m1-$$" "mock-m2-$$" <<'PY'
@@ -1082,7 +1090,7 @@ PY
   chmod 600 "$home/config.toml" "$home/accounts/"*.json
 
   : > "$TMP/fakeprov.handshake"
-  "$ROOT/target/debug/alex-fakeprov" --port 0 >"$TMP/fakeprov.handshake" 2>"$TMP/fakeprov.log" &
+  "$TARGET_DIR/debug/alex-fakeprov$BIN_EXT" --port 0 >"$TMP/fakeprov.handshake" 2>"$TMP/fakeprov.log" &
   FAKEPROV_PID=$!
   i=0
   while [ "$i" -lt 100 ] && [ ! -s "$TMP/fakeprov.handshake" ]; do
@@ -1099,7 +1107,7 @@ PY
   fi
 
   base="http://127.0.0.1:$port"
-  mock_env "$home" "$fake_base" "$ROOT/target/debug/alex" daemon --host 127.0.0.1 --port "$port" \
+  mock_env "$home" "$fake_base" "$TARGET_DIR/debug/alex$BIN_EXT" daemon --host 127.0.0.1 --port "$port" \
     >"$TMP/mock-daemon.log" 2>&1 &
   MOCK_DAEMON_PID=$!
   i=0
@@ -1458,7 +1466,7 @@ run_harness_mock_lifecycle_for() {
   dir="$TMP/lifecycle-$harness"
   harness_mock_seed_connect_dir "$harness" "$dir"
   out="$TMP/cell.$c1.json"; err="$TMP/cell.$c1.err"; t0=$(now_ms); rc=0
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" connect "$harness" --config-dir "$dir" --json >"$out" 2>"$err" || rc=$?
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" connect "$harness" --config-dir "$dir" --json >"$out" 2>"$err" || rc=$?
   if [ "$rc" -eq 0 ] && msg=$(harness_mock_connect_assert "$harness" "$dir" "$out" 2>&1); then
     in_only "$c1" && write_result "$c1" PASS "$(( $(now_ms)-t0 ))" "$msg"
   else
@@ -1486,7 +1494,7 @@ run_harness_mock_lifecycle_for() {
   fi
   key_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["key_id"])' "$out" 2>/dev/null || true)
   err="$TMP/cell.$c4.err"; t0=$(now_ms); rc=0
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" disconnect "$harness" --config-dir "$dir" >"$TMP/cell.$c4.out" 2>"$err" || rc=$?
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" disconnect "$harness" --config-dir "$dir" >"$TMP/cell.$c4.out" 2>"$err" || rc=$?
   keys="$TMP/cell.$c4.keys.json"
   curl -fsS --max-time 10 -H "x-api-key: $HARNESS_MOCK_KEY" -o "$keys" "$HARNESS_MOCK_BASE/admin/run-keys?all=1" || true
   if [ "$rc" -eq 0 ] && msg=$(harness_mock_disconnect_assert "$harness" "$dir" "$key_id" "$keys" 2>&1); then
@@ -1513,7 +1521,7 @@ run_harness_mock_c5() {
   local t0 out err rc=0 msg
   t0=$(now_ms)
   out="$TMP/cell.C5.json"; err="$TMP/cell.C5.err"
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" wrap smoke --harness amp --json >"$out" 2>"$err" || rc=$?
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" wrap smoke --harness amp --json >"$out" 2>"$err" || rc=$?
   if [ "$rc" -eq 0 ] && msg=$(python3 - "$out" <<'PY' 2>&1
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -1546,7 +1554,7 @@ PY
   )
   HARNESS_MOCK_KEY="alx-harness-mock-key"
   : > "$TMP/harness-mock-fake.handshake"
-  "$ROOT/target/debug/alex-fakeprov" --bind 0.0.0.0 --port 0 \
+  "$TARGET_DIR/debug/alex-fakeprov$BIN_EXT" --bind 0.0.0.0 --port 0 \
     >"$TMP/harness-mock-fake.handshake" 2>"$TMP/harness-mock-fake.log" &
   FAKEPROV_PID=$!
   i=0
@@ -1598,7 +1606,7 @@ for account in accounts:
         json.dump(account, f, indent=2)
 PY
   chmod 600 "$HARNESS_MOCK_HOME/config.toml" "$HARNESS_MOCK_HOME/accounts/"*.json
-  harness_mock_env "$ROOT/target/debug/alex" daemon --host 0.0.0.0 --port "$port" \
+  harness_mock_env "$TARGET_DIR/debug/alex$BIN_EXT" daemon --host 0.0.0.0 --port "$port" \
     >"$TMP/harness-mock-daemon.log" 2>&1 &
   MOCK_DAEMON_PID=$!
   i=0
@@ -1634,7 +1642,7 @@ run_harness_mock_cell() {
   fi
   out="$TMP/cell.$id.harness.json"
   err="$TMP/cell.$id.harness.err"
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run "$harness" \
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" harness run "$harness" \
     --model "$model" --prompt "Use your shell or directory-listing tool to list the current directory, then report the result." \
     --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
   t1=$(now_ms)
@@ -1816,7 +1824,7 @@ run_harness_mock_b3() {
   harness_mock_control /_control/scenario '{"name":"stream-stall"}'
   harness_mock_openai_mode openai
   out="$TMP/cell.B3.harness.json"; err="$TMP/cell.B3.harness.err"
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run codex \
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" harness run codex \
     --model alex/openai/gpt-fake-1 --prompt "Reply once." --json --no-trace-check --timeout-secs 25 \
     >"$out" 2>"$err" || rc=$?
   elapsed=$(( $(now_ms)-t0 ))
@@ -1901,7 +1909,7 @@ PY
   env ALEX_HOME="$home" \
     ALEX_UPSTREAM_ANTHROPIC_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
     ALEX_DARIO_UPSTREAM_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
-    "$ROOT/target/debug/alex" daemon --host 127.0.0.1 --port "$port" \
+    "$TARGET_DIR/debug/alex$BIN_EXT" daemon --host 127.0.0.1 --port "$port" \
     >"$TMP/dario-mock-daemon.log" 2>&1 &
   DARIO_MOCK_PID=$!
   i=0
@@ -2026,7 +2034,7 @@ PY
   chmod 600 "$home/config.toml" "$home/accounts/"*.json
   env ALEX_HOME="$home" ALEX_DARIO_UPSTREAM_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
     ALEX_UPSTREAM_ANTHROPIC_URL="$HARNESS_MOCK_FAKE_BASE/anthropic" \
-    "$ROOT/target/debug/alex" daemon --host 0.0.0.0 --port "$port" \
+    "$TARGET_DIR/debug/alex$BIN_EXT" daemon --host 0.0.0.0 --port "$port" \
     >"$TMP/dario-tool-daemon.log" 2>&1 &
   DARIO_MOCK_PID=$!
   i=0
@@ -2055,7 +2063,7 @@ PY
   harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","directory_tool_call":true}'
   harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","tool_final":"alex-harness-tool-ok Fake Anthropic response."}'
   out="$TMP/cell.B-DARIO-TOOL.harness.json"; err="$TMP/cell.B-DARIO-TOOL.err"
-  ALEX_HOME="$home" "$ROOT/target/debug/alex" harness run codex \
+  ALEX_HOME="$home" "$TARGET_DIR/debug/alex$BIN_EXT" harness run codex \
     --model alex/claude-fake-1 --prompt "Use your shell tool to list the current directory, then report the result." \
     --container-base-url "http://host.docker.internal:$port" \
     --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
@@ -2126,7 +2134,7 @@ run_harness_mock_b_fable_on() {
   harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","failure":"refusal"}'
   harness_mock_control /_control/queue '{"endpoint":"POST /openai/v1/responses","fixture":"openai/fable-reroute-sol.sse"}'
   out="$TMP/cell.B-FABLE-REROUTE-ON.harness.json"; err="$TMP/cell.B-FABLE-REROUTE-ON.err"
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run claude \
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" harness run claude \
     --model alex/claude-fable-5 --prompt "B-FABLE-REROUTE-ON" \
     --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
   traces="$TMP/cell.B-FABLE-REROUTE-ON.traces.json"; activity="$TMP/cell.B-FABLE-REROUTE-ON.activity.json"; requests="$TMP/cell.B-FABLE-REROUTE-ON.requests.json"
@@ -2177,7 +2185,7 @@ run_harness_mock_b_fable_off() {
   harness_mock_openai_mode openai
   harness_mock_control /_control/queue '{"endpoint":"POST /anthropic/v1/messages","failure":"refusal"}'
   out="$TMP/cell.B-FABLE-REROUTE-OFF.harness.json"; err="$TMP/cell.B-FABLE-REROUTE-OFF.err"
-  ALEX_HOME="$HARNESS_MOCK_HOME" "$ROOT/target/debug/alex" harness run claude \
+  ALEX_HOME="$HARNESS_MOCK_HOME" "$TARGET_DIR/debug/alex$BIN_EXT" harness run claude \
     --model alex/claude-fable-5 --prompt "B-FABLE-REROUTE-OFF" \
     --json --no-trace-check --timeout-secs "$HARNESS_TIMEOUT" >"$out" 2>"$err" || rc=$?
   harness_mock_set_fable_rule true || true

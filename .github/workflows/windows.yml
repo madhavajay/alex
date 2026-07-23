@@ -53,7 +53,13 @@ jobs:
         run: |
           cargo test --locked -p alex-core --target ${{ matrix.target }}
           cargo test --locked -p alex-auth --target ${{ matrix.target }}
+          cargo test --locked -p alex-store --target ${{ matrix.target }}
+          cargo test --locked -p alex-fakeprov --target ${{ matrix.target }}
           cargo test --locked -p alex --target ${{ matrix.target }}
+        shell: pwsh
+
+      - name: Fakeprov router integration
+        run: cargo test --locked -p alex-proxy --target ${{ matrix.target }} --test fakeprov_router -- --nocapture
         shell: pwsh
 
       - name: Parse Windows packaging scripts and verify smoke contracts
