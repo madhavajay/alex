@@ -32,7 +32,7 @@ final class OnboardingModel {
     static let currentVersion = OnboardingLaunchPolicy.currentVersion
     static let stepTitles = [
         "Meet Alex", "Pick a provider", "Connect and test",
-        "Credentials for compatible apps", "Never lose a login", "Keep your agents running",
+        "Credentials for compatible apps", "Network", "Never lose a login", "Keep your agents running",
         "Beyond single provider",
     ]
 
@@ -917,8 +917,9 @@ struct OnboardingView: View {
         case 1: providerPicker
         case 2: stagedConnect
         case 3: credentials
-        case 4: notifications
-        case 5: failover
+        case 4: network
+        case 5: notifications
+        case 6: failover
         default: beyondSingleProvider
         }
     }
@@ -1497,6 +1498,15 @@ struct OnboardingView: View {
                     .font(.system(size: 11)).foregroundStyle(AlexTheme.Colors.textTertiary)
             }
             .padding(14).cardStyle()
+        }
+    }
+
+    private var network: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intro(
+                "Network",
+                "Choose which interfaces Alex listens on. Loopback is right unless other devices need to reach this daemon.")
+            NetworkExposureSection(store: model.store)
         }
     }
 
