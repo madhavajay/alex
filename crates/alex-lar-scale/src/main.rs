@@ -1,5 +1,6 @@
 use alex_lar_scale::{
-    generate_corpus, generate_fable_sol_fixture, run_scale, verify_scale, write_json, ScaleProfile,
+    generate_browser_corpus, generate_corpus, generate_fable_sol_fixture, run_scale, verify_scale,
+    write_json, ScaleProfile,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -17,6 +18,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate the deterministic trace-browser stress corpus.
+    BrowserProfile {
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Generate only the deterministic legacy SQLite/gzip corpus.
     Generate {
         #[arg(long, value_enum, default_value_t = ScaleProfile::Full)]
@@ -63,6 +69,17 @@ enum Command {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::BrowserProfile { root } => {
+            let (manifest, elapsed) = generate_browser_corpus(&root)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "manifest": manifest,
+                    "generation_ms": elapsed.as_millis(),
+                    "root": root,
+                }))?
+            );
+        }
         Command::Generate { profile, root } => {
             let (manifest, elapsed) = generate_corpus(&root, profile)?;
             println!(

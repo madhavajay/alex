@@ -167,6 +167,7 @@ dependencies = [
 name = "alex-lar-scale"
 version = "0.1.25"
 dependencies = [
+ "alex-core",
  "alex-lar",
  "alex-store",
  "anyhow",

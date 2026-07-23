@@ -3,10 +3,13 @@
 //! The full profile creates 55,000 synthetic traces and 9.4 GB of logical
 //! request/response bytes without retaining more than one body in memory.
 
+use alex_core::TraceRecord;
 use alex_lar::{
     export_sanitized_fixture, ArchiveReader, ArchiveWriter, BodyKey, FixtureExportReport,
 };
-use alex_store::{LarMigrationReport, Store, StoredBodySource, TraceBodyKind, TraceFilter};
+use alex_store::{
+    LarMigrationReport, Store, StoredBodySource, ToolCallRecord, TraceBodyKind, TraceFilter,
+};
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use flate2::{Compression, GzBuilder};
@@ -23,6 +26,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MANIFEST_FILE: &str = "lar-scale-manifest.json";
 pub const FULL_TRACE_COUNT: u64 = 55_000;
 pub const FULL_LOGICAL_BODY_BYTES: u64 = 9_400_000_000;
+pub const BROWSER_MANIFEST_FILE: &str = "trace-browser-corpus.json";
+pub const BROWSER_LONG_TURNS: usize = 500;
+pub const BROWSER_MEDIUM_SESSIONS: usize = 50;
+
+const BROWSER_LONG_BODY_BYTES: usize = 2 * 1024 * 1024;
+const BROWSER_MEDIUM_TURNS: usize = 6;
+const BROWSER_MEDIUM_BODY_BYTES: usize = 64 * 1024;
+const BROWSER_TOOL_BODY_BYTES: usize = 32 * 1024;
+const BROWSER_BASE_TIMESTAMP_MS: i64 = 1_700_000_000_000;
+const BROWSER_SESSION_ID: &str = "trace-browser-long-session";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +125,20 @@ pub struct CorpusManifest {
     pub logical_body_bytes: u64,
     pub legacy_file_count: u64,
     pub deterministic_date: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BrowserCorpusManifest {
+    pub schema_version: u32,
+    pub seed: u64,
+    pub long_session_id: String,
+    pub long_turns: usize,
+    pub medium_sessions: usize,
+    pub medium_turns_per_session: usize,
+    pub trace_count: usize,
+    pub tool_call_count: usize,
+    pub long_body_bytes: usize,
+    pub medium_body_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -281,6 +308,202 @@ pub fn generate_corpus(root: &Path, profile: ScaleProfile) -> Result<(CorpusMani
     };
     write_json(&root.join(MANIFEST_FILE), &manifest)?;
     Ok((manifest, started.elapsed()))
+}
+
+pub fn generate_browser_corpus(root: &Path) -> Result<(BrowserCorpusManifest, Duration)> {
+    generate_browser_corpus_with_spec(
+        root,
+        BROWSER_LONG_TURNS,
+        BROWSER_MEDIUM_SESSIONS,
+        BROWSER_MEDIUM_TURNS,
+        BROWSER_LONG_BODY_BYTES,
+        BROWSER_MEDIUM_BODY_BYTES,
+        BROWSER_TOOL_BODY_BYTES,
+    )
+}
+
+fn generate_browser_corpus_with_spec(
+    root: &Path,
+    long_turns: usize,
+    medium_sessions: usize,
+    medium_turns_per_session: usize,
+    long_body_bytes: usize,
+    medium_body_bytes: usize,
+    tool_body_bytes: usize,
+) -> Result<(BrowserCorpusManifest, Duration)> {
+    ensure_empty_root(root)?;
+    fs::create_dir_all(root)?;
+    let store = Store::open(root.to_path_buf())?;
+    let started = Instant::now();
+    let mut tool_call_count = 0;
+
+    for index in 0..long_turns {
+        insert_browser_turn(
+            &store,
+            BROWSER_SESSION_ID,
+            index,
+            BROWSER_BASE_TIMESTAMP_MS + index as i64 * 10,
+            long_body_bytes,
+            tool_body_bytes,
+            true,
+        )?;
+        tool_call_count += 1;
+    }
+
+    for session in 0..medium_sessions {
+        let session_id = format!("trace-browser-medium-{session:02}");
+        for turn in 0..medium_turns_per_session {
+            insert_browser_turn(
+                &store,
+                &session_id,
+                turn,
+                BROWSER_BASE_TIMESTAMP_MS
+                    + 1_000_000
+                    + (session * medium_turns_per_session + turn) as i64 * 10,
+                medium_body_bytes,
+                tool_body_bytes,
+                false,
+            )?;
+            tool_call_count += 1;
+        }
+    }
+
+    let manifest = BrowserCorpusManifest {
+        schema_version: 1,
+        seed: 0x54_52_41_43_45,
+        long_session_id: BROWSER_SESSION_ID.into(),
+        long_turns,
+        medium_sessions,
+        medium_turns_per_session,
+        trace_count: long_turns + medium_sessions * medium_turns_per_session,
+        tool_call_count,
+        long_body_bytes,
+        medium_body_bytes,
+    };
+    write_json(&root.join(BROWSER_MANIFEST_FILE), &manifest)?;
+    Ok((manifest, started.elapsed()))
+}
+
+fn insert_browser_turn(
+    store: &Store,
+    session_id: &str,
+    index: usize,
+    timestamp_ms: i64,
+    body_bytes: usize,
+    tool_body_bytes: usize,
+    long: bool,
+) -> Result<()> {
+    let prefix = if long { "long" } else { "medium" };
+    let trace_id = format!("trace-browser-{prefix}-{timestamp_ms}-{index:03}");
+    let tool_id = format!("tool-{trace_id}");
+    let request = browser_request_body(&trace_id, body_bytes)?;
+    let response = browser_sse_body(&trace_id, body_bytes)?;
+    let args = browser_tool_body(&trace_id, "args", tool_body_bytes)?;
+    let result = browser_tool_body(&trace_id, "result", tool_body_bytes)?;
+    let request_path = store.write_body(&trace_id, "request.json", &request)?;
+    let response_path = store.write_body(&trace_id, "response.sse", &response)?;
+    let args_path = store.write_body(&tool_id, "tool-args.json", &args)?;
+    let result_path = store.write_body(&tool_id, "tool-result.json", &result)?;
+    store.insert_trace(&TraceRecord {
+        id: trace_id.clone(),
+        ts_request_ms: timestamp_ms,
+        ts_response_ms: Some(timestamp_ms + 8),
+        session_id: Some(session_id.into()),
+        harness: Some("trace-browser-corpus".into()),
+        client_format: Some("openai-chat".into()),
+        upstream_provider: Some("openai".into()),
+        upstream_format: Some("openai-chat".into()),
+        requested_model: Some("gpt-5.6-sol".into()),
+        routed_model: Some("gpt-5.6-sol".into()),
+        method: Some("POST".into()),
+        path: Some("/v1/chat/completions".into()),
+        status: Some(200),
+        streamed: Some(true),
+        req_body_path: Some(request_path),
+        resp_body_path: Some(response_path),
+        run_id: Some("trace-browser-corpus".into()),
+        tags: Some(json!({"profile": "trace-browser", "size": prefix}).to_string()),
+        ..Default::default()
+    })?;
+    store.upsert_tool_call(&ToolCallRecord {
+        id: tool_id.clone(),
+        harness: "trace-browser-corpus".into(),
+        session_id: session_id.into(),
+        turn_id: Some(format!("turn-{index:03}")),
+        tool_call_id: format!("call-{trace_id}"),
+        trace_id: Some(trace_id),
+        tool_name: "read_file".into(),
+        ts_start_ms: timestamp_ms + 2,
+        ts_end_ms: Some(timestamp_ms + 6),
+        is_error: Some(false),
+        exit_status: Some(0),
+        args_body_path: Some(args_path),
+        result_body_path: Some(result_path),
+    })?;
+    Ok(())
+}
+
+fn browser_request_body(trace_id: &str, target_bytes: usize) -> Result<Vec<u8>> {
+    let base = json!({
+        "model": "gpt-5.6-sol",
+        "stream": true,
+        "messages": [{"role": "user", "content": ""}],
+        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        "metadata": {"trace_id": trace_id},
+    });
+    padded_json(base, "/messages/0/content", target_bytes)
+}
+
+fn browser_sse_body(trace_id: &str, target_bytes: usize) -> Result<Vec<u8>> {
+    let tool = json!({
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": format!("call-{trace_id}"), "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"fixture.txt\"}"}}]}}]
+    });
+    let prefix = format!("data: {tool}\n\n");
+    let suffix = "\n\ndata: [DONE]\n\n";
+    let empty_event = json!({"choices": [{"index": 0, "delta": {"content": ""}}]});
+    let fixed_bytes = prefix.len() + "data: ".len() + empty_event.to_string().len() + suffix.len();
+    if fixed_bytes > target_bytes {
+        bail!("browser SSE target is too small");
+    }
+    let text_len = target_bytes - fixed_bytes;
+    let text = deterministic_text(trace_id, text_len);
+    let event = json!({"choices": [{"index": 0, "delta": {"content": text}}]});
+    let body = format!("{prefix}data: {event}{suffix}").into_bytes();
+    if body.len() != target_bytes {
+        bail!("browser SSE body length {} != {target_bytes}", body.len());
+    }
+    Ok(body)
+}
+
+fn browser_tool_body(trace_id: &str, kind: &str, target_bytes: usize) -> Result<Vec<u8>> {
+    padded_json(
+        json!({"trace_id": trace_id, "kind": kind, "content": ""}),
+        "/content",
+        target_bytes,
+    )
+}
+
+fn padded_json(mut value: Value, pointer: &str, target_bytes: usize) -> Result<Vec<u8>> {
+    let empty = serde_json::to_vec(&value)?;
+    if empty.len() > target_bytes {
+        bail!("browser JSON target is too small");
+    }
+    let padding = deterministic_text(pointer, target_bytes - empty.len());
+    *value
+        .pointer_mut(pointer)
+        .context("browser JSON padding pointer is missing")? = json!(padding);
+    let body = serde_json::to_vec(&value)?;
+    if body.len() != target_bytes {
+        bail!("browser JSON body length {} != {target_bytes}", body.len());
+    }
+    Ok(body)
+}
+
+fn deterministic_text(seed: &str, length: usize) -> String {
+    let offset = seed.bytes().fold(0usize, |sum, byte| sum + byte as usize);
+    (0..length)
+        .map(|index| (b'a' + ((index + offset) % 23) as u8) as char)
+        .collect()
 }
 
 pub fn verify_scale(
@@ -981,5 +1204,32 @@ mod tests {
         assert!(report.synthetic_secret_absent);
         assert!(report.fable_failure_verified);
         assert!(report.sol_reroute_verified);
+    }
+
+    #[test]
+    fn browser_corpus_has_long_and_medium_sessions_with_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-corpus");
+        let (manifest, _) =
+            generate_browser_corpus_with_spec(&root, 5, 3, 2, 16_384, 4_096, 2_048).unwrap();
+        let store = Store::open(root).unwrap();
+        assert_eq!(manifest.trace_count, 11);
+        assert_eq!(manifest.tool_call_count, 11);
+        assert_eq!(
+            store
+                .session_traces(BROWSER_SESSION_ID, None)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            store.session_tool_calls(BROWSER_SESSION_ID).unwrap().len(),
+            5
+        );
+        assert!(store
+            .session_traces("trace-browser-medium-02", None)
+            .unwrap()
+            .iter()
+            .all(|row| row["streamed"] == 1));
     }
 }
