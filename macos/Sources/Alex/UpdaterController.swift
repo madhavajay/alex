@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import Sparkle
@@ -105,6 +106,25 @@ final class ChannelFeedDelegate: NSObject, SPUUpdaterDelegate {
             updaterController?.recordAppUpdate(version: nil)
         }
     }
+
+    /// Any aborted update cycle (bad signature, download failure, failed
+    /// validation, …) gets a curl-installer escape hatch. Sparkle's own alert
+    /// dead-ends at "try again later"; a locally-signed or half-published
+    /// build can stay broken indefinitely, so always offer the force path.
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        let nsError = error as NSError
+        BarLog.warn(
+            .ui,
+            "sparkle didAbortWithError: domain=\(nsError.domain) code=\(nsError.code) \(nsError.localizedDescription)")
+        // 1001 = no update available, 4007/4008 = user canceled or deferred —
+        // normal outcomes, not failures.
+        guard nsError.domain == SUSparkleErrorDomain,
+            ![1001, 4007, 4008].contains(nsError.code)
+        else { return }
+        MainActor.assumeIsolated {
+            updaterController?.offerForceInstall(afterError: nsError)
+        }
+    }
 }
 
 @MainActor
@@ -170,6 +190,47 @@ final class UpdaterController: ObservableObject {
 
     fileprivate func recordAppUpdate(version: String?) {
         availableAppUpdateVersion = version
+    }
+
+    /// The channel-appropriate bootstrap installer: it reinstalls the CLI,
+    /// re-pins the daemon, and replaces the app with the latest published
+    /// build — exactly the recovery for a Sparkle update Sparkle itself
+    /// cannot validate or install.
+    static func forceInstallCommand() -> String {
+        let rawChannel = UserDefaults.standard.string(forKey: UpdateChannelSetting.defaultsKey)
+        let runningVersion =
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let channel = UpdateChannelSetting.resolved(
+            rawStored: rawChannel, runningVersion: runningVersion)
+        let script = channel == .beta ? "install-beta.sh" : "install-release.sh"
+        return "curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/\(script) | sh"
+    }
+
+    /// Follow-up alert after Sparkle aborts: explain the failure and offer to
+    /// run the curl installer in the user's terminal, which force-installs the
+    /// latest published version regardless of what Sparkle choked on.
+    fileprivate func offerForceInstall(afterError error: NSError) {
+        let command = Self.forceInstallCommand()
+        let alert = NSAlert()
+        alert.messageText = "Update could not be installed"
+        alert.informativeText =
+            "\(error.localizedDescription)\n\nYou can force-install the latest version with the "
+            + "official installer instead:\n\n\(command)\n\nIt reinstalls the CLI, daemon, and app, "
+            + "then relaunches Alex."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Force Install in Terminal")
+        alert.addButton(withTitle: "Copy Command")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            TerminalLauncher.launch(command: command)
+        case .alertSecondButtonReturn:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(command, forType: .string)
+        default:
+            break
+        }
     }
 
     /// Debug-only manual preview hook (see MenuUpdateBannerView doc) so the
