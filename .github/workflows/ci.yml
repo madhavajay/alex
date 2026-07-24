@@ -42,10 +42,14 @@ jobs:
           retention-days: 14
 
   linux-installed-smoke:
-    name: Linux x86-64 installed release smoke
+    name: Linux ${{ matrix.arch }} installed release smoke
     if: github.event_name == 'pull_request'
     runs-on: namespace-profile-linux-medium
-    timeout-minutes: 25
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
     permissions:
       contents: read
     steps:
@@ -55,7 +59,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-installed-smoke
+          key: linux-installed-smoke-${{ matrix.arch }}
+
+      - name: Enable ARM64 container emulation
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Assert clean Ubuntu x86-64 runner
         run: |
@@ -66,47 +76,88 @@ jobs:
           [[ "$ID" == "ubuntu" ]]
           docker info >/dev/null
 
-      - name: Build release-format candidate archive and checksum
+      - name: Build release-format candidate archives and checksums
         id: package
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
-          asset_dir="$GITHUB_WORKSPACE/dist/ci-linux/assets"
-          asset="alex-cli-${version}-linux-x86_64.tar.gz"
+          arch="${{ matrix.arch }}"
+          asset_dir="$GITHUB_WORKSPACE/dist/ci-linux-$arch/assets"
+          asset="alex-cli-${version}-linux-${arch}.tar.gz"
 
-          rm -rf "$GITHUB_WORKSPACE/dist/ci-linux"
+          rm -rf "$GITHUB_WORKSPACE/dist/ci-linux-$arch"
           mkdir -p "$asset_dir"
-          cargo build --release --locked -p alex --bins
-          tar -C target/release -czf "$asset_dir/$asset" alex
+          if [[ "$arch" == "x86_64" ]]; then
+            cargo build --release --locked -p alex --bins
+            binary_dir="target/release"
+            docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
+              set -euo pipefail
+              rustup target add x86_64-unknown-linux-musl
+              cargo zigbuild --locked -p alex --bin alex --release \
+                --target x86_64-unknown-linux-musl
+              file target/x86_64-unknown-linux-musl/release/alex | grep -q "statically linked"
+            '
+            musl_binary_dir="target/x86_64-unknown-linux-musl/release"
+          else
+            docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
+              set -euo pipefail
+              rustup target add aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+              cargo zigbuild --locked -p alex --bin alex --release \
+                --target aarch64-unknown-linux-gnu \
+                --target aarch64-unknown-linux-musl
+              file target/aarch64-unknown-linux-gnu/release/alex | grep -Eq "ARM aarch64|aarch64"
+              file target/aarch64-unknown-linux-gnu/release/alex | grep -q "dynamically linked"
+              file target/aarch64-unknown-linux-musl/release/alex | grep -q "statically linked"
+            '
+            binary_dir="target/aarch64-unknown-linux-gnu/release"
+            musl_binary_dir="target/aarch64-unknown-linux-musl/release"
+          fi
+          musl_asset="alex-cli-${version}-linux-${arch}-musl.tar.gz"
+          tar -C "$musl_binary_dir" -czf "$asset_dir/$musl_asset" alex
+          shasum -a 256 "$asset_dir/$musl_asset" > "$asset_dir/$musl_asset.sha256"
+          tar -C "$binary_dir" -czf "$asset_dir/$asset" alex
           shasum -a 256 "$asset_dir/$asset" > "$asset_dir/$asset.sha256"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke public installer, routing, trace persistence, and systemd restart
+      - name: Smoke GNU installer, routing, trace persistence, and systemd restart
         env:
-          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux/installed-smoke.json
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux-${{ matrix.arch }}/installed-gnu-smoke.json
           ALEX_CI_LINUX_VERSION: ${{ steps.package.outputs.version }}
-          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux/assets
-          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          ALEX_CI_LINUX_ARCH: ${{ matrix.arch }}
+          ALEX_CI_LINUX_LIBC: gnu
+          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux-${{ matrix.arch }}/assets
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ matrix.arch }}-gnu-${{ github.run_id }}-${{ github.run_attempt }}
+        run: packaging/ci-linux/run-systemd-container.sh
+
+      - name: Smoke musl installer, routing, trace persistence, and systemd restart
+        env:
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/ci-linux-${{ matrix.arch }}/installed-musl-smoke.json
+          ALEX_CI_LINUX_VERSION: ${{ steps.package.outputs.version }}
+          ALEX_CI_LINUX_ARCH: ${{ matrix.arch }}
+          ALEX_CI_LINUX_LIBC: musl
+          ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/ci-linux-${{ matrix.arch }}/assets
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ matrix.arch }}-musl-${{ github.run_id }}-${{ github.run_attempt }}
         run: packaging/ci-linux/run-systemd-container.sh
 
       - name: Clean installed smoke container
         if: always()
-        env:
-          ALEX_CI_LINUX_CONTAINER_NAME: alex-linux-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set +e
-          docker rm --force "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1
-          if docker container inspect "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1; then
-            echo "container cleanup failed: $ALEX_CI_LINUX_CONTAINER_NAME" >&2
-            exit 1
-          fi
+          for libc in gnu musl; do
+            name="alex-linux-smoke-${{ matrix.arch }}-${libc}-${{ github.run_id }}-${{ github.run_attempt }}"
+            docker rm --force "$name" >/dev/null 2>&1
+            if docker container inspect "$name" >/dev/null 2>&1; then
+              echo "container cleanup failed: $name" >&2
+              exit 1
+            fi
+          done
 
       - name: Upload Linux candidate and smoke evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x86-64-installed-smoke
-          path: dist/ci-linux/
+          name: linux-${{ matrix.arch }}-installed-smoke
+          path: dist/ci-linux-${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 14
 
@@ -120,6 +171,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify complete release manifest contract
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/test-release-manifest.py
+          bash scripts/test-linux-installers.sh
       - run: cargo build --workspace
       - name: Deterministic shared-web platform smoke
         run: cargo test -p alex-proxy deterministic_platform_smoke -- --nocapture

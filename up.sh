@@ -5,6 +5,7 @@ set -eu
 
 REPO="${ALEX_REPO:-madhavajay/alex}"
 INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
+ASSET_BASE_OVERRIDE="${ALEX_ASSET_BASE_URL:-}"
 HARNESS="pi"
 URL=""
 KEY=""
@@ -31,8 +32,8 @@ platform() {
   case "$(uname -s)" in
     Linux)
       case "$(uname -m)" in
-        x86_64|amd64) printf '%s\n' 'linux-x86_64' ;;
-        aarch64|arm64) printf '%s\n' 'linux-aarch64' ;;
+        x86_64|amd64) printf '%s\n' 'x86_64-unknown-linux-musl' ;;
+        aarch64|arm64) printf '%s\n' 'aarch64-unknown-linux-musl' ;;
         *) say "No static Alex CLI binary for Linux $(uname -m)." >&2; exit 1 ;;
       esac
       ;;
@@ -64,7 +65,11 @@ install_alex() {
   fi
   triple="$(platform)"
   asset="alex-$triple"
-  base="https://github.com/$REPO/releases/download/$tag"
+  if [ -n "$ASSET_BASE_OVERRIDE" ]; then
+    base="${ASSET_BASE_OVERRIDE%/}"
+  else
+    base="https://github.com/$REPO/releases/download/$tag"
+  fi
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alex-up.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
   say "alex: downloading $asset from $tag"

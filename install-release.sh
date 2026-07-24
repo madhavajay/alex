@@ -8,6 +8,7 @@ INSTALL_DIR="${ALEX_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION_OVERRIDE="${ALEX_VERSION:-}"
 ASSET_BASE_OVERRIDE="${ALEX_ASSET_BASE_URL:-}"
 NO_SERVICE="${ALEX_NO_SERVICE:-0}"
+LINUX_LIBC_OVERRIDE="${ALEX_LINUX_LIBC:-}"
 
 say() {
   printf '%s\n' "$*"
@@ -75,15 +76,41 @@ install_macos() {
   say "Next: alex auth import"
 }
 
+linux_libc() {
+  case "$LINUX_LIBC_OVERRIDE" in
+    gnu|musl) printf '%s\n' "$LINUX_LIBC_OVERRIDE"; return ;;
+    '') ;;
+    *) say "ALEX_LINUX_LIBC must be 'gnu' or 'musl'." >&2; exit 1 ;;
+  esac
+  if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+    printf '%s\n' musl
+    return
+  fi
+  for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+    if [ -e "$loader" ]; then
+      printf '%s\n' musl
+      return
+    fi
+  done
+  printf '%s\n' gnu
+}
+
 install_linux() {
   machine="$(uname -m)"
   case "$machine" in
-    x86_64|amd64) platform="linux-x86_64" ;;
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
     *)
       say "No precompiled Alex Linux binary is published for $machine yet." >&2
       exit 1
       ;;
   esac
+  libc="$(linux_libc)"
+  if [ "$libc" = "musl" ]; then
+    platform="linux-$arch-musl"
+  else
+    platform="linux-$arch"
+  fi
 
   if [ -n "$VERSION_OVERRIDE" ]; then
     version="$VERSION_OVERRIDE"
@@ -113,7 +140,7 @@ install_linux() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/alex-install.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
-  say "Downloading Alex $version for Linux x86_64…"
+  say "Downloading Alex $version for Linux $arch ($libc)…"
   curl -fsSL "$base/$asset" -o "$tmp/$asset"
   curl -fsSL "$base/$asset.sha256" -o "$tmp/$asset.sha256"
 

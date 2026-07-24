@@ -83,23 +83,35 @@ jobs:
     name: Build Linux GNU CLI artifact
     needs: [meta, rust-test]
     runs-on: namespace-profile-linux-medium
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build and package CLI from tagged source
+      - name: Build and package x86_64 and aarch64 GNU CLIs from tagged source
         run: |
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           ./scripts/stamp-version.sh "$version"
           cargo build --release -p alex --bins
+          docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
+            set -euo pipefail
+            rustup target add aarch64-unknown-linux-gnu
+            cargo zigbuild -p alex --bin alex --release --target aarch64-unknown-linux-gnu
+            file target/aarch64-unknown-linux-gnu/release/alex | grep -Eq "ARM aarch64|aarch64"
+            file target/aarch64-unknown-linux-gnu/release/alex | grep -q "dynamically linked"
+          '
           mkdir -p dist
-          asset="alex-cli-${version}-linux-x86_64.tar.gz"
-          tar -C target/release -czf "dist/$asset" alex
-          sha256sum "dist/$asset" > "dist/$asset.sha256"
+          x86_asset="alex-cli-${version}-linux-x86_64.tar.gz"
+          arm_asset="alex-cli-${version}-linux-aarch64.tar.gz"
+          tar -C target/release -czf "dist/$x86_asset" alex
+          tar -C target/aarch64-unknown-linux-gnu/release -czf "dist/$arm_asset" alex
+          file target/release/alex | grep -Eq "x86-64|x86_64"
+          file target/release/alex | grep -q "dynamically linked"
+          sha256sum "dist/$x86_asset" > "dist/$x86_asset.sha256"
+          sha256sum "dist/$arm_asset" > "dist/$arm_asset.sha256"
       - name: Upload Linux GNU workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -133,6 +145,10 @@ jobs:
             cp target/aarch64-unknown-linux-musl/release/alex dist/alex-aarch64-unknown-linux-musl
             file dist/alex-x86_64-unknown-linux-musl | grep -q "statically linked"
             file dist/alex-aarch64-unknown-linux-musl | grep -q "statically linked"
+            tar -C target/x86_64-unknown-linux-musl/release -czf "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz" alex
+            tar -C target/aarch64-unknown-linux-musl/release -czf "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz" alex
+            sha256sum "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz" > "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz.sha256"
+            sha256sum "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz" > "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz.sha256"
             (cd dist && sha256sum alex-x86_64-unknown-linux-musl alex-aarch64-unknown-linux-musl > checksums.txt)
             chmod -R a+rX dist
           '
@@ -143,6 +159,10 @@ jobs:
           path: |
             dist/alex-x86_64-unknown-linux-musl
             dist/alex-aarch64-unknown-linux-musl
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz.sha256
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz.sha256
             dist/checksums.txt
           if-no-files-found: error
           overwrite: true
@@ -413,14 +433,25 @@ jobs:
     secrets: inherit
 
   linux-packaged-smoke:
-    name: Smoke installed Linux release package
-    needs: [meta, linux-gnu-asset]
+    name: Smoke installed Linux ${{ matrix.arch }} ${{ matrix.libc }} release package
+    needs: [meta, linux-gnu-asset, linux-musl-asset]
     runs-on: namespace-profile-linux-medium
-    timeout-minutes: 20
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        libc: [gnu, musl]
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Enable ARM64 container emulation
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Download packaged Linux CLI
         uses: actions/download-artifact@v4
@@ -428,24 +459,32 @@ jobs:
           name: stable-linux-gnu
           path: dist/linux
 
+      - name: Download packaged static Linux CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: stable-linux-musl
+          path: dist/linux
+
       - name: Smoke installer, systemd, routing, trace persistence, and restart
         env:
-          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/linux-smoke.json
+          ALEX_CI_LINUX_SMOKE_RESULT: ${{ github.workspace }}/dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.json
           ALEX_CI_LINUX_VERSION: ${{ needs.meta.outputs.version }}
+          ALEX_CI_LINUX_ARCH: ${{ matrix.arch }}
+          ALEX_CI_LINUX_LIBC: ${{ matrix.libc }}
           ALEX_CI_LINUX_ASSET_DIR: ${{ github.workspace }}/dist/linux
-          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.run_id }}-${{ github.run_attempt }}
           RELEASE_SHA: ${{ needs.meta.outputs.sha }}
         run: |
           set -euo pipefail
           packaging/ci-linux/run-systemd-container.sh
           jq --arg commit "$RELEASE_SHA" '. + {commit:$commit}' \
-            dist/linux-smoke.json > dist/linux-smoke.with-commit.json
-          mv dist/linux-smoke.with-commit.json dist/linux-smoke.json
+            "dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.json" > "dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.with-commit.json"
+          mv "dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.with-commit.json" "dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.json"
 
       - name: Clean installed smoke container
         if: always()
         env:
-          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          ALEX_CI_LINUX_CONTAINER_NAME: alex-stable-linux-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set +e
           docker rm --force "$ALEX_CI_LINUX_CONTAINER_NAME" >/dev/null 2>&1
@@ -458,8 +497,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stable-linux-smoke-evidence
-          path: dist/linux-smoke.json
+          name: stable-linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke-evidence
+          path: dist/linux-${{ matrix.arch }}-${{ matrix.libc }}-smoke.json
           if-no-files-found: error
           overwrite: true
           retention-days: 30
@@ -590,7 +629,13 @@ jobs:
           python3 - "$RELEASE_SHA" "$RELEASE_VERSION" <<'PY'
           import json, pathlib, sys
           root = pathlib.Path("dist/evidence")
-          expected = {"linux-smoke.json", "macos-smoke.json"}
+          expected = {
+              "linux-x86_64-gnu-smoke.json",
+              "linux-x86_64-musl-smoke.json",
+              "linux-aarch64-gnu-smoke.json",
+              "linux-aarch64-musl-smoke.json",
+              "macos-smoke.json",
+          }
           present = {path.name for path in root.glob("*.json")}
           if present != expected:
               raise SystemExit(f"incomplete packaged smoke evidence: {sorted(present)}")
@@ -601,18 +646,23 @@ jobs:
               if record.get("commit") != sys.argv[1]:
                   raise SystemExit(f"stale smoke evidence: {name}")
 
-          linux = records["linux-smoke.json"]
-          if not (
-              linux.get("platform") == {"os": "ubuntu", "arch": "x86_64"}
-              and linux.get("package", {}).get("version") == sys.argv[2]
-              and linux.get("package", {}).get("archive_checksum_verified") is True
-              and linux.get("package", {}).get("installed_binary") is True
-              and linux.get("service", {}).get("manager") == "systemd-user"
-              and linux.get("service", {}).get("replaced") is True
-              and linux.get("trace", {}).get("persisted_across_restart") is True
-              and linux.get("external_provider_network") is False
-          ):
-              raise SystemExit("Linux installed-package evidence is incomplete")
+          for arch in ("x86_64", "aarch64"):
+              for libc in ("gnu", "musl"):
+                  name = f"linux-{arch}-{libc}-smoke.json"
+                  linux = records[name]
+                  if not (
+                      linux.get("platform") == {"os": "ubuntu", "arch": arch, "libc": libc}
+                      and linux.get("package", {}).get("version") == sys.argv[2]
+                      and linux.get("package", {}).get("archive_checksum_verified") is True
+                      and linux.get("package", {}).get("installed_binary") is True
+                      and linux.get("service", {}).get("manager") == "systemd-user"
+                      and linux.get("service", {}).get("replaced") is True
+                      and linux.get("trace", {}).get("persisted_across_restart") is True
+                      and linux.get("external_provider_network") is False
+                  ):
+                      raise SystemExit(
+                          f"Linux {arch} {libc} installed-package evidence is incomplete"
+                      )
 
           macos = records["macos-smoke.json"]
           if not (
@@ -779,6 +829,12 @@ jobs:
           for name in \
             "alex-cli-${version}-linux-x86_64.tar.gz" \
             "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-linux-aarch64.tar.gz" \
+            "alex-cli-${version}-linux-aarch64.tar.gz.sha256" \
+            "alex-cli-${version}-linux-x86_64-musl.tar.gz" \
+            "alex-cli-${version}-linux-x86_64-musl.tar.gz.sha256" \
+            "alex-cli-${version}-linux-aarch64-musl.tar.gz" \
+            "alex-cli-${version}-linux-aarch64-musl.tar.gz.sha256" \
             "alex-cli-${version}-macos-aarch64.tar.gz" \
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \
@@ -877,6 +933,12 @@ jobs:
           for name in \
             "alex-cli-${version}-linux-x86_64.tar.gz" \
             "alex-cli-${version}-linux-x86_64.tar.gz.sha256" \
+            "alex-cli-${version}-linux-aarch64.tar.gz" \
+            "alex-cli-${version}-linux-aarch64.tar.gz.sha256" \
+            "alex-cli-${version}-linux-x86_64-musl.tar.gz" \
+            "alex-cli-${version}-linux-x86_64-musl.tar.gz.sha256" \
+            "alex-cli-${version}-linux-aarch64-musl.tar.gz" \
+            "alex-cli-${version}-linux-aarch64-musl.tar.gz.sha256" \
             "alex-cli-${version}-macos-aarch64.tar.gz" \
             "alex-cli-${version}-macos-aarch64.tar.gz.sha256" \
             "alex-cli-${version}-macos-x86_64.tar.gz" \
@@ -968,14 +1030,16 @@ jobs:
           version="${{ needs.meta.outputs.version }}"
           sha_mac_arm="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["aarch64-apple-darwin"]["sha256"])')"
           sha_mac_intel="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["x86_64-apple-darwin"]["sha256"])')"
-          sha_linux="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["x86_64-unknown-linux-gnu"]["sha256"])')"
+          sha_linux_arm="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["aarch64-unknown-linux-gnu"]["sha256"])')"
+          sha_linux_intel="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["cli"]["platforms"]["x86_64-unknown-linux-gnu"]["sha256"])')"
           sha_dmg="$(python3 -c 'import json; print(json.load(open("manifest.json"))["components"]["app"]["platforms"]["darwin-universal"]["sha256"])')"
           mkdir -p dist/homebrew
           sed \
             -e "s/{{VERSION}}/${version}/g" \
             -e "s/{{SHA_MAC_ARM}}/${sha_mac_arm}/g" \
             -e "s/{{SHA_MAC_INTEL}}/${sha_mac_intel}/g" \
-            -e "s/{{SHA_LINUX}}/${sha_linux}/g" \
+            -e "s/{{SHA_LINUX_ARM}}/${sha_linux_arm}/g" \
+            -e "s/{{SHA_LINUX_INTEL}}/${sha_linux_intel}/g" \
             packaging/homebrew/alex-formula.rb.tmpl > dist/homebrew/alex-formula.rb
           sed \
             -e "s/{{VERSION}}/${version}/g" \

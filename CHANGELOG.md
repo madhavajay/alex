@@ -7,6 +7,17 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+### Added
+- Linux ARM64 is now a first-class release target for both GNU libc and musl:
+  stable and beta releases package both variants, publish them in the update
+  manifest, exercise both installers under ARM64 emulation, and expose the GNU
+  archive through the Homebrew formula.
+
+### Fixed
+- Linux installers, one-line harness bootstrap, and CLI self-update now select
+  the correct architecture and libc asset instead of rejecting ARM64 or asking
+  a musl build to install a GNU archive.
+
 ## [0.1.31] - 2026-07-24
 
 ### Added

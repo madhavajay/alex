@@ -12,10 +12,11 @@ PATTERNS = [
     ("cli", "aarch64-apple-darwin", "alex-cli-*-macos-aarch64.tar.gz"),
     ("cli", "x86_64-apple-darwin", "alex-cli-*-macos-x86_64.tar.gz"),
     ("cli", "x86_64-unknown-linux-gnu", "alex-cli-*-linux-x86_64.tar.gz"),
+    ("cli", "aarch64-unknown-linux-gnu", "alex-cli-*-linux-aarch64.tar.gz"),
+    ("cli", "x86_64-unknown-linux-musl", "alex-cli-*-linux-x86_64-musl.tar.gz"),
+    ("cli", "aarch64-unknown-linux-musl", "alex-cli-*-linux-aarch64-musl.tar.gz"),
     ("cli", "x86_64-pc-windows-msvc", "alex-cli-*-windows-x86_64.zip"),
     ("cli", "aarch64-pc-windows-msvc", "alex-cli-*-windows-arm64.zip"),
-    ("cli", "x86_64-unknown-linux-musl", "alex-x86_64-unknown-linux-musl"),
-    ("cli", "aarch64-unknown-linux-musl", "alex-aarch64-unknown-linux-musl"),
     ("app", "darwin-universal", "Alex-*.dmg"),
 ]
 
@@ -24,10 +25,11 @@ PLATFORM_ORDER = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
+    "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
     "darwin-universal",
 )
 

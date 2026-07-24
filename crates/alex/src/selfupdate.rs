@@ -138,24 +138,27 @@ pub fn install_channel(exe: &Path, home: &Path) -> Channel {
 }
 
 pub fn platform_key() -> Result<&'static str> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Ok("aarch64-apple-darwin")
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Ok("x86_64-apple-darwin")
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Ok("x86_64-unknown-linux-gnu")
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        Ok("aarch64-unknown-linux-gnu")
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Ok("x86_64-pc-windows-msvc")
-    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        Ok("aarch64-pc-windows-msvc")
+    let target_env = if cfg!(target_env = "musl") {
+        "musl"
     } else {
-        anyhow::bail!(
-            "self-update is not available for this platform (os={}, arch={})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+        "gnu"
+    };
+    platform_key_for(std::env::consts::OS, std::env::consts::ARCH, target_env)
+}
+
+fn platform_key_for(os: &str, arch: &str, target_env: &str) -> Result<&'static str> {
+    match (os, arch, target_env) {
+        ("macos", "aarch64", _) => Ok("aarch64-apple-darwin"),
+        ("macos", "x86_64", _) => Ok("x86_64-apple-darwin"),
+        ("linux", "x86_64", "musl") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64", "musl") => Ok("aarch64-unknown-linux-musl"),
+        ("linux", "x86_64", _) => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", _) => Ok("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64", _) => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64", _) => Ok("aarch64-pc-windows-msvc"),
+        _ => anyhow::bail!(
+            "self-update is not available for this platform (os={os}, arch={arch}, env={target_env})"
+        ),
     }
 }
 
@@ -1445,10 +1448,32 @@ mod tests {
             "x86_64-apple-darwin",
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
             "x86_64-pc-windows-msvc",
             "aarch64-pc-windows-msvc",
         ]
         .contains(&key));
+    }
+
+    #[test]
+    fn linux_platform_keys_distinguish_architecture_and_libc() {
+        assert_eq!(
+            platform_key_for("linux", "x86_64", "gnu").unwrap(),
+            "x86_64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            platform_key_for("linux", "aarch64", "gnu").unwrap(),
+            "aarch64-unknown-linux-gnu"
+        );
+        assert_eq!(
+            platform_key_for("linux", "x86_64", "musl").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            platform_key_for("linux", "aarch64", "musl").unwrap(),
+            "aarch64-unknown-linux-musl"
+        );
     }
 
     // ----------------------------------------------------------------------
