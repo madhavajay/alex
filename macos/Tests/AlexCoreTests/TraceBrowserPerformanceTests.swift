@@ -6,14 +6,15 @@ import Testing
 
 @Suite(.serialized) struct TraceBrowserPerformanceTests {
     private static func makeTurn(
-        _ index: Int, text: String, traceId: String? = nil, completedMs: Int64? = nil
+        _ index: Int, text: String, traceId: String? = nil, completedMs: Int64? = nil,
+        accountId: String? = nil
     ) -> TranscriptTurn {
         TranscriptTurn(
             traceId: traceId ?? "perf-\(index)", tsRequestMs: Int64(index),
             tsResponseMs: completedMs ?? Int64(index + 1),
             model: "gpt-5.6-sol", provider: "openai", status: 200,
             inputTokens: 100, outputTokens: 100, reasoningEffort: nil,
-            thinkingBudget: nil, costUsd: nil, billingBucket: nil, accountId: nil,
+            thinkingBudget: nil, costUsd: nil, billingBucket: nil, accountId: accountId,
             viaDario: nil, darioGeneration: nil, error: nil, errorKind: nil,
             errorCode: nil, errorClass: nil, user: "user \(index) \(text)",
             assistant: "assistant \(index) \(text)", toolCalls: nil,
@@ -295,6 +296,33 @@ import Testing
             fileBytes: UIHangLog.maxFileBytes, incomingBytes: 1))
         #expect(UIHangLog.shouldRotate(fileBytes: 8, incomingBytes: 3, limit: 10))
         TraceBrowserSignpost.end(active)
+    }
+
+    @Test func hangLogCanBePreparedBeforeFirstFreeze() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = UIHangLog.fileURL(home: root)
+        try UIHangLog.prepareForReveal(at: url)
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        try FileManager.default.removeItem(at: root)
+    }
+
+    @Test func hangWatchdogHonorsExplicitUserSetting() throws {
+        let suite = try #require(UserDefaults(suiteName: UUID().uuidString))
+        suite.set(false, forKey: UIHangWatchdog.defaultsKey)
+        #expect(!UIHangWatchdog.isEnabled(defaults: suite))
+        suite.set(true, forKey: UIHangWatchdog.defaultsKey)
+        #expect(UIHangWatchdog.isEnabled(defaults: suite))
+    }
+
+    @Test @MainActor func topBarTurnFilteringCapsAndFiltersInPreparationStep() throws {
+        let huge = String(repeating: "x", count: TurnTextCap.maxChars + 500)
+        let chosen = Self.makeTurn(1, text: huge, accountId: "chosen")
+        let other = Self.makeTurn(2, text: "small", accountId: "other")
+        let prepared = try #require(TraceBrowserModel.prepareDisplayTurns(
+            [chosen, other], query: OmniQuery.parse("account:chosen")))
+        #expect(prepared.turns.map(\.traceId) == [chosen.traceId])
+        #expect((prepared.turns[0].user?.count ?? 0) <= TurnTextCap.maxChars)
     }
 
     @MainActor

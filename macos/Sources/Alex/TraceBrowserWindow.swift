@@ -17,7 +17,7 @@ final class TraceBrowserModel {
     private let traceTurnFetcher: TraceTurnFetcher?
 
     private(set) var sessions: [TraceSession] = [] {
-        didSet { recomputeSessionSummary(); recomputeTranscriptSummary() }
+        didSet { recomputeTranscriptSummary() }
     }
     private(set) var turns: [TranscriptTurn] = [] {
         didSet { scheduleTranscriptFilter(debounce: false); recomputeTranscriptSummary() }
@@ -83,8 +83,11 @@ final class TraceBrowserModel {
     }
     var queryText = "" {
         didSet {
+            let interval = TraceBrowserSignpost.begin(
+                .queryChange, "chars=\(queryText.count)")
             parsedQuery = OmniQuery.parse(queryText)
             queryChanged()
+            TraceBrowserSignpost.end(interval)
         }
     }
     /// Quick status filter pills (All | Running | Error | Done) layered on top
@@ -568,10 +571,13 @@ final class TraceBrowserModel {
                 try? await Task.sleep(for: .milliseconds(175))
                 guard !Task.isCancelled else { return }
             }
-            let rows = await Task.detached(priority: .userInitiated) {
+            let result = await Task.detached(priority: .userInitiated) {
                 let start = ContinuousClock.now
+                let filterInterval = TraceBrowserSignpost.begin(
+                    .sessionFilter, "sessions=\(input.sessions.count)")
                 defer {
                     let elapsed = start.duration(to: .now)
+                    TraceBrowserSignpost.end(filterInterval)
                     BarLog.timing(
                         .browser, label: "session filter sessions=\(input.sessions.count)",
                         milliseconds: Double(elapsed.components.seconds) * 1000
@@ -581,10 +587,21 @@ final class TraceBrowserModel {
                     sessions: input.sessions, rowsById: input.rowsById, showPings: input.showPings,
                     query: input.query, serverMatches: input.serverMatches, sortOrder: input.sortOrder,
                     nestSubagents: input.nestSubagents, collapsedRoots: input.collapsedRoots)
-                return Self.applyStatusPill(input.statusPill, rows: raw)
+                let summaryInterval = TraceBrowserSignpost.begin(
+                    .sessionSummary, "sessions=\(input.sessions.count)")
+                let summary = Self.sessionErrorSummary(
+                    sessions: input.sessions, query: input.query)
+                TraceBrowserSignpost.end(summaryInterval)
+                return (
+                    rows: Self.applyStatusPill(input.statusPill, rows: raw),
+                    errorSummary: summary)
             }.value
             guard !Task.isCancelled, let self, generation == self.sessionFilterGeneration else { return }
-            self.visibleRows = rows
+            let applyInterval = TraceBrowserSignpost.begin(
+                .visibleRowsApply, "rows=\(result.rows.count)")
+            self.visibleRows = result.rows
+            self.errorClassSummaryLine = result.errorSummary
+            DispatchQueue.main.async { TraceBrowserSignpost.end(applyInterval) }
         }
     }
 
@@ -733,9 +750,11 @@ final class TraceBrowserModel {
     private(set) var transcriptSubagentCount = 0
     private(set) var transcriptTokensTotal: Int64 = 0
 
-    private func recomputeSessionSummary() {
+    nonisolated static func sessionErrorSummary(
+        sessions: [TraceSession], query: OmniQuery
+    ) -> String? {
         let counts = sessions
-            .filter { parsedQuery.matches($0) }
+            .filter { query.matches($0) }
             .reduce(into: [String: Int64]()) { totals, session in
                 for (errorClass, count) in session.errorClassCounts ?? [:] {
                     totals[errorClass, default: 0] += count
@@ -745,14 +764,13 @@ final class TraceBrowserModel {
             $0.key != TraceClassification.clientDisconnectKind
         }
         guard !realCounts.isEmpty else {
-            errorClassSummaryLine = nil
-            return
+            return nil
         }
         let real = realCounts.values.reduce(0, +)
         let detail = realCounts.sorted { $0.key < $1.key }
             .map { "\($0.key) \($0.value)" }
             .joined(separator: " · ")
-        errorClassSummaryLine = "\(real) errored · \(detail)"
+        return "\(real) errored · \(detail)"
     }
 
     var selectedSession: TraceSession? {
@@ -1263,8 +1281,7 @@ final class TraceBrowserModel {
             sessionsFingerprint = ""
             Task { [weak self] in await self?.pollSessions() }
         }
-        recomputeSessionSummary()
-        applyTurnFilter()
+        applyTurnFilter(debounce: true)
         guard !query.freeText.isEmpty || query.key != nil else {
             searchSessionIds = nil
             searchInFlight = false
@@ -1280,24 +1297,34 @@ final class TraceBrowserModel {
         }
     }
 
-    private func applyTurnFilter() {
-        let filtered = parsedQuery.effort == nil && parsedQuery.account == nil
-            ? allTurns
-            : allTurns.filter(parsedQuery.matches)
-        defer { retargetInspector() }
+    private func applyTurnFilter(debounce: Bool = false) {
         turnApplyTask?.cancel()
         turnApplyGeneration += 1
         let generation = turnApplyGeneration
-        let requiresIncremental = TranscriptApplyPolicy.requiresIncrementalApply(filtered)
-        transcriptRendering = !filtered.isEmpty && requiresIncremental
-        forceChunkedPaneUpdate = requiresIncremental
+        let turnsSnapshot = allTurns
+        let query = parsedQuery
         turnApplyTask = Task { [weak self] in
-            let capped = await Task.detached(priority: .userInitiated) {
-                filtered.map(TranscriptInlineDisplay.capped)
-            }.value
+            if debounce {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+            }
+            let worker = Task.detached(priority: .userInitiated) {
+                Self.prepareDisplayTurns(turnsSnapshot, query: query)
+            }
+            let prepared = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
             guard let self, !Task.isCancelled, generation == self.turnApplyGeneration else {
                 return
             }
+            guard let prepared else { return }
+            let capped = prepared.turns
+            let requiresIncremental = prepared.requiresIncremental
+            self.transcriptRendering = !capped.isEmpty && requiresIncremental
+            self.forceChunkedPaneUpdate = requiresIncremental
+            self.retargetInspector()
             if capped == self.turns {
                 self.transcriptRendering = false
                 self.forceChunkedPaneUpdate = false
@@ -1347,6 +1374,47 @@ final class TraceBrowserModel {
                 }
             }
         }
+    }
+
+    struct PreparedDisplayTurns: Sendable {
+        let turns: [TranscriptTurn]
+        let requiresIncremental: Bool
+    }
+
+    /// Performs the top-bar's potentially expensive turn scan and text
+    /// capping away from the main actor. Cancellation is checked between
+    /// turns so superseded keystrokes stop consuming CPU promptly.
+    nonisolated static func prepareDisplayTurns(
+        _ turns: [TranscriptTurn], query: OmniQuery
+    ) -> PreparedDisplayTurns? {
+        let interval = TraceBrowserSignpost.begin(
+            .turnFilter,
+            "turns=\(turns.count) filtered=\(query.effort != nil || query.account != nil)")
+        var filtered: [TranscriptTurn] = []
+        filtered.reserveCapacity(turns.count)
+        for turn in turns {
+            if Task.isCancelled {
+                TraceBrowserSignpost.end(interval, "cancelled=true")
+                return nil
+            }
+            guard (query.effort == nil && query.account == nil) || query.matches(turn) else {
+                continue
+            }
+            filtered.append(turn)
+        }
+        let requiresIncremental = TranscriptApplyPolicy.requiresIncrementalApply(filtered)
+        var output: [TranscriptTurn] = []
+        output.reserveCapacity(filtered.count)
+        for turn in filtered {
+            if Task.isCancelled {
+                TraceBrowserSignpost.end(interval, "cancelled=true")
+                return nil
+            }
+            output.append(TranscriptInlineDisplay.capped(turn))
+        }
+        TraceBrowserSignpost.end(interval, "output_turns=\(output.count)")
+        return PreparedDisplayTurns(
+            turns: output, requiresIncremental: requiresIncremental)
     }
 
     private func commitDisplayTurns(

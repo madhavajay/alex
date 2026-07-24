@@ -11,6 +11,11 @@ public enum TraceBrowserSignpost {
         case transcriptRenderBuild = "TranscriptRender.build"
         case chatPaneUpdate = "chat-pane update"
         case classicPaneUpdate = "classic-pane update"
+        case queryChange = "query change"
+        case sessionFilter = "session filter"
+        case sessionSummary = "session summary"
+        case turnFilter = "turn filter"
+        case visibleRowsApply = "visible-rows apply"
     }
 
     public struct Interval: @unchecked Sendable {
@@ -104,6 +109,26 @@ public enum TraceBrowserSignpost {
             os_signpost(
                 type, log: log, name: "classic-pane update", signpostID: interval.signpostID,
                 "%{public}@", value)
+        case .queryChange:
+            os_signpost(
+                type, log: log, name: "query change", signpostID: interval.signpostID,
+                "%{public}@", value)
+        case .sessionFilter:
+            os_signpost(
+                type, log: log, name: "session filter", signpostID: interval.signpostID,
+                "%{public}@", value)
+        case .sessionSummary:
+            os_signpost(
+                type, log: log, name: "session summary", signpostID: interval.signpostID,
+                "%{public}@", value)
+        case .turnFilter:
+            os_signpost(
+                type, log: log, name: "turn filter", signpostID: interval.signpostID,
+                "%{public}@", value)
+        case .visibleRowsApply:
+            os_signpost(
+                type, log: log, name: "visible-rows apply", signpostID: interval.signpostID,
+                "%{public}@", value)
         }
     }
     #endif
@@ -168,6 +193,19 @@ public enum UIHangLog {
     public static func fileURL(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         home.appendingPathComponent("Library/Logs/Alex", isDirectory: true)
             .appendingPathComponent("ui-hangs.log")
+    }
+
+    /// Ensures Finder has a concrete file to select even before the first
+    /// detected hang has been written.
+    public static func prepareForReveal(at url: URL = fileURL()) throws {
+        let manager = FileManager.default
+        try manager.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !manager.fileExists(atPath: url.path) {
+            guard manager.createFile(atPath: url.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
     }
 
     public static func shouldRotate(
