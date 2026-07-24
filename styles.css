@@ -324,13 +324,20 @@ h2 {
   gap: 8px;
   min-height: 38px;
   padding: 7px 12px;
-  border: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 6px;
-  color: var(--quiet);
-  background: transparent;
+  color: #c7c7cc;
+  background: rgba(255, 255, 255, 0.035);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.segmented-control button:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #f2f2f7;
+  background: rgba(255, 255, 255, 0.075);
 }
 
 .tab-brand-mark {
@@ -396,9 +403,10 @@ h2 {
 .tab-cta:hover { background: rgba(10, 132, 255, 0.28); }
 
 .segmented-control button[aria-selected="true"] {
-  color: var(--foreground);
-  background: rgba(255, 255, 255, 0.1);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  border-color: rgba(10, 132, 255, 0.58);
+  color: #fff;
+  background: rgba(10, 132, 255, 0.18);
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(100, 210, 255, 0.08);
 }
 
 .embed-frame {
@@ -424,8 +432,31 @@ h2 {
   width: 100%;
 }
 
-.player-panel cove-player .cb-stage {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+@media (min-width: 860px) {
+  .player-panel cove-player .cb-stage {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 859px) {
+  .player-panel cove-player .cb-stage {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+  }
+
+  .player-panel cove-player .cb-shell {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .player-panel cove-player .cb-rail {
+    grid-column: 1;
+    grid-row: 2;
+    height: auto;
+    max-height: 440px;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
 }
 
 /* Cove also renders trace markers above the terminal. The terminal player's
@@ -954,7 +985,14 @@ a:focus-visible {
   }
 
   .segmented-control {
+    gap: 6px;
     grid-template-columns: 1fr;
+    padding: 6px;
+  }
+
+  .segmented-control button,
+  .tab-cta {
+    min-height: 46px;
   }
 
   .demo-explanation {
