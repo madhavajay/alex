@@ -287,6 +287,72 @@ public enum UIHangLog {
     }
 }
 
+/// Captures a short stack sample of the app when the watchdog observes a
+/// main-thread stall. Breadcrumbs identify known operations; this sample is
+/// the fallback that explains stalls which happen inside SwiftUI/AppKit and
+/// therefore have no active Alex signpost.
+public enum UIHangSample {
+    public static func fileURL(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        home.appendingPathComponent("Library/Logs/Alex", isDirectory: true)
+            .appendingPathComponent("ui-hang-sample.txt")
+    }
+
+    public static func arguments(
+        pid: Int32 = ProcessInfo.processInfo.processIdentifier,
+        outputURL: URL = fileURL()
+    ) -> [String] {
+        [String(pid), "1", "10", "-file", outputURL.path]
+    }
+
+    static func capture() {
+        guard state.begin() else { return }
+        queue.async {
+            defer { state.end() }
+            let outputURL = fileURL()
+            do {
+                try UIHangLog.prepareForReveal(at: outputURL)
+                let executable = URL(fileURLWithPath: "/usr/bin/sample")
+                guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+                    return
+                }
+                let process = Process()
+                process.executableURL = executable
+                process.arguments = arguments(outputURL: outputURL)
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                BarLog.warn(.browser, "UI hang stack sample failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static let queue = DispatchQueue(label: "com.alex.ui-hang-sample", qos: .utility)
+    private static let state = CaptureState()
+
+    private final class CaptureState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running = false
+
+        func begin() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !running else { return false }
+            running = true
+            return true
+        }
+
+        func end() {
+            lock.lock()
+            running = false
+            lock.unlock()
+        }
+    }
+}
+
 public final class UIHangWatchdog: @unchecked Sendable {
     public static let shared = UIHangWatchdog()
     public static let defaultsKey = "UIHangWatchdogEnabled"
@@ -375,5 +441,6 @@ public final class UIHangWatchdog: @unchecked Sendable {
             durationMilliseconds, operation as NSString)
         #endif
         UIHangLog.append(durationMilliseconds: durationMilliseconds, snapshot: snapshot)
+        UIHangSample.capture()
     }
 }

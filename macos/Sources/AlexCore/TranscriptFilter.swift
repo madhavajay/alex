@@ -62,11 +62,13 @@ public enum TranscriptFilter {
         var total = 0
         out.reserveCapacity(turns.count * 2)
         for (index, turn) in turns.enumerated() {
+            if Task.isCancelled { break }
             let userText = turn.user ?? ""
-            let userIsToolResult = TurnHeader.toolResultBody(userText) != nil
+            let userIsToolResult = userText.hasPrefix(TurnHeader.toolResultPrefix)
+            let userSearchText = trimmed.isEmpty ? "" : bounded(userText)
             if !userText.isEmpty,
                 matches(
-                    role: .user, searchText: userText, hasTools: false,
+                    role: .user, searchText: userSearchText, hasTools: false,
                     isToolResult: userIsToolResult, filterTab: filterTab, query: trimmed)
             {
                 out.append(TranscriptFilterEntry(turnId: turn.traceId, turnIndex: index, role: .user))
@@ -76,18 +78,16 @@ public enum TranscriptFilter {
             let attemptEventPresent = turn.hasInlineAttemptEvents
             let clientClosed = TraceClassification.isClientDisconnect(errorKind: turn.errorKind)
             let errorPresent = turn.error?.isEmpty == false
-            let assistant = assistantText(turn)
-            guard !assistant.isEmpty || toolsPresent || errorPresent || clientClosed
+            let assistantPresent = hasAssistantText(turn)
+            guard assistantPresent || toolsPresent || errorPresent || clientClosed
                 || attemptEventPresent
             else { continue }
             total += 1
-            let eventText = [
-                clientClosed ? "client closed" : nil,
-                attemptEventPresent ? attemptSearchText(turn) : nil,
-            ].compactMap { $0 }.joined(separator: "\n")
             let searchText = trimmed.isEmpty
-                ? "" : assistant + (turn.error.map { "\n" + $0 } ?? "")
-                    + (eventText.isEmpty ? "" : "\n" + eventText)
+                ? ""
+                : boundedAssistantSearchText(
+                    turn, clientClosed: clientClosed,
+                    attemptEventPresent: attemptEventPresent)
             if matches(
                 role: .assistant, searchText: searchText, hasTools: toolsPresent,
                 filterTab: filterTab, query: trimmed)
@@ -98,30 +98,61 @@ public enum TranscriptFilter {
         return TranscriptFilterResult(entries: out, totalCount: total)
     }
 
-    /// Mirrors `TranscriptChatMessages.assistantText` (Alex) without
-    /// depending on that target. Kept in sync manually; both are pure and
-    /// small.
-    static func assistantText(_ turn: TranscriptTurn) -> String {
+    /// Mirrors the presence test in `TranscriptChatMessages.assistantText`
+    /// without joining potentially multi-megabyte blocks just to decide
+    /// whether an assistant slot exists.
+    static func hasAssistantText(_ turn: TranscriptTurn) -> Bool {
         let blocks = turn.assistantBlocks ?? []
-        guard !blocks.isEmpty else { return turn.assistant ?? "" }
-        return blocks
-            .filter { $0.type == "text" }
-            .compactMap(\.text)
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
+        guard !blocks.isEmpty else { return turn.assistant?.isEmpty == false }
+        return blocks.contains { $0.type == "text" && $0.text?.isEmpty == false }
     }
 
-    static func attemptSearchText(_ turn: TranscriptTurn) -> String {
-        var values: [String] = [turn.substitutionReason].compactMap { $0 }
-        for attempt in turn.attempts ?? [] {
-            values += [attempt.provider, attempt.model, attempt.error?.kind,
-                       attempt.error?.code, attempt.error?.message].compactMap { $0 }
-            for decision in attempt.middlewareDecisions ?? [] {
-                values += [decision.ruleId, decision.ruleName, decision.action,
-                           decision.explanation].compactMap { $0 }
+    /// Builds only the searchable prefix. The old implementation joined all
+    /// assistant blocks, errors, and middleware explanations before throwing
+    /// away everything after `searchCharLimit`.
+    static func boundedAssistantSearchText(
+        _ turn: TranscriptTurn, clientClosed: Bool,
+        attemptEventPresent: Bool
+    ) -> String {
+        var result = ""
+        func append(_ value: String?, separator: String = "\n") {
+            guard let value, !value.isEmpty, result.count < searchCharLimit else { return }
+            if !result.isEmpty {
+                result.append(contentsOf: separator.prefix(searchCharLimit - result.count))
+            }
+            guard result.count < searchCharLimit else { return }
+            result.append(contentsOf: value.prefix(searchCharLimit - result.count))
+        }
+
+        let blocks = turn.assistantBlocks ?? []
+        if blocks.isEmpty {
+            append(turn.assistant, separator: "")
+        } else {
+            for block in blocks where block.type == "text" {
+                append(block.text, separator: "\n\n")
+                if result.count >= searchCharLimit { return result }
             }
         }
-        return values.joined(separator: "\n")
+        append(turn.error)
+        if clientClosed { append("client closed") }
+        if attemptEventPresent {
+            append(turn.substitutionReason)
+            for attempt in turn.attempts ?? [] {
+                append(attempt.provider)
+                append(attempt.model)
+                append(attempt.error?.kind)
+                append(attempt.error?.code)
+                append(attempt.error?.message)
+                for decision in attempt.middlewareDecisions ?? [] {
+                    append(decision.ruleId)
+                    append(decision.ruleName)
+                    append(decision.action)
+                    append(decision.explanation)
+                }
+                if result.count >= searchCharLimit { return result }
+            }
+        }
+        return result
     }
 
     static func hasTools(_ turn: TranscriptTurn) -> Bool {
@@ -147,9 +178,10 @@ public enum TranscriptFilter {
         default: break
         }
         guard !query.isEmpty else { return true }
-        let bounded = searchText.count > searchCharLimit
-            ? String(searchText.prefix(searchCharLimit))
-            : searchText
-        return bounded.localizedCaseInsensitiveContains(query)
+        return bounded(searchText).localizedCaseInsensitiveContains(query)
+    }
+
+    private static func bounded(_ value: String) -> String {
+        String(value.prefix(searchCharLimit))
     }
 }

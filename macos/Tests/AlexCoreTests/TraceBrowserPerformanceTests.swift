@@ -7,7 +7,7 @@ import Testing
 @Suite(.serialized) struct TraceBrowserPerformanceTests {
     private static func makeTurn(
         _ index: Int, text: String, traceId: String? = nil, completedMs: Int64? = nil,
-        accountId: String? = nil
+        accountId: String? = nil, assistantBlocks: [AssistantBlock]? = nil
     ) -> TranscriptTurn {
         TranscriptTurn(
             traceId: traceId ?? "perf-\(index)", tsRequestMs: Int64(index),
@@ -18,7 +18,7 @@ import Testing
             viaDario: nil, darioGeneration: nil, error: nil, errorKind: nil,
             errorCode: nil, errorClass: nil, user: "user \(index) \(text)",
             assistant: "assistant \(index) \(text)", toolCalls: nil,
-            assistantBlocks: nil, executedTools: nil, attempts: nil,
+            assistantBlocks: assistantBlocks, executedTools: nil, attempts: nil,
             substituted: nil, substitutionReason: nil)
     }
 
@@ -163,7 +163,7 @@ import Testing
         #expect(model.lastTurnApplyBatchCharacterCounts.count == 1)
         #expect(model.lastTurnApplyBatchCharacterCounts.max() ?? 0
             <= TranscriptApplyPolicy.maxCharsPerBatch)
-        #expect(model.lastChatPaneBatchCharacterCounts.count == 2)
+        #expect(model.lastChatPaneBatchCharacterCounts.count == 1)
         #expect(model.lastChatPaneBatchCharacterCounts.max() ?? 0
             <= TranscriptApplyPolicy.maxCharsPerBatch)
 
@@ -307,6 +307,15 @@ import Testing
         try FileManager.default.removeItem(at: root)
     }
 
+    @Test func hangSampleUsesDedicatedFileAndExpectedSampleArguments() {
+        let root = URL(fileURLWithPath: "/tmp/alex-diagnostics-test", isDirectory: true)
+        let url = UIHangSample.fileURL(home: root)
+        #expect(url.path == "/tmp/alex-diagnostics-test/Library/Logs/Alex/ui-hang-sample.txt")
+        #expect(UIHangSample.arguments(pid: 42, outputURL: url) == [
+            "42", "1", "10", "-file", url.path,
+        ])
+    }
+
     @Test func hangWatchdogHonorsExplicitUserSetting() throws {
         let suite = try #require(UserDefaults(suiteName: UUID().uuidString))
         suite.set(false, forKey: UIHangWatchdog.defaultsKey)
@@ -323,6 +332,105 @@ import Testing
             [chosen, other], query: OmniQuery.parse("account:chosen")))
         #expect(prepared.turns.map(\.traceId) == [chosen.traceId])
         #expect((prepared.turns[0].user?.count ?? 0) <= TurnTextCap.maxChars)
+    }
+
+    @Test func duplicateSnapshotsKeepStablePositionAndLatestValue() throws {
+        let first = Self.metadata("duplicate")
+        let replacement = TranscriptTurnMetadata(
+            traceId: first.traceId, tsRequestMs: first.tsRequestMs, tsResponseMs: 99,
+            harness: first.harness, model: first.model, provider: first.provider,
+            status: 201, inputTokens: first.inputTokens, outputTokens: first.outputTokens,
+            error: nil, errorKind: nil, attempts: nil, substituted: nil,
+            substitutionReason: nil, streamed: 1, hasRequest: true, hasResponse: true)
+        let other = Self.metadata("other")
+        let metadata = TraceSnapshotDeduplication.transcriptMetadata(
+            [first, other, replacement])
+        #expect(metadata.map(\.traceId) == [first.traceId, other.traceId])
+        #expect(metadata[0].status == 201)
+
+        let sessions = try JSONDecoder().decode([TraceSession].self, from: Data("""
+        [
+          {"session_id":"same","first_ts_ms":1,"last_ts_ms":2,"trace_count":1},
+          {"session_id":"other","first_ts_ms":1,"last_ts_ms":3,"trace_count":1},
+          {"session_id":"same","first_ts_ms":1,"last_ts_ms":9,"trace_count":2}
+        ]
+        """.utf8))
+        let deduplicated = TraceSnapshotDeduplication.sessions(sessions)
+        #expect(deduplicated.map(\.sessionId) == ["same", "other"])
+        #expect(deduplicated[0].lastTsMs == 9)
+        #expect(deduplicated[0].traceCount == 2)
+    }
+
+    @Test func transcriptPreparationBuildsRolesAndBoundsHugeBlockSearch() throws {
+        let marker = "needle-inside-prefix"
+        let huge = marker + String(repeating: "x", count: 100_000)
+        let turn = Self.makeTurn(
+            1, text: "small", assistantBlocks: [
+                AssistantBlock(type: "text", text: huge),
+                AssistantBlock(type: "text", text: "needle-after-search-cap"),
+            ])
+        let prepared = try #require(TraceBrowserModel.prepareTranscriptFilter(
+            turns: [turn], filterTab: 0, query: marker, forceIncremental: false))
+        #expect(prepared.entries.count == 1)
+        #expect(prepared.entries[0].renderedRole == .assistant)
+        #expect(TranscriptFilter.result(
+            turns: [turn], filterTab: 0, query: "needle-after-search-cap").entries.isEmpty)
+
+        let harnessTurn = Self.makeTurn(
+            2, text: "small", traceId: "harness-result")
+        let harnessJSON = try JSONEncoder().encode(harnessTurn)
+        var object = try #require(
+            JSONSerialization.jsonObject(with: harnessJSON) as? [String: Any])
+        object["user"] = "[tool result] ok"
+        let rewritten = try JSONSerialization.data(withJSONObject: object)
+        let harness = try JSONDecoder().decode(TranscriptTurn.self, from: rewritten)
+        let roles = try #require(TraceBrowserModel.prepareTranscriptFilter(
+            turns: [harness, turn], filterTab: 0, query: "", forceIncremental: false))
+        #expect(roles.entries.first?.renderedRole == .harness)
+        #expect(roles.entries.dropFirst().first?.roleChanged == true)
+    }
+
+    @Test func tagFilterValuesArePreparedFromSnapshots() throws {
+        let sessions = try JSONDecoder().decode([TraceSession].self, from: Data("""
+        [{
+          "session_id":"filters","first_ts_ms":1,"last_ts_ms":2,"trace_count":1,
+          "harness":"codex","models":["gpt-5.6-sol"],"account_ids":["account-b"],
+          "tags":{"task":"release"}
+        }]
+        """.utf8))
+        let accounts = try JSONDecoder().decode([Account].self, from: Data("""
+        [
+          {"id":"account-a","provider":"openai","name":"A","kind":"oauth","paused":false,"status":"ready","email":"a@example.com"},
+          {"id":"account-b","provider":"openai","name":"B","kind":"oauth","paused":false,"status":"ready","email":"b@example.com"}
+        ]
+        """.utf8))
+        let values = TraceBrowserModel.prepareTagFilterValues(
+            sessions: sessions, accounts: accounts, middlewareRules: [])
+        #expect(values[.harness] == ["codex"])
+        #expect(values[.task] == ["release"])
+        #expect(values[.model] == ["gpt-5.6-sol"])
+        #expect(values[.account] == ["account-a", "account-b"])
+        #expect(values[.duration] == SessionDurationFilter.allCases.map(\.rawValue))
+    }
+
+    @Test @MainActor func duplicateTranscriptPagesDoNotCreateDuplicateRows() async throws {
+        let metadata = Self.metadata("overlap")
+        let model = TraceBrowserModel(
+            store: SnapshotStore(),
+            transcriptPageFetcher: { sessionId, _, _ in
+                TranscriptPageResponse(
+                    sessionId: sessionId, turns: [metadata, metadata], limit: 50,
+                    hasMore: false, nextCursor: nil)
+            },
+            traceTurnFetcher: { traceId in
+                Self.makeTurn(0, text: "loaded", traceId: traceId)
+            })
+        model.selectFromUser("overlap")
+        try await waitUntil {
+            await MainActor.run { model.turns.count == 1 && model.transcriptEntries.count == 2 }
+        }
+        #expect(Set(model.transcriptEntries.map(\.id)).count == model.transcriptEntries.count)
+        model.stop()
     }
 
     @MainActor

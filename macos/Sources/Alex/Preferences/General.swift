@@ -297,6 +297,25 @@ struct GeneralPreferencesPane: View {
                 }
             }
         }
+        RowDivider()
+        SettingRow(
+            label: "Latest freeze stack",
+            hint: "A one-second stack sample captured after a detected freeze. It contains function and library names, not prompt or response bodies."
+        ) {
+            PillButton(
+                title: "Reveal in Finder", variant: .bordered,
+                horizontalPadding: 12, verticalPadding: 5,
+                cornerRadius: 7, showsBorder: true
+            ) {
+                let url = UIHangSample.fileURL()
+                do {
+                    try UIHangLog.prepareForReveal(at: url)
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                } catch {
+                    NSSound.beep()
+                }
+            }
+        }
 
         SectionLabel(text: "Reset")
             .settingsSectionSpacing()
