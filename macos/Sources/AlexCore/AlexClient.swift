@@ -903,6 +903,30 @@ public struct AlexClient: Sendable {
         return try JSONDecoder().decode(OpenRouterExposedResponse.self, from: data).exposed
     }
 
+    /// The cross-provider Models pane snapshot: live merged catalog + curated
+    /// list with availability. The daemon re-fetches dynamic catalogs first,
+    /// so this call doubles as "Refresh models".
+    public func modelsAdmin() async throws -> ModelsAdminResponse {
+        try await get("admin/models", as: ModelsAdminResponse.self)
+    }
+
+    /// Persist the curated cross-provider list in the given order; nil turns
+    /// curation off (publish the full catalog).
+    @discardableResult
+    public func updateExposedModels(_ exposed: [String]?) async throws -> [String]? {
+        struct Body: Encodable { let exposed: [String]? }
+        struct Reply: Decodable { let exposed: [String]? }
+        let data = try await request(
+            "admin/models/exposed", method: "POST", body: body(Body(exposed: exposed)))
+        return try JSONDecoder().decode(Reply.self, from: data).exposed
+    }
+
+    /// Re-verify every curated model against a live catalog fetch.
+    public func checkExposedModels() async throws -> ModelsCheckResponse {
+        let data = try await request("admin/models/check", method: "POST", body: nil)
+        return try JSONDecoder().decode(ModelsCheckResponse.self, from: data)
+    }
+
     public func traceSessions(
         since: String = "24h", limit: Int = 200, middlewareId: String? = nil
     ) async throws -> [TraceSession] {

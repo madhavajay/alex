@@ -2812,14 +2812,16 @@ public enum TranscriptRender {
 
     public static func build(
         turns: [TranscriptTurn], firstTurnNumber: Int = 1, harnessName: String = "harness",
-        icons: TranscriptIcons = .none, rawMode: Bool = false
+        icons: TranscriptIcons = .none, rawMode: Bool = false, fontScale: CGFloat = 1
     ) -> TranscriptDocument {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        let labelFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
-        let separatorFont = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
-        let proseFont = NSFont.systemFont(ofSize: 13)
-        let monoFont = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+        // All transcript type scales together; Cmd+= / Cmd+- adjust fontScale.
+        let scale = max(0.5, min(fontScale, 3))
+        let labelFont = NSFont.monospacedSystemFont(ofSize: 10 * scale, weight: .bold)
+        let separatorFont = NSFont.monospacedSystemFont(ofSize: 9 * scale, weight: .regular)
+        let proseFont = NSFont.systemFont(ofSize: 13 * scale)
+        let monoFont = NSFont.monospacedSystemFont(ofSize: 12.5 * scale, weight: .regular)
 
         let separatorPara = NSMutableParagraphStyle()
         separatorPara.paragraphSpacing = 6
@@ -2858,7 +2860,7 @@ public enum TranscriptRender {
             .paragraphStyle: separatorPara,
         ]
         let badSeparator: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .bold),
+            .font: NSFont.monospacedSystemFont(ofSize: 9 * scale, weight: .bold),
             .foregroundColor: NSColor.systemRed,
             .paragraphStyle: separatorPara,
         ]
@@ -2900,7 +2902,7 @@ public enum TranscriptRender {
             .transcriptBubbleKind: TranscriptBubbleKind.error.rawValue,
         ]
         let event: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+            .font: NSFont.monospacedSystemFont(ofSize: 9 * scale, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor,
             .backgroundColor: NSColor.quaternaryLabelColor.withAlphaComponent(0.12),
             .paragraphStyle: rightCardPara,

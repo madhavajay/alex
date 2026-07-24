@@ -262,6 +262,21 @@ struct TranscriptTextPane: NSViewRepresentable {
                 showFindBar()
                 return true
             }
+            if modifiers == .command || modifiers == [.command, .shift] {
+                switch event.charactersIgnoringModifiers {
+                case "=", "+":
+                    model?.zoomTranscript(1)
+                    return true
+                case "-", "_":
+                    model?.zoomTranscript(-1)
+                    return true
+                case "0":
+                    model?.resetTranscriptZoom()
+                    return true
+                default:
+                    break
+                }
+            }
             guard modifiers.isEmpty else { return false }
             switch event.keyCode {
             case 126: // up arrow

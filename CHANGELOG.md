@@ -7,6 +7,52 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-07-24
+
+### Added
+- **Models settings tab with cross-provider curation.** Settings → Models
+  shows every provider's live catalog, lets you build a curated published
+  list with drag-to-reorder favourites, flags curated models that are no
+  longer available upstream, and adds Refresh models / Check models actions.
+  Connected harness configs update automatically when providers or the
+  curated list change.
+- **Remote 1-liners are customizable before copying.** Copy 1-liner now opens
+  a sheet to choose harness, default model, interface (localhost, LAN, or
+  Tailscale), whether to install Alex if missing, and whether to embed a
+  scoped key — with a live command preview and reachability warnings.
+- **Onboarding asks who can reach Alex.** The Network access step offers
+  loopback, a specific interface, or all interfaces, explains the security
+  implications of each, and applies the choice before harness connect. A
+  one-time tip under the menu-bar icon points new users at the Trace Browser
+  and Settings after onboarding completes.
+- **Claude Code supports a default Alex model.** `alex up claude --model …`
+  now works, and `alex up claude` launches Claude with the Alex settings
+  profile applied.
+- **Trace browser quality of life.** Adjustable transcript text size
+  (Cmd+= / Cmd+- / Cmd+0, persisted), a brand icon in the title bar, and a
+  right-click "Re-approve key" action that re-enables a rejected known run
+  key so the session can continue, next to a shortcut into
+  Settings → Credentials.
+- **Force-install fallback when an app update fails.** If a Sparkle update
+  aborts (for example an update that cannot be validated), Alex now offers to
+  run the official curl installer in your terminal — or copy the command —
+  instead of dead-ending.
+
+### Changed
+- Remote 1-liner host selection prefers Wi-Fi and Ethernet addresses over
+  bridges and VPN tunnels when the daemon listens on all interfaces, so
+  copied commands embed an address remote machines can actually reach.
+- Requests that fail because a provider has no active account now return 403
+  instead of 502, so harness SDKs surface the `alex auth` hint immediately
+  instead of retrying for tens of seconds.
+
+### Fixed
+- The Harnesses settings pane no longer shows a misleading "daemon is bound
+  to localhost" warning; reachability guidance now lives in the 1-liner sheet
+  where it is accurate.
+- Updated `ratatui` to 0.30, clearing the Dependabot advisory for the `lru`
+  crate's soundness issue.
+
 ## [0.1.30] - 2026-07-23
 
 ### Added

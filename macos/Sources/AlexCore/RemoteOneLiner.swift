@@ -10,16 +10,52 @@ public enum RemoteOneLiner {
     public static let localhostWarning =
         "Daemon is bound to localhost — remote machines can't reach it. Bind a LAN address in General to use this on another machine."
 
+    /// Everything a user can customize before copying a remote 1-liner.
+    public struct Options: Sendable, Equatable {
+        public var harness: String
+        public var model: String?
+        public var includeInstall: Bool
+        public var includeKey: Bool
+
+        public init(
+            harness: String,
+            model: String? = nil,
+            includeInstall: Bool = true,
+            includeKey: Bool = true
+        ) {
+            self.harness = harness
+            self.model = model
+            self.includeInstall = includeInstall
+            self.includeKey = includeKey
+        }
+    }
+
     public static func build(harness: String, baseURL: URL, key: String) -> String {
         build(harness: harness, baseURL: baseURL.absoluteString, key: key)
     }
 
     public static func build(harness: String, baseURL: String, key: String) -> String {
+        build(options: Options(harness: harness), baseURL: baseURL, key: key)
+    }
+
+    public static func build(options: Options, baseURL: URL, key: String?) -> String {
+        build(options: options, baseURL: baseURL.absoluteString, key: key)
+    }
+
+    public static func build(options: Options, baseURL: String, key: String?) -> String {
         let normalizedBaseURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let script =
-            "command -v alex >/dev/null || curl -fsSL \(installerURL) | sh; "
-            + "alex up \(shellArgument(harness)) --url \(shellArgument(normalizedBaseURL)) "
-            + "--key \(shellArgument(key))"
+        var script = ""
+        if options.includeInstall {
+            script += "command -v alex >/dev/null || curl -fsSL \(installerURL) | sh; "
+        }
+        script += "alex up \(shellArgument(options.harness)) "
+            + "--url \(shellArgument(normalizedBaseURL))"
+        if options.includeKey, let key, !key.isEmpty {
+            script += " --key \(shellArgument(key))"
+        }
+        if let model = options.model, !model.isEmpty {
+            script += " --model \(shellArgument(model))"
+        }
         return "sh -c \"\(outerDoubleQuotedArgument(script))\""
     }
 
@@ -41,10 +77,15 @@ public enum RemoteOneLiner {
         default:
             host = configuredHost
         }
+        return url(host: host, port: config.port) ?? config.baseURL
+    }
+
+    /// Renders `http://host:port`, bracketing bare IPv6 addresses.
+    public static func url(host: String, port: Int) -> URL? {
         let unwrappedHost = host.hasPrefix("[") && host.hasSuffix("]")
             ? String(host.dropFirst().dropLast()) : host
         let renderedHost = unwrappedHost.contains(":") ? "[\(unwrappedHost)]" : unwrappedHost
-        return URL(string: "http://\(renderedHost):\(config.port)") ?? config.baseURL
+        return URL(string: "http://\(renderedHost):\(port)")
     }
 
     private static func shellArgument(_ value: String) -> String {

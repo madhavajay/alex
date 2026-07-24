@@ -48,6 +48,37 @@ public enum NetworkInterfaces {
         return "Interface \(name)"
     }
 
+    /// Orders addresses by how likely a remote machine is to reach them:
+    /// primary LAN interfaces first, then Tailscale, then virtual interfaces.
+    /// Alphabetical `addresses()` order puts bridges and VPN tunnels ahead of
+    /// Wi-Fi, which is how remote 1-liners ended up embedding unreachable IPs.
+    public static func rankedForRemoteAccess(
+        _ addresses: [NetworkInterfaceAddress]
+    ) -> [NetworkInterfaceAddress] {
+        addresses.sorted { lhs, rhs in
+            let lhsRank = remoteAccessRank(lhs)
+            let rhsRank = remoteAccessRank(rhs)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.displayName.localizedStandardCompare(rhs.displayName)
+                == .orderedAscending
+        }
+    }
+
+    private static func remoteAccessRank(_ interface: NetworkInterfaceAddress) -> Int {
+        let ipv4Penalty = interface.address.contains(":") ? 1 : 0
+        if interface.name == "en0" { return 0 + ipv4Penalty }
+        if isTailscale(interface.address)
+            || interface.name.lowercased().contains("tailscale")
+        {
+            return 4 + ipv4Penalty
+        }
+        if interface.name.hasPrefix("en") { return 2 + ipv4Penalty }
+        if interface.name.hasPrefix("bridge") || interface.name.hasPrefix("utun") {
+            return 6 + ipv4Penalty
+        }
+        return 8 + ipv4Penalty
+    }
+
     private static func numericAddress(_ address: UnsafeMutablePointer<sockaddr>) -> String? {
         switch Int32(address.pointee.sa_family) {
         case AF_INET:

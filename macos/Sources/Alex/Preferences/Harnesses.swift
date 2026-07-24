@@ -119,14 +119,6 @@ struct HarnessesPreferencesSection: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 0) {
-                if store.config?.lanEnabled == false {
-                    Text(RemoteOneLiner.localhostWarning)
-                        .font(.system(size: 10))
-                        .foregroundStyle(AlexTheme.Colors.warningOrange)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
                 ScrollView {
                     VStack(spacing: 0) {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, harness in
@@ -203,9 +195,7 @@ private struct HarnessRowView: View {
     @State private var actionModel: HarnessActionSheetModel?
     @State private var hovered = false
     @State private var confirmingDisconnect = false
-    @State private var copyingRemote = false
-    @State private var copiedRemote = false
-    @State private var copyConfirmationTask: Task<Void, Never>?
+    @State private var oneLinerModel: RemoteOneLinerSheetModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -231,6 +221,11 @@ private struct HarnessRowView: View {
         .sheet(item: $actionModel) { model in
             HarnessActionSheetHost(model: model) {
                 actionModel = nil
+            }
+        }
+        .sheet(item: $oneLinerModel) { model in
+            RemoteOneLinerSheet(model: model) {
+                oneLinerModel = nil
             }
         }
         .confirmationDialog(
@@ -308,19 +303,18 @@ private struct HarnessRowView: View {
                     .controlSize(.small)
             } else {
                 PillButton(
-                    title: copiedRemote ? "Copied" : "Copy 1-liner",
+                    title: "Copy 1-liner",
                     variant: .bordered,
-                    systemImage: copiedRemote ? "checkmark" : "doc.on.doc",
+                    systemImage: "doc.on.doc",
                     fontSize: 9,
                     horizontalPadding: 6,
                     verticalPadding: 3,
                     cornerRadius: 5,
-                    isEnabled: store.config != nil && !copyingRemote,
-                    isBusy: copyingRemote
+                    isEnabled: store.config != nil
                 ) {
-                    copyRemoteOneLiner()
+                    openOneLinerSheet()
                 }
-                .help("Mint a fresh harness key and copy a remote install/connect/launch command")
+                .help("Choose interface, model, and auth options, then mint a fresh harness key and copy a remote install/connect/launch command")
                 if harness.connected && harness.supportsConnect {
                     PillButton(
                         title: "Remove", variant: .danger
@@ -376,29 +370,10 @@ private struct HarnessRowView: View {
         model.start()
     }
 
-    private func copyRemoteOneLiner() {
-        guard let config = store.config, !copyingRemote else { return }
+    private func openOneLinerSheet() {
+        guard let config = store.config else { return }
         error = nil
-        copiedRemote = false
-        copyingRemote = true
-        copyConfirmationTask?.cancel()
-        Task {
-            defer { copyingRemote = false }
-            do {
-                try await RemoteOneLinerClipboard.copy(harness: harness.name, config: config)
-                copiedRemote = true
-                copyConfirmationTask = Task {
-                    try? await Task.sleep(for: .seconds(2))
-                    guard !Task.isCancelled else { return }
-                    copiedRemote = false
-                }
-            } catch is CancellationError {
-                return
-            } catch {
-                NSSound.beep()
-                self.error = "Could not copy remote 1-liner: \(error.localizedDescription)"
-            }
-        }
+        oneLinerModel = RemoteOneLinerSheetModel(harness: harness.name, config: config)
     }
 
 }

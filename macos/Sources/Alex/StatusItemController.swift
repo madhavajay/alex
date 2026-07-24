@@ -12,6 +12,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var darioWindow: DarioWindowController?
     private var onboardingWindow: OnboardingWindowController?
     private var onboardingShownThisLaunch = false
+    private var postOnboardingPopover: NSPopover?
     private let reauthWizard: ReauthWizardWindowController
     private let authWindows = AuthWindowController()
     private let pingWindow = PingWindowController()
@@ -961,6 +962,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     ) {
         if traceBrowser == nil {
             traceBrowser = TraceBrowserWindowController(store: store)
+            traceBrowser?.onOpenCredentialsSettings = { [weak self] in
+                self?.openPreferences(section: .credentials)
+            }
         }
         traceBrowser?.show(
             harness: harness, query: query, selectSessionId: selectSessionId,
@@ -1007,10 +1011,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     guard let self else { return }
                     self.openTraceBrowser(
                         query: query, above: self.onboardingWindow?.orderingWindow)
-                })
+                },
+                onCompleted: { [weak self] in self?.showPostOnboardingTip() })
         }
         onboardingShownThisLaunch = true
         onboardingWindow?.show()
+    }
+
+    /// One-shot pointer at the menu-bar icon once the tutorial ends, so new
+    /// users know where Alex lives after the onboarding window disappears.
+    private func showPostOnboardingTip() {
+        guard let button = statusItem.button else { return }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(
+            rootView: PostOnboardingTipView(
+                openDashboard: { [weak self, weak popover] in
+                    popover?.close()
+                    self?.openTraceBrowser(query: nil)
+                },
+                openSettings: { [weak self, weak popover] in
+                    popover?.close()
+                    self?.openPreferences(section: .general)
+                }))
+        postOnboardingPopover = popover
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 }
 
