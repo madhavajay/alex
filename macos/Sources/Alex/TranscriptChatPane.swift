@@ -17,21 +17,14 @@ struct TranscriptChatPane: View {
         // every keystroke (that synchronous, uncapped recompute used to
         // freeze the window on large sessions).
         let entries = model.transcriptEntries
-        // Displayed role per entry (user / harness tool-result / assistant)
-        // resolved once up front: role-change dividers and thread connectors
-        // need the *actual* rendered role, not just which half of the turn
-        // the entry structurally belongs to (a "user"-slot entry can render
-        // as `.harness` — see `TranscriptChatMessages.messages`).
-        let messages = entries.map { displayMessage($0) }
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    ForEach(entries) { entry in
                         entryView(
-                            entry, message: messages[index],
-                            roleChanged: index > 0 && messages[index - 1]?.role != messages[index]?.role,
-                            isThreaded: index + 1 < entries.count
-                                && messages[index + 1]?.role == messages[index]?.role)
+                            entry, message: displayMessage(entry),
+                            roleChanged: entry.roleChanged,
+                            isThreaded: entry.isThreaded)
                     }
                     if entries.isEmpty, !model.turns.isEmpty {
                         EmptyStateView(message: "No messages match")
@@ -195,14 +188,32 @@ private struct RoleChangeDivider: View {
 }
 
 /// One renderable message slot of a turn (user or assistant half).
-struct TranscriptChatEntry: Identifiable {
-    enum Role {
+struct TranscriptChatEntry: Identifiable, Sendable {
+    enum Role: Sendable {
         case user, event, assistant
     }
 
     let turn: TranscriptTurn
     let turnNumber: Int
     let role: Role
+    /// Cheap role metadata prepared off-main. SwiftUI can draw dividers and
+    /// connectors without eagerly creating every rendered message.
+    let renderedRole: MessageDisplay.Role
+    let roleChanged: Bool
+    let isThreaded: Bool
+
+    init(
+        turn: TranscriptTurn, turnNumber: Int, role: Role,
+        renderedRole: MessageDisplay.Role, roleChanged: Bool = false,
+        isThreaded: Bool = false
+    ) {
+        self.turn = turn
+        self.turnNumber = turnNumber
+        self.role = role
+        self.renderedRole = renderedRole
+        self.roleChanged = roleChanged
+        self.isThreaded = isThreaded
+    }
 
     var id: String {
         let suffix = switch role {

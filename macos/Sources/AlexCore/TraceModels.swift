@@ -157,6 +157,40 @@ public struct TranscriptTurnMetadata: Codable, Sendable, Identifiable, Equatable
     }
 }
 
+/// Stabilizes daemon snapshots before they reach SwiftUI collections. Live
+/// pagination can overlap while new traces arrive; duplicate IDs otherwise
+/// create duplicate `ForEach` identities and can also trap callers that build
+/// dictionaries with `uniqueKeysWithValues`.
+public enum TraceSnapshotDeduplication {
+    public static func sessions(_ values: [TraceSession]) -> [TraceSession] {
+        stableLatest(values, id: \.sessionId)
+    }
+
+    public static func transcriptMetadata(
+        _ values: [TranscriptTurnMetadata]
+    ) -> [TranscriptTurnMetadata] {
+        stableLatest(values, id: \.traceId)
+    }
+
+    private static func stableLatest<Value>(
+        _ values: [Value], id: KeyPath<Value, String>
+    ) -> [Value] {
+        var output: [Value] = []
+        var indexById: [String: Int] = [:]
+        output.reserveCapacity(values.count)
+        for value in values {
+            let key = value[keyPath: id]
+            if let index = indexById[key] {
+                output[index] = value
+            } else {
+                indexById[key] = output.count
+                output.append(value)
+            }
+        }
+        return output
+    }
+}
+
 public struct TranscriptPageResponse: Codable, Sendable, Equatable {
     public let sessionId: String
     public let turns: [TranscriptTurnMetadata]
@@ -2339,6 +2373,7 @@ public enum TranscriptApplyPolicy {
     public static let largeMessageCount = 20
     public static let maxTurnsPerBatch = 3
     public static let maxMessagesPerBatch = 6
+    public static let maxIncrementalMessagesPerBatch = 3
     public static let maxCharsPerBatch = 24_000
     public static let initialTurnCount = 6
     public static let earlierTurnPageCount = 8
@@ -2434,7 +2469,8 @@ public enum TranscriptApplyPolicy {
         for index in characterCounts.indices {
             let count = characterCounts[index]
             let batchCount = index - start
-            let limit = forceIncremental ? 1 : maxMessagesPerBatch
+            let limit = forceIncremental
+                ? maxIncrementalMessagesPerBatch : maxMessagesPerBatch
             if batchCount > 0 && (batchCount >= limit || chars + count > maxCharsPerBatch) {
                 ranges.append(start..<index)
                 start = index
@@ -3292,4 +3328,3 @@ public struct DarioLogsResponse: Codable, Sendable {
         case generationId = "generation_id"
     }
 }
-

@@ -17,10 +17,16 @@ final class TraceBrowserModel {
     private let traceTurnFetcher: TraceTurnFetcher?
 
     private(set) var sessions: [TraceSession] = [] {
-        didSet { recomputeTranscriptSummary() }
+        didSet {
+            scheduleTranscriptSummary()
+            scheduleTagFilterValues()
+        }
     }
     private(set) var turns: [TranscriptTurn] = [] {
-        didSet { scheduleTranscriptFilter(debounce: false); recomputeTranscriptSummary() }
+        didSet {
+            scheduleTranscriptFilter(debounce: false, coalesce: true)
+            scheduleTranscriptSummary()
+        }
     }
     private(set) var visibleRows: [SessionRow] = []
     private(set) var parsedQuery = OmniQuery()
@@ -28,7 +34,9 @@ final class TraceBrowserModel {
     private(set) var sessionsLoading = true
     private(set) var sessionsUnreachable = false
     private(set) var simulationFixtures: [ErrorSimulationFixture] = []
-    private(set) var middlewareRules: [MiddlewareRuleSpecV1] = []
+    private(set) var middlewareRules: [MiddlewareRuleSpecV1] = [] {
+        didSet { scheduleTagFilterValues() }
+    }
     private var lastSessionsMiddlewareId: String?
     private(set) var fixturesLoading = false
     private(set) var fixtureLoadError: String?
@@ -117,6 +125,12 @@ final class TraceBrowserModel {
     private(set) var transcriptTotalCount = 0
     private(set) var transcriptTabCounts: TranscriptTabCounts?
     private var transcriptFilterTask: Task<Void, Never>?
+    private var transcriptFilterGeneration = 0
+    private var transcriptSummaryTask: Task<Void, Never>?
+    private var transcriptSummaryGeneration = 0
+    private(set) var cachedFilterValues: [TagFilterDimension: [String]] = [:]
+    private var tagFilterTask: Task<Void, Never>?
+    private var tagFilterGeneration = 0
     private var transcriptMetadata: [TranscriptTurnMetadata] = []
     private var expandedTurns: [String: TranscriptTurn] = [:]
     private var turnFetchTasks: [String: Task<Void, Never>] = [:]
@@ -135,8 +149,10 @@ final class TraceBrowserModel {
     /// structural changes (new turns, tab switch) that should apply
     /// immediately. Cancels any in-flight recompute first, so a burst of
     /// keystrokes only pays for the final one.
-    private func scheduleTranscriptFilter(debounce: Bool) {
+    private func scheduleTranscriptFilter(debounce: Bool, coalesce: Bool = false) {
         transcriptFilterTask?.cancel()
+        transcriptFilterGeneration += 1
+        let generation = transcriptFilterGeneration
         let turnsSnapshot = turns
         let tab = transcriptFilterTab
         let query = transcriptQuery
@@ -145,9 +161,12 @@ final class TraceBrowserModel {
             if debounce {
                 try? await Task.sleep(for: .milliseconds(200))
                 guard !Task.isCancelled else { return }
+            } else if coalesce {
+                try? await Task.sleep(for: .milliseconds(15))
+                guard !Task.isCancelled else { return }
             }
-            let result = await Task.detached(priority: .userInitiated) {
-                () -> ([TranscriptFilterEntry], Int) in
+            let worker = Task.detached(priority: .userInitiated) {
+                () -> PreparedTranscriptFilter? in
                 let start = ContinuousClock.now
                 defer {
                     let elapsed = start.duration(to: .now)
@@ -157,32 +176,36 @@ final class TraceBrowserModel {
                         milliseconds: Double(elapsed.components.seconds) * 1000
                             + Double(elapsed.components.attoseconds) / 1e15)
                 }
-                let filtered = TranscriptFilter.result(
-                    turns: turnsSnapshot, filterTab: tab, query: query)
-                return (filtered.entries, filtered.totalCount)
-            }.value
-            guard !Task.isCancelled, let self else { return }
-            let mapped = self.mapFilterEntries(result.0, turns: turnsSnapshot)
-            let characterCounts = mapped.map(Self.entryCharacterCount)
-            let ranges = TranscriptApplyPolicy.messageBatchRanges(
-                characterCounts: characterCounts,
-                forceIncremental: forceIncremental
-                    || mapped.count > TranscriptApplyPolicy.largeMessageCount)
+                return Self.prepareTranscriptFilter(
+                    turns: turnsSnapshot, filterTab: tab, query: query,
+                    forceIncremental: forceIncremental)
+            }
+            let prepared = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled, let self,
+                generation == self.transcriptFilterGeneration,
+                let prepared
+            else { return }
             self.lastChatPaneBatchCharacterCounts = []
-            self.transcriptTotalCount = result.1
-            if ranges.isEmpty {
+            self.transcriptTotalCount = prepared.totalCount
+            if prepared.ranges.isEmpty {
                 self.transcriptEntries = []
             } else {
-                for range in ranges {
-                    guard !Task.isCancelled else { return }
-                    let batchChars = characterCounts[range].reduce(0, +)
+                for range in prepared.ranges {
+                    guard !Task.isCancelled,
+                        generation == self.transcriptFilterGeneration
+                    else { return }
+                    let batchChars = prepared.characterCounts[range].reduce(0, +)
                     let interval = TraceBrowserSignpost.begin(
                         .chatPaneUpdate,
-                        "batch_entries=\(range.count) batch_chars=\(batchChars) total_entries=\(mapped.count)")
-                    self.transcriptEntries = Array(mapped[..<range.upperBound])
+                        "batch_entries=\(range.count) batch_chars=\(batchChars) total_entries=\(prepared.entries.count)")
+                    self.transcriptEntries = Array(prepared.entries[..<range.upperBound])
                     self.lastChatPaneBatchCharacterCounts.append(batchChars)
                     DispatchQueue.main.async { TraceBrowserSignpost.end(interval) }
-                    if range.upperBound < mapped.count {
+                    if range.upperBound < prepared.entries.count {
                         await Task.yield()
                         try? await Task.sleep(for: .milliseconds(1))
                     }
@@ -192,6 +215,13 @@ final class TraceBrowserModel {
             self.forceChunkedPaneUpdate = false
             self.transcriptRendering = false
         }
+    }
+
+    struct PreparedTranscriptFilter: Sendable {
+        let entries: [TranscriptChatEntry]
+        let totalCount: Int
+        let characterCounts: [Int]
+        let ranges: [Range<Int>]
     }
 
     private nonisolated static func entryCharacterCount(_ entry: TranscriptChatEntry) -> Int {
@@ -215,25 +245,51 @@ final class TraceBrowserModel {
         }
     }
 
-    private func mapFilterEntries(
-        _ filtered: [TranscriptFilterEntry], turns: [TranscriptTurn]
-    ) -> [TranscriptChatEntry] {
-        filtered.flatMap { entry -> [TranscriptChatEntry] in
-            guard turns.indices.contains(entry.turnIndex) else { return [] }
+    nonisolated static func prepareTranscriptFilter(
+        turns: [TranscriptTurn], filterTab: Int, query: String,
+        forceIncremental: Bool
+    ) -> PreparedTranscriptFilter? {
+        let filtered = TranscriptFilter.result(
+            turns: turns, filterTab: filterTab, query: query)
+        guard !Task.isCancelled else { return nil }
+        var slots: [(TranscriptTurn, Int, TranscriptChatEntry.Role, MessageDisplay.Role)] = []
+        slots.reserveCapacity(filtered.entries.count * 2)
+        for entry in filtered.entries {
+            guard !Task.isCancelled else { return nil }
+            guard turns.indices.contains(entry.turnIndex) else { continue }
             let turn = turns[entry.turnIndex]
-            guard turn.traceId == entry.turnId else { return [] }
+            guard turn.traceId == entry.turnId else { continue }
             let role: TranscriptChatEntry.Role = entry.role == .user ? .user : .assistant
             if entry.role == .assistant, turn.hasInlineAttemptEvents {
-                return [
-                    TranscriptChatEntry(
-                        turn: turn, turnNumber: entry.turnIndex + 1, role: .event),
-                    TranscriptChatEntry(
-                        turn: turn, turnNumber: entry.turnIndex + 1, role: role),
-                ]
+                slots.append((turn, entry.turnIndex + 1, .event, .harness))
             }
-            return [TranscriptChatEntry(
-                turn: turn, turnNumber: entry.turnIndex + 1, role: role)]
+            let renderedRole: MessageDisplay.Role = switch role {
+            case .user:
+                turn.user?.hasPrefix(TurnHeader.toolResultPrefix) == true
+                    ? .harness : .user
+            case .event: .harness
+            case .assistant: .assistant
+            }
+            slots.append((turn, entry.turnIndex + 1, role, renderedRole))
         }
+        var entries: [TranscriptChatEntry] = []
+        entries.reserveCapacity(slots.count)
+        for index in slots.indices {
+            let slot = slots[index]
+            entries.append(TranscriptChatEntry(
+                turn: slot.0, turnNumber: slot.1, role: slot.2,
+                renderedRole: slot.3,
+                roleChanged: index > 0 && slots[index - 1].3 != slot.3,
+                isThreaded: index + 1 < slots.count && slots[index + 1].3 == slot.3))
+        }
+        let characterCounts = entries.map(entryCharacterCount)
+        let ranges = TranscriptApplyPolicy.messageBatchRanges(
+            characterCounts: characterCounts,
+            forceIncremental: forceIncremental
+                || entries.count > TranscriptApplyPolicy.largeMessageCount)
+        return PreparedTranscriptFilter(
+            entries: entries, totalCount: filtered.totalCount,
+            characterCounts: characterCounts, ranges: ranges)
     }
 
     /// Session id of a subagent the user followed via "Follow trace"; drives
@@ -660,23 +716,7 @@ final class TraceBrowserModel {
     }
 
     func filterValues(_ dimension: TagFilterDimension) -> [String] {
-        if dimension == .middleware {
-            return middlewareRules.map(\.id).sorted {
-                filterLabel(.middleware, value: $0).localizedCaseInsensitiveCompare(
-                    filterLabel(.middleware, value: $1)) == .orderedAscending
-            }
-        }
-        if dimension == .account {
-            let known = Set(billingAccounts.map(\.id))
-            let observed = dimension.values(in: sessions).filter { known.contains($0) }
-            return Array(Set(observed).union(known)).sorted {
-                AccountIdentity.name(accountId: $0, accounts: billingAccounts)
-                    .localizedCaseInsensitiveCompare(
-                        AccountIdentity.name(accountId: $1, accounts: billingAccounts))
-                    == .orderedAscending
-            }
-        }
-        return dimension.values(in: sessions)
+        cachedFilterValues[dimension] ?? []
     }
 
     func activeFilter(_ dimension: TagFilterDimension) -> String? {
@@ -777,16 +817,111 @@ final class TraceBrowserModel {
         sessions.first { $0.sessionId == selectedSessionId }
     }
 
-    /// Recompute only when sessions/turns or the selected session changes,
-    /// never from a SwiftUI view body.
-    private func recomputeTranscriptSummary() {
-        transcriptToolCount = turns.reduce(0) { $0 + TranscriptChatMessages.toolCount(for: $1) }
-        transcriptTokensTotal = turns.reduce(0) {
-            $0 + ($1.inputTokens ?? 0) + ($1.outputTokens ?? 0)
+    struct PreparedTranscriptSummary: Sendable {
+        let toolCount: Int
+        let tokenCount: Int64
+        let subagentCount: Int
+    }
+
+    private func scheduleTranscriptSummary() {
+        transcriptSummaryTask?.cancel()
+        transcriptSummaryGeneration += 1
+        let generation = transcriptSummaryGeneration
+        let turnsSnapshot = turns
+        let sessionsSnapshot = sessions
+        let selectedId = selectedSessionId
+        transcriptSummaryTask = Task { [weak self] in
+            let worker = Task.detached(priority: .utility) {
+                () -> PreparedTranscriptSummary? in
+                var tools = 0
+                var tokens: Int64 = 0
+                for turn in turnsSnapshot {
+                    guard !Task.isCancelled else { return nil }
+                    tools += TranscriptChatMessages.toolCount(for: turn)
+                    tokens += (turn.inputTokens ?? 0) + (turn.outputTokens ?? 0)
+                }
+                var subagents = 0
+                if let selectedId {
+                    for session in sessionsSnapshot {
+                        guard !Task.isCancelled else { return nil }
+                        if session.parentSessionId == selectedId { subagents += 1 }
+                    }
+                }
+                return PreparedTranscriptSummary(
+                    toolCount: tools, tokenCount: tokens, subagentCount: subagents)
+            }
+            let summary = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard let self, !Task.isCancelled,
+                generation == self.transcriptSummaryGeneration,
+                let summary
+            else { return }
+            self.transcriptToolCount = summary.toolCount
+            self.transcriptTokensTotal = summary.tokenCount
+            self.transcriptSubagentCount = summary.subagentCount
         }
-        transcriptSubagentCount = selectedSessionId.map { sid in
-            sessions.filter { $0.parentSessionId == sid }.count
-        } ?? 0
+    }
+
+    private func scheduleTagFilterValues() {
+        tagFilterTask?.cancel()
+        tagFilterGeneration += 1
+        let generation = tagFilterGeneration
+        let sessionsSnapshot = sessions
+        let accountsSnapshot = billingAccounts
+        let rulesSnapshot = middlewareRules
+        tagFilterTask = Task { [weak self] in
+            let worker = Task.detached(priority: .utility) {
+                Self.prepareTagFilterValues(
+                    sessions: sessionsSnapshot, accounts: accountsSnapshot,
+                    middlewareRules: rulesSnapshot)
+            }
+            let values = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard let self, !Task.isCancelled,
+                generation == self.tagFilterGeneration
+            else { return }
+            self.cachedFilterValues = values
+        }
+    }
+
+    nonisolated static func prepareTagFilterValues(
+        sessions: [TraceSession], accounts: [Account],
+        middlewareRules: [MiddlewareRuleSpecV1]
+    ) -> [TagFilterDimension: [String]] {
+        var result: [TagFilterDimension: [String]] = [:]
+        let knownAccounts = Set(accounts.map(\.id))
+        let middlewareNames = middlewareRules.reduce(into: [String: String]()) {
+            $0[$1.id] = $1.name
+        }
+        for dimension in TagFilterDimension.allCases {
+            if Task.isCancelled { return [:] }
+            switch dimension {
+            case .middleware:
+                result[dimension] = middlewareRules.map(\.id).sorted {
+                    (middlewareNames[$0] ?? $0).localizedCaseInsensitiveCompare(
+                        middlewareNames[$1] ?? $1) == .orderedAscending
+                }
+            case .account:
+                let observed = dimension.values(in: sessions).filter {
+                    knownAccounts.contains($0)
+                }
+                result[dimension] = Array(Set(observed).union(knownAccounts)).sorted {
+                    AccountIdentity.name(accountId: $0, accounts: accounts)
+                        .localizedCaseInsensitiveCompare(
+                            AccountIdentity.name(accountId: $1, accounts: accounts))
+                        == .orderedAscending
+                }
+            default:
+                result[dimension] = dimension.values(in: sessions)
+            }
+        }
+        return result
     }
 
     func start() {
@@ -831,6 +966,13 @@ final class TraceBrowserModel {
         firstDetailTask = nil
         transcriptFilterTask?.cancel()
         transcriptFilterTask = nil
+        transcriptFilterGeneration += 1
+        transcriptSummaryTask?.cancel()
+        transcriptSummaryTask = nil
+        transcriptSummaryGeneration += 1
+        tagFilterTask?.cancel()
+        tagFilterTask = nil
+        tagFilterGeneration += 1
         sessionFilterTask?.cancel()
         sessionFilterTask = nil
         fixtureLoadTask?.cancel()
@@ -854,7 +996,6 @@ final class TraceBrowserModel {
         // and the transcript pane agree on one session again.
         multiSelection = [id]
         followedSubagentId = nil
-        recomputeTranscriptSummary()
         resetTurns()
         setUserAtBottom(true)
         startTranscriptPolling()
@@ -1085,8 +1226,9 @@ final class TraceBrowserModel {
         }
         do {
             let middlewareId = parsedQuery.middleware
-            let fetched = try await client.traceSessions(
-                since: "24h", limit: 200, middlewareId: middlewareId)
+            let fetched = TraceSnapshotDeduplication.sessions(
+                try await client.traceSessions(
+                    since: "24h", limit: 200, middlewareId: middlewareId))
             guard middlewareId == parsedQuery.middleware else { return }
             lastSessionsMiddlewareId = middlewareId
             daemonDown = false
@@ -1101,6 +1243,8 @@ final class TraceBrowserModel {
                     recomputeVisible()
                 }
             }
+            // Accounts can refresh independently of the session fingerprint.
+            scheduleTagFilterValues()
             if let pending = pendingSelectSessionId,
                 sessions.contains(where: { $0.sessionId == pending })
             {
@@ -1162,9 +1306,11 @@ final class TraceBrowserModel {
             } while cursor != nil
             daemonDown = false
             guard selectedSessionId == sid else { return }
-            let previous = Dictionary(uniqueKeysWithValues: transcriptMetadata.map {
-                ($0.traceId, $0)
-            })
+            fetched = TraceSnapshotDeduplication.transcriptMetadata(fetched)
+            let previous = transcriptMetadata.reduce(
+                into: [String: TranscriptTurnMetadata]()) {
+                    $0[$1.traceId] = $1
+                }
             let changed = Set(fetched.compactMap { metadata in
                 previous[metadata.traceId] == metadata ? nil : metadata.traceId
             })
@@ -1420,12 +1566,9 @@ final class TraceBrowserModel {
     private func commitDisplayTurns(
         _ value: [TranscriptTurn], batchChars: Int, resetRenderState: Bool
     ) {
-        let totalChars = value.reduce(0) {
-            $0 + TranscriptApplyPolicy.inlineCharacterCount($1)
-        }
         let interval = TraceBrowserSignpost.begin(
             .transcriptApply,
-            "turns=\(value.count) total_chars=\(totalChars) batch_chars=\(batchChars)")
+            "turns=\(value.count) batch_chars=\(batchChars)")
         turns = value
         lastTurnApplyBatchCharacterCounts.append(batchChars)
         if resetRenderState { renderState = nil }
@@ -2641,7 +2784,9 @@ enum SessionContextMenuSelection {
     ) -> [TraceSession] {
         let requested = ids.isEmpty ? fallbackIds : ids
         guard !requested.isEmpty else { return [] }
-        let byId = Dictionary(uniqueKeysWithValues: sessions.map { ($0.sessionId, $0) })
+        let byId = sessions.reduce(into: [String: TraceSession]()) {
+            $0[$1.sessionId] = $1
+        }
         let resolved = requested.sorted().compactMap { byId[$0] }
         if !resolved.isEmpty || requested == fallbackIds { return resolved }
         return fallbackIds.sorted().compactMap { byId[$0] }
