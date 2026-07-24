@@ -7,9 +7,11 @@
 <p align="center">
   <a href="https://crates.io/crates/alex"><img src="https://img.shields.io/crates/v/alex.svg" alt="crates.io"></a>
   <a href="https://github.com/madhavajay/alex/actions/workflows/ci.yml"><img src="https://github.com/madhavajay/alex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-supported-black?logo=apple" alt="macOS supported"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/Linux-supported-FCC624?logo=linux&amp;logoColor=black" alt="Linux supported"></a>
-  <img src="https://img.shields.io/badge/Windows-coming%20soon-0078D4?logo=windows11&amp;logoColor=white" alt="Windows coming soon">
+  <a href="#quickstart"><img src="https://img.shields.io/badge/macOS-ARM64-black?logo=apple" alt="macOS ARM64"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Windows-x86--64%20alpha-0078D4?logo=windows11&amp;logoColor=white" alt="Windows x86-64 alpha"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Windows-ARM64%20alpha-0078D4?logo=windows11&amp;logoColor=white" alt="Windows ARM64 alpha"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Linux-x86--64-FCC624?logo=linux&amp;logoColor=black" alt="Linux x86-64"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/Linux-ARM64-FCC624?logo=linux&amp;logoColor=black" alt="Linux ARM64"></a>
 </p>
 
 <h2 align="center">Your tokens, your traces, your choice!</h2>
@@ -24,9 +26,32 @@
   </a>
 </p>
 
-## e2e Harness ↔️ Provider Traces
+## Problems Alex fixes
 
-![Alex capturing a wrapped Amp session alongside its full conversation trace](https://raw.githubusercontent.com/madhavajay/alex/main/images/amp.png)
+**Problem:** Fable 5 guardrails kill your session.  
+**Solution:** Alex can transparently **switch** to GPT-5.6 Sol, or **fork** the session into another harness or model.
+
+`pi` · `claude` · `codex` · `grok`
+
+**Problem:** Your subscription logs out mid-run.  
+**Solution:** Alex pings you on Telegram to re-auth from your phone and can reroute traffic until it reconnects.
+
+`anthropic` · `openai` · `gemini` · `grok`
+
+**Problem:** You cannot use your Anthropic subscription from other harnesses.  
+**Solution:** Alex routes through Dario so requests match Anthropic's expected wire format.
+
+`pi` · `codex` · `claude` · `opencode`
+
+**Problem:** You hit five-hour or weekly limits and start juggling accounts.  
+**Solution:** Alex bonds multiple subscriptions and fails over automatically.
+
+`account-1` · `account-2` · `account-3`
+
+**Problem:** You cannot see what agents and subagents are really doing.  
+**Solution:** Alex shows every message, tool call, response, and subagent as one readable chat thread.
+
+`claude` · `codex` · `pi` · `amp` · `cursor`
 
 ## Quickstart
 
@@ -36,7 +61,39 @@ Install the macOS app or Linux daemon with one command:
 curl -fsSL https://raw.githubusercontent.com/madhavajay/alex/main/install-release.sh | sh
 ```
 
-Windows support is coming soon and is not included in the stable release.
+Windows support is alpha. In a normal PowerShell window, download the latest
+x86-64 or ARM64 installer and open it with:
+
+```powershell
+Invoke-RestMethod 'https://raw.githubusercontent.com/madhavajay/alex/main/install-windows.ps1' | Invoke-Expression
+```
+
+## Extra Benefits of LLM Proxies
+### PAM — Pi Agents Mixed
+
+[![PAM capability dial](https://github.com/madhavajay/pam/raw/main/assets/demo2.webp)](https://github.com/madhavajay/pam)
+
+Alex gives you the ability to easily combine subscriptions so you can experiment with SOTA techniques and MoA patterns without the fear of token bills.
+
+[PAM](https://github.com/madhavajay/pam) is an extension for the [Pi coding harness](https://pi.dev/) with an Agent ↔ Oracle mixture-of-agents dial, inspired by Amp Code's The Dial: your primary work stays on the faster agent while a smarter, slower oracle gives second opinions. Turn it up to 11 with `Ctrl+S`.
+
+```sh
+pi install npm:@madhavajay/pam
+```
+
+PAM works with whatever providers Pi has — and works best with Alex, where a single dial can mix providers and benefit from subscription bonding, automatic failover, and middleware reroutes.
+
+### Easily change PAM to use any model
+```
+# use kimi/k3 instead of fable in ultra mode
+pi --mode u --modes='{"u":["alex:alex/kimi/k3","sol"],"h":["sol@xhigh","fable"]}'
+```
+
+## e2e Harness ↔️ Provider Traces
+
+![Alex capturing a wrapped Amp session alongside its full conversation trace](https://raw.githubusercontent.com/madhavajay/alex/main/images/amp.png)
+
+Even in closed harnesses you can see whats going on!
 
 ## Your Tokens, Your Traces, Your Choice!
 
@@ -91,32 +148,6 @@ Use a Claude model from Pi. Use a GPT model from Claude Code. Route across multi
 
 ![Alex Trace Browser showing model requests, tool calls, token usage, and latency](https://raw.githubusercontent.com/madhavajay/alex/main/images/trace-browser.png)
 
-## Problems Alex fixes
-
-**Problem:** Fable 5 guardrails kill your session.  
-**Solution:** Alex can transparently **switch** to GPT-5.6 Sol, or **fork** the session into another harness or model.
-
-`pi` · `claude` · `codex` · `grok`
-
-**Problem:** Your subscription logs out mid-run.  
-**Solution:** Alex pings you on Telegram to re-auth from your phone and can reroute traffic until it reconnects.
-
-`anthropic` · `openai` · `gemini` · `grok`
-
-**Problem:** You cannot use your Anthropic subscription from other harnesses.  
-**Solution:** Alex routes through Dario so requests match Anthropic's expected wire format.
-
-`pi` · `codex` · `claude` · `opencode`
-
-**Problem:** You hit five-hour or weekly limits and start juggling accounts.  
-**Solution:** Alex bonds multiple subscriptions and fails over automatically.
-
-`account-1` · `account-2` · `account-3`
-
-**Problem:** You cannot see what agents and subagents are really doing.  
-**Solution:** Alex shows every message, tool call, response, and subagent as one readable chat thread.
-
-`claude` · `codex` · `pi` · `amp` · `cursor`
 
 ### Harness tracing support
 
@@ -167,18 +198,6 @@ Alex translates between Anthropic Messages, OpenAI Chat Completions, OpenAI Resp
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/claude.png" alt="OpenAI GPT-5.6 running in Claude Code through Alex" width="500"> | **GPT-5.6 in Claude Code.** Mix OpenAI models into an Anthropic-native harness. |
 | <img src="https://raw.githubusercontent.com/madhavajay/alex/main/images/codex.png" alt="Claude Fable 5 running in Codex through Alex" width="500"> | **Fable 5 in Codex.** Run Fable 5 from a compatible connected harness such as Codex. Your tokens, your choice! |
 | <img src="https://github.com/madhavajay/pam/raw/main/assets/pi.png" alt="The PAM mixture-of-agents plugin running in Pi through Alex" width="500"> | **[PAM](https://github.com/madhavajay/pam) in Pi.** Experiment with custom MoA plugins like PAM (the AMP Dial). |
-
-## PAM — Pi Agents Mixed
-
-[![PAM capability dial](https://github.com/madhavajay/pam/raw/main/assets/demo2.webp)](https://github.com/madhavajay/pam)
-
-[PAM](https://github.com/madhavajay/pam) is an extension for the [Pi coding harness](https://pi.dev/) with an Agent ↔ Oracle mixture-of-agents dial, inspired by Amp Code's The Dial: your primary work stays on the faster agent while a smarter, slower oracle gives second opinions. Turn it up to 11 with `Ctrl+S`.
-
-```sh
-pi install npm:@madhavajay/pam
-```
-
-PAM works with whatever providers Pi has — and works best with Alex, where a single dial can mix providers and benefit from subscription bonding, automatic failover, and middleware reroutes.
 
 A complete record of agent work.
 Requests, responses, token usage, latency, cost, sessions, subagents, requested tools, and executed tool results can all be captured locally and inspected as a coherent transcript.
@@ -487,7 +506,9 @@ Any harness pointed at Alex can set these per request:
 
 ## Platforms and alternative installation
 
-The stable release supports macOS and Ubuntu Linux x86-64 for the core CLI, user service, onboarding, routing, middleware, and Trace Browser path. The native menu-bar app and native notifications remain macOS-only; Linux uses the shared web UI. Windows support is being developed separately and is not a release target yet.
+Release binaries and installers are available for macOS ARM64, Windows x86-64
+and ARM64 (alpha), and Linux x86-64 and ARM64. The native menu-bar app and
+native notifications remain macOS-only; Linux uses the shared web UI.
 
 Alternative installation methods:
 
