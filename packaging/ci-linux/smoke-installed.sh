@@ -21,7 +21,14 @@ for command in curl jq python3 systemctl tar; do
   command -v "$command" >/dev/null 2>&1 || fail "missing required command: $command"
 done
 [[ "$(uname -s)" == "Linux" ]] || fail "candidate gate requires Linux"
-[[ "$(uname -m)" == "x86_64" ]] || fail "candidate gate requires x86_64"
+EXPECTED_ARCH="${ALEX_CI_LINUX_ARCH:-x86_64}"
+EXPECTED_LIBC="${ALEX_CI_LINUX_LIBC:-gnu}"
+[[ "$EXPECTED_ARCH" == "x86_64" || "$EXPECTED_ARCH" == "aarch64" ]] \
+  || fail "ALEX_CI_LINUX_ARCH must be x86_64 or aarch64"
+[[ "$EXPECTED_LIBC" == "gnu" || "$EXPECTED_LIBC" == "musl" ]] \
+  || fail "ALEX_CI_LINUX_LIBC must be gnu or musl"
+[[ "$(uname -m)" == "$EXPECTED_ARCH" ]] \
+  || fail "candidate gate requires $EXPECTED_ARCH, found $(uname -m)"
 # shellcheck disable=SC1091
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || fail "candidate gate requires Ubuntu, found ${ID:-unknown}"
@@ -36,7 +43,11 @@ VERSION="${ALEX_CI_LINUX_VERSION:?set ALEX_CI_LINUX_VERSION}"
 ASSET_DIR="${ALEX_CI_LINUX_ASSET_DIR:?set ALEX_CI_LINUX_ASSET_DIR}"
 INSTALL_DIR="$SMOKE_ROOT/bin"
 ALEX_BIN="$INSTALL_DIR/alex"
-ASSET_NAME="alex-cli-$VERSION-linux-x86_64.tar.gz"
+if [[ "$EXPECTED_LIBC" == "musl" ]]; then
+  ASSET_NAME="alex-cli-$VERSION-linux-$EXPECTED_ARCH-musl.tar.gz"
+else
+  ASSET_NAME="alex-cli-$VERSION-linux-$EXPECTED_ARCH.tar.gz"
+fi
 ASSET_PID=""
 MOCK_PID=""
 ROOT_OWNED=0
@@ -144,6 +155,7 @@ MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 ALEX_VERSION="$VERSION" \
 ALEX_ASSET_BASE_URL="$ASSET_URL" \
 ALEX_INSTALL_DIR="$INSTALL_DIR" \
+ALEX_LINUX_LIBC="$EXPECTED_LIBC" \
   "$INSTALLER"
 
 [[ -x "$ALEX_BIN" ]] || fail "release installer did not install alex"
@@ -289,9 +301,11 @@ jq -n \
   --arg trace_id "$TRACE_ID" \
   --arg session_id "$SESSION_ID" \
   --arg model "exo/$MODEL" \
+  --arg arch "$EXPECTED_ARCH" \
+  --arg libc "$EXPECTED_LIBC" \
   --argjson pid_before "$PID_BEFORE" \
   --argjson pid_after "$PID_AFTER" \
-  '{schema_version:1,passed:true,platform:{os:"ubuntu",arch:"x86_64"},
+  '{schema_version:1,passed:true,platform:{os:"ubuntu",arch:$arch,libc:$libc},
     package:{version:$version,archive_checksum_verified:true,
     installed_binary:true},service:{manager:"systemd-user",managed:true,
     pid_before:$pid_before,pid_after:$pid_after,replaced:true},

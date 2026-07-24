@@ -507,8 +507,11 @@ Any harness pointed at Alex can set these per request:
 ## Platforms and alternative installation
 
 Release binaries and installers are available for macOS ARM64, Windows x86-64
-and ARM64 (alpha), and Linux x86-64 and ARM64. The native menu-bar app and
-native notifications remain macOS-only; Linux uses the shared web UI.
+and ARM64 (alpha), and Linux x86-64 and ARM64. Linux GNU and static musl builds
+are available for both architectures; the packaged variants exercise the user
+service, onboarding, routing, middleware, and Trace Browser path in release CI.
+The native menu-bar app and native notifications remain macOS-only; Linux uses
+the shared web UI.
 
 Alternative installation methods:
 

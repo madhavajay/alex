@@ -10,7 +10,6 @@ CONTAINER_HOME="/home/$CONTAINER_USER"
 CONTAINER_ROOT="$CONTAINER_HOME/alex-installed-linux"
 CONTAINER_PAYLOAD="/opt/alex-ci"
 CONTAINER_RESULT="$CONTAINER_PAYLOAD/output/installed-smoke.json"
-IMAGE_TAG="alex-linux-systemd-smoke:ubuntu-24.04"
 SERVICE_NAME="alex"
 
 fail() {
@@ -27,7 +26,25 @@ RESULT_TMP="$RESULT_PATH.tmp"
 VERSION="${ALEX_CI_LINUX_VERSION:?set ALEX_CI_LINUX_VERSION}"
 ASSET_DIR="${ALEX_CI_LINUX_ASSET_DIR:?set ALEX_CI_LINUX_ASSET_DIR}"
 CONTAINER_NAME="${ALEX_CI_LINUX_CONTAINER_NAME:-alex-linux-installed-smoke}"
-ASSET_NAME="alex-cli-$VERSION-linux-x86_64.tar.gz"
+ARCH="${ALEX_CI_LINUX_ARCH:-x86_64}"
+LIBC="${ALEX_CI_LINUX_LIBC:-gnu}"
+case "$ARCH" in
+  x86_64)
+    DOCKER_PLATFORM="linux/amd64"
+    ;;
+  aarch64)
+    DOCKER_PLATFORM="linux/arm64"
+    ;;
+  *)
+    fail "ALEX_CI_LINUX_ARCH must be x86_64 or aarch64"
+    ;;
+esac
+case "$LIBC" in
+  gnu) ASSET_NAME="alex-cli-$VERSION-linux-$ARCH.tar.gz" ;;
+  musl) ASSET_NAME="alex-cli-$VERSION-linux-$ARCH-musl.tar.gz" ;;
+  *) fail "ALEX_CI_LINUX_LIBC must be gnu or musl" ;;
+esac
+IMAGE_TAG="alex-linux-systemd-smoke-$ARCH-$LIBC:ubuntu-24.04"
 
 [[ "$RESULT_PATH" = /* ]] || fail "ALEX_CI_LINUX_SMOKE_RESULT must be absolute"
 [[ "$ASSET_DIR" = /* ]] || fail "ALEX_CI_LINUX_ASSET_DIR must be absolute"
@@ -105,7 +122,7 @@ cp "$REPO_ROOT/packaging/ci-macos/mock-openai.py" \
 cp "$ASSET_DIR/$ASSET_NAME" "$ASSET_DIR/$ASSET_NAME.sha256" "$PAYLOAD_ROOT/assets/"
 
 docker build \
-  --platform linux/amd64 \
+  --platform "$DOCKER_PLATFORM" \
   --file "$DOCKERFILE" \
   --tag "$IMAGE_TAG" \
   "$SCRIPT_DIR"
@@ -113,7 +130,7 @@ docker build \
 docker run \
   --detach \
   --name "$CONTAINER_NAME" \
-  --platform linux/amd64 \
+  --platform "$DOCKER_PLATFORM" \
   --privileged \
   --cgroupns host \
   --tmpfs /run \
@@ -160,6 +177,8 @@ user_exec env \
   "ALEX_CI_LINUX_SMOKE_ROOT=$CONTAINER_ROOT" \
   "ALEX_CI_LINUX_SMOKE_RESULT=$CONTAINER_RESULT" \
   "ALEX_CI_LINUX_VERSION=$VERSION" \
+  "ALEX_CI_LINUX_ARCH=$ARCH" \
+  "ALEX_CI_LINUX_LIBC=$LIBC" \
   "ALEX_CI_LINUX_ASSET_DIR=$CONTAINER_PAYLOAD/assets" \
   "$CONTAINER_PAYLOAD/repo/packaging/ci-linux/smoke-installed.sh"
 

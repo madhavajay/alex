@@ -94,23 +94,35 @@ jobs:
   linux-asset:
     needs: [meta, create-prerelease]
     runs-on: namespace-profile-linux-medium
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.meta.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build and package CLI
+      - name: Build and package x86_64 and aarch64 GNU CLIs
         run: |
           set -euo pipefail
           version="${{ needs.meta.outputs.version }}"
           ./scripts/stamp-version.sh "$version"
           cargo build --release -p alex --bins
+          docker run --rm -v "$PWD":/io -w /io ghcr.io/rust-cross/cargo-zigbuild:latest bash -c '
+            set -euo pipefail
+            rustup target add aarch64-unknown-linux-gnu
+            cargo zigbuild -p alex --bin alex --release --target aarch64-unknown-linux-gnu
+            file target/aarch64-unknown-linux-gnu/release/alex | grep -Eq "ARM aarch64|aarch64"
+            file target/aarch64-unknown-linux-gnu/release/alex | grep -q "dynamically linked"
+          '
           mkdir -p dist
-          asset="alex-cli-${version}-linux-x86_64.tar.gz"
-          tar -C target/release -czf "dist/$asset" alex
-          shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
+          x86_asset="alex-cli-${version}-linux-x86_64.tar.gz"
+          arm_asset="alex-cli-${version}-linux-aarch64.tar.gz"
+          tar -C target/release -czf "dist/$x86_asset" alex
+          tar -C target/aarch64-unknown-linux-gnu/release -czf "dist/$arm_asset" alex
+          file target/release/alex | grep -Eq "x86-64|x86_64"
+          file target/release/alex | grep -q "dynamically linked"
+          shasum -a 256 "dist/$x86_asset" > "dist/$x86_asset.sha256"
+          shasum -a 256 "dist/$arm_asset" > "dist/$arm_asset.sha256"
       - name: Upload to prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,7 +131,7 @@ jobs:
   linux-musl-asset:
     needs: [meta, create-prerelease]
     runs-on: namespace-profile-linux-medium
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,6 +154,10 @@ jobs:
             cp target/aarch64-unknown-linux-musl/release/alex dist/alex-aarch64-unknown-linux-musl
             file dist/alex-x86_64-unknown-linux-musl  | grep -q "statically linked"
             file dist/alex-aarch64-unknown-linux-musl | grep -q "statically linked"
+            tar -C target/x86_64-unknown-linux-musl/release -czf "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz" alex
+            tar -C target/aarch64-unknown-linux-musl/release -czf "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz" alex
+            sha256sum "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz" > "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz.sha256"
+            sha256sum "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz" > "dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz.sha256"
             ( cd dist && sha256sum alex-x86_64-unknown-linux-musl alex-aarch64-unknown-linux-musl > checksums.txt )
             chmod -R a+rX dist
           '
@@ -153,6 +169,10 @@ jobs:
           gh release upload "${{ needs.meta.outputs.tag }}" \
             dist/alex-x86_64-unknown-linux-musl \
             dist/alex-aarch64-unknown-linux-musl \
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz \
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-x86_64-musl.tar.gz.sha256 \
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz \
+            dist/alex-cli-${{ needs.meta.outputs.version }}-linux-aarch64-musl.tar.gz.sha256 \
             dist/checksums.txt --clobber
 
   macos-cli-asset:

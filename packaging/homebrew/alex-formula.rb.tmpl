@@ -17,9 +17,14 @@ class Alex < Formula
   end
 
   on_linux do
+    on_arm do
+      url "https://github.com/madhavajay/alex/releases/download/v{{VERSION}}/alex-cli-{{VERSION}}-linux-aarch64.tar.gz"
+      sha256 "{{SHA_LINUX_ARM}}"
+    end
+
     on_intel do
       url "https://github.com/madhavajay/alex/releases/download/v{{VERSION}}/alex-cli-{{VERSION}}-linux-x86_64.tar.gz"
-      sha256 "{{SHA_LINUX}}"
+      sha256 "{{SHA_LINUX_INTEL}}"
     end
   end
 
