@@ -146,6 +146,7 @@ public enum AppSettingsReset {
         "limitWarnPct",
         "terminalApp",
         "binaryPath",
+        UIHangWatchdog.defaultsKey,
         "TranscriptRawMode",
         "TraceBrowserDetailsOn",
         "TraceBrowserLeftPaneWidth",

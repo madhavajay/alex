@@ -15,6 +15,8 @@ struct GeneralPreferencesPane: View {
     @AppStorage("notifyEnabled") private var notifyEnabled = true
     @AppStorage("binaryPath") private var binaryPath = ""
     @AppStorage("terminalApp") private var terminalApp = "auto"
+    @AppStorage(UIHangWatchdog.defaultsKey) private var uiHangWatchdogEnabled =
+        UIHangWatchdog.isEnabled()
     // B2: default the picker to the channel this build actually follows. A
     // pre-release build defaults to beta, so the UI never shows "Stable" while
     // the updater is (correctly) checking the beta appcast. An explicit user
@@ -259,6 +261,42 @@ struct GeneralPreferencesPane: View {
         }
 
         NetworkExposureSection(store: store)
+
+        SectionLabel(text: "Diagnostics")
+            .settingsSectionSpacing()
+        SettingRow(
+            label: "Detect interface freezes",
+            hint: "Record main-thread stalls longer than 500 ms. Logs include operation and trace identifiers, but not prompt or response bodies."
+        ) {
+            Toggle("", isOn: $uiHangWatchdogEnabled)
+                .settingsSwitch()
+                .onChange(of: uiHangWatchdogEnabled) { _, enabled in
+                    if enabled {
+                        UIHangWatchdog.shared.startIfEnabled()
+                    } else {
+                        UIHangWatchdog.shared.stop()
+                    }
+                }
+        }
+        RowDivider()
+        SettingRow(
+            label: "Interface freeze log",
+            hint: UIHangLog.fileURL().path
+        ) {
+            PillButton(
+                title: "Reveal in Finder", variant: .bordered,
+                horizontalPadding: 12, verticalPadding: 5,
+                cornerRadius: 7, showsBorder: true
+            ) {
+                let url = UIHangLog.fileURL()
+                do {
+                    try UIHangLog.prepareForReveal(at: url)
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                } catch {
+                    NSSound.beep()
+                }
+            }
+        }
 
         SectionLabel(text: "Reset")
             .settingsSectionSpacing()
