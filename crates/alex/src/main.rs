@@ -3926,6 +3926,13 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("heartbeat: disabled (set heartbeat_minutes in config.toml to enable)");
             }
+            // Heal legacy same-subscription OAuth duplicates immediately so
+            // the credentials UI and re-auth notifier start from one canonical
+            // account even when the periodic watchdog is disabled.
+            let merged_duplicates = alex_proxy::reconcile_duplicate_subscriptions(&state).await;
+            if merged_duplicates > 0 {
+                eprintln!("accounts: merged {merged_duplicates} duplicate subscription(s)");
+            }
             if config.reauth_check_minutes > 0 {
                 let watch_state = state.clone();
                 let minutes = config.reauth_check_minutes;

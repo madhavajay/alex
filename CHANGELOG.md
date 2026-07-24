@@ -7,6 +7,12 @@ predate this file — see the git history and GitHub releases.
 
 ## [Unreleased]
 
+### Fixed
+- Kimi native credential re-import now reuses an account-scoped login with the
+  same provider-issued subject. Exact legacy duplicates are merged with their
+  trace history before re-auth checks, preventing a stale `kimi-oauth` record
+  from showing a second subscription or consuming Telegram re-auth alerts.
+
 ## [0.1.30] - 2026-07-23
 
 ### Added

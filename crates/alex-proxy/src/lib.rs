@@ -31,6 +31,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+#[cfg(test)]
+use base64::Engine as _;
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
@@ -3535,6 +3537,84 @@ async fn admin_account_merge(
         "rows": rows,
     }))
     .into_response()
+}
+
+fn duplicate_subscription_rank(account: &Account, now: i64) -> (bool, bool, bool, i64, i64) {
+    let healthy = account
+        .account_meta
+        .pointer("/last_probe/health")
+        .and_then(Value::as_str)
+        == Some("healthy");
+    let usable = account.status == "active" && !account.paused && !account.needs_reauth();
+    let unexpired = account.expires_at_ms.is_some_and(|expires| expires > now);
+    (
+        healthy,
+        usable,
+        unexpired,
+        account.last_refresh_ms.unwrap_or(i64::MIN),
+        account.expires_at_ms.unwrap_or(i64::MIN),
+    )
+}
+
+/// Collapse OAuth records that carry the exact same provider-issued
+/// subscription identity. This repairs the legacy Kimi shape where native
+/// re-import wrote `kimi-oauth` beside an account-scoped device login. The
+/// identity comparison is deliberately strict (provider + JWT subject/email),
+/// so separate Kimi subscriptions remain separate.
+///
+/// The healthiest/freshest record survives. Trace, heartbeat, and catalogue
+/// rows are re-keyed before the duplicate credential is tombstoned, matching
+/// the explicit account-merge endpoint's ordering and recovery guarantees.
+pub async fn reconcile_duplicate_subscriptions(state: &Arc<AppState>) -> usize {
+    let now = now_ms();
+    let mut groups = BTreeMap::<(String, String), Vec<Account>>::new();
+    for account in state.vault.list().await {
+        if account.kind != "oauth" {
+            continue;
+        }
+        let Some(identity) = account.subscription_identity() else {
+            continue;
+        };
+        groups
+            .entry((account.kind.clone(), identity))
+            .or_default()
+            .push(account);
+    }
+
+    let mut merged = 0;
+    for accounts in groups.values_mut().filter(|accounts| accounts.len() > 1) {
+        accounts.sort_by(|a, b| {
+            duplicate_subscription_rank(b, now)
+                .cmp(&duplicate_subscription_rank(a, now))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let survivor = accounts[0].clone();
+        if let Err(error) = state.store.upsert_known_account(&known_account(&survivor)) {
+            tracing::warn!(account = %survivor.id, %error, "could not catalogue duplicate-account survivor");
+            continue;
+        }
+        for duplicate in accounts.iter().skip(1) {
+            if let Err(error) = state.store.merge_accounts(&duplicate.id, &survivor.id) {
+                tracing::warn!(from = %duplicate.id, into = %survivor.id, %error, "could not merge duplicate subscription history");
+                continue;
+            }
+            match state
+                .vault
+                .merge_accounts(&duplicate.id, &survivor.id, true)
+                .await
+            {
+                Ok(_) => {
+                    clear_active_reauth(state, &duplicate.id).await;
+                    merged += 1;
+                    tracing::info!(from = %duplicate.id, into = %survivor.id, "merged duplicate subscription identity");
+                }
+                Err(error) => {
+                    tracing::warn!(from = %duplicate.id, into = %survivor.id, %error, "history merged but duplicate credential still needs removal")
+                }
+            }
+        }
+    }
+    merged
 }
 
 fn known_account(account: &Account) -> KnownAccount {
@@ -17142,6 +17222,10 @@ const REAUTH_EXPIRY_GRACE_MS: i64 = 60_000;
 /// needs-reauth flag is set on death and cleared on a successful refresh so the
 /// admin UI reflects it and the next fresh logout alerts again.
 pub async fn reauth_watch_once(state: &Arc<AppState>) {
+    // Repair exact legacy duplicates before an expired stale record can open a
+    // second re-auth flow or consume the notification cooldown for its healthy
+    // account-scoped replacement.
+    reconcile_duplicate_subscriptions(state).await;
     let now = now_ms();
     for account in state.vault.list().await {
         // Only managed OAuth logins expire and need refreshing. API-key
@@ -21816,6 +21900,94 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn kimi_subject_account(
+        id: &str,
+        name: &str,
+        subject: &str,
+        expires_at_ms: i64,
+        healthy: bool,
+    ) -> Account {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"sub": subject}).to_string());
+        Account {
+            id: id.into(),
+            provider: Provider::Kimi,
+            kind: "oauth".into(),
+            name: name.into(),
+            description: None,
+            paused: false,
+            label: Some("kimi (kimi-code)".into()),
+            access_token: Some(format!("header.{payload}.signature")),
+            refresh_token: Some(format!("refresh-{name}")),
+            id_token: None,
+            api_key: None,
+            expires_at_ms: Some(expires_at_ms),
+            last_refresh_ms: Some(expires_at_ms - 900_000),
+            account_meta: if healthy {
+                json!({"last_probe": {"health": "healthy"}, "scope": "kimi-code"})
+            } else {
+                json!({"needs_reauth": true, "scope": "kimi-code"})
+            },
+            cooldown_until_ms: None,
+            status: "active".into(),
+            path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_kimi_subject_duplicates_auto_merge_before_reauth() {
+        let now = now_ms();
+        let state = test_state("kimi-subject-auto-merge");
+        let legacy = kimi_subject_account(
+            "kimi-oauth",
+            "default",
+            "same-kimi-user",
+            now - 60_000,
+            false,
+        );
+        let scoped = kimi_subject_account(
+            "kimi-oauth-acct-subject",
+            "acct-subject",
+            "same-kimi-user",
+            now + 3_600_000,
+            true,
+        );
+        state.vault.upsert(legacy).await.unwrap();
+        state.vault.upsert(scoped).await.unwrap();
+        for (trace_id, account_id) in [
+            ("legacy-kimi-trace", "kimi-oauth"),
+            ("scoped-kimi-trace", "kimi-oauth-acct-subject"),
+        ] {
+            state
+                .store
+                .insert_trace(&TraceRecord {
+                    id: trace_id.into(),
+                    ts_request_ms: now,
+                    account_id: Some(account_id.into()),
+                    subscription_identity: Some("kimi:subject:same-kimi-user".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        assert_eq!(reconcile_duplicate_subscriptions(&state).await, 1);
+        let accounts = state.vault.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, "kimi-oauth-acct-subject");
+        assert!(!accounts[0].needs_reauth());
+        for trace_id in ["legacy-kimi-trace", "scoped-kimi-trace"] {
+            assert_eq!(
+                state.store.get_trace(trace_id).unwrap().unwrap()["account_id"],
+                "kimi-oauth-acct-subject"
+            );
+        }
+        assert!(state
+            .vault
+            .removed_accounts()
+            .iter()
+            .any(|account| account.id == "kimi-oauth"));
     }
 
     #[tokio::test]

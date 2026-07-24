@@ -428,7 +428,7 @@ async fn save_named_login_account(
 /// Stable upstream identity for an OAuth account. Prefer a provider-issued
 /// account id, then the verified/display email, then the OIDC subject carried
 /// by a token returned directly from the provider's token endpoint.
-fn automatic_account_identity(account: &Account) -> Option<String> {
+pub(crate) fn automatic_account_identity(account: &Account) -> Option<String> {
     let provider = account.provider.as_str();
     if let Some(account_id) = account
         .account_meta

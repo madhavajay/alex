@@ -195,6 +195,29 @@ impl Account {
         if let Some(email) = self.email() {
             return Some(format!("{}:email:{}", self.provider.as_str(), email));
         }
+        // Kimi (and some other device-flow providers) does not return an email,
+        // but its JWT `sub` is the stable upstream account identity. Keeping
+        // this as an identity only (never the token itself) lets native imports,
+        // fresh logins, trace attribution, and duplicate reconciliation agree
+        // that two rotating credentials belong to the same subscription.
+        if self.kind == "oauth" {
+            if let Some(subject) = [self.id_token.as_deref(), self.access_token.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|token| {
+                    login::jwt_payload(token).and_then(|payload| {
+                        payload
+                            .get("sub")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|subject| !subject.is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+            {
+                return Some(format!("{}:subject:{subject}", self.provider.as_str()));
+            }
+        }
         // API keys have no provider-exposed account id in this application.
         // A one-way fingerprint is stable across a local rename and avoids
         // persisting the credential itself. It is intentionally last resort.
@@ -2116,12 +2139,62 @@ pub async fn import_kimi(vault: &Vault) -> ImportOutcome {
         creds.expires_in,
         creds.scope,
     );
-    let id = account.id.clone();
-    match vault.upsert(account).await {
-        Ok(()) => outcome.imported.push(id),
+    match upsert_imported_kimi(vault, account).await {
+        Ok(id) => outcome.imported.push(id),
         Err(e) => outcome.note = Some(format!("failed to save: {e}")),
     }
     outcome
+}
+
+/// Store a native Kimi credential in the local slot already representing the
+/// same JWT subject. Older releases always wrote `kimi-oauth`, which created a
+/// second card after an account-scoped device login. Matching only on the
+/// provider-issued subject keeps genuinely separate subscriptions separate.
+async fn upsert_imported_kimi(vault: &Vault, mut account: Account) -> Result<String> {
+    let identity = login::automatic_account_identity(&account);
+    let existing = identity.as_deref().and_then(|identity| {
+        vault
+            .list_cached()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.provider == Provider::Kimi
+                    && candidate.kind == "oauth"
+                    && login::automatic_account_identity(candidate).as_deref() == Some(identity)
+            })
+            .max_by_key(credential_rank)
+    });
+    if let Some(existing) = existing {
+        let existing_is_healthy = !existing.needs_reauth()
+            && existing
+                .expires_at_ms
+                .is_none_or(|expires| expires > now_ms() + REFRESH_MARGIN_MS);
+        let imported_is_at_least_as_fresh =
+            account.expires_at_ms.unwrap_or(i64::MIN) >= existing.expires_at_ms.unwrap_or(i64::MIN);
+        // The native Kimi file may lag behind a device login completed inside
+        // Alex. Reuse the matching slot without replacing a healthier, longer-
+        // lived credential with that older snapshot.
+        if existing_is_healthy && !imported_is_at_least_as_fresh {
+            return Ok(existing.id);
+        }
+        if let (Some(old), Some(new)) = (
+            existing.account_meta.as_object(),
+            account.account_meta.as_object_mut(),
+        ) {
+            for (key, value) in old {
+                new.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            new.remove("needs_reauth");
+        }
+        account.id = existing.id;
+        account.name = existing.name;
+        account.description = account.description.or(existing.description);
+        account.paused = existing.paused;
+        account.cooldown_until_ms = None;
+        account.path = existing.path;
+    }
+    let id = account.id.clone();
+    vault.upsert(account).await?;
+    Ok(id)
 }
 
 pub async fn import_amp(vault: &Vault) -> ImportOutcome {
@@ -3241,6 +3314,93 @@ mod tests {
         );
         account.id_token = Some(format!("header.{payload}.signature"));
         assert_eq!(account.email().as_deref(), Some("workspace@example.com"));
+    }
+
+    fn subject_token(subject: &str) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"sub": subject}).to_string());
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn oauth_subscription_identity_falls_back_to_jwt_subject() {
+        let mut account = kimi_account_from_credentials(
+            subject_token("kimi-user-123"),
+            Some("refresh-token".into()),
+            None,
+            Some(900),
+            None,
+        );
+        assert_eq!(
+            account.subscription_identity().as_deref(),
+            Some("kimi:subject:kimi-user-123")
+        );
+        account.access_token = Some(subject_token("different-kimi-user"));
+        assert_eq!(
+            account.subscription_identity().as_deref(),
+            Some("kimi:subject:different-kimi-user")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_kimi_import_reuses_matching_account_scoped_slot_only() {
+        let dir = temp_dir("kimi-native-import-dedupe");
+        let vault = Vault::open(dir.clone()).unwrap();
+        let mut scoped = kimi_account_from_credentials(
+            subject_token("same-kimi-user"),
+            Some("scoped-refresh".into()),
+            None,
+            Some(1_800),
+            None,
+        );
+        scoped.id = "kimi-oauth-acct-subject".into();
+        scoped.name = "acct-subject".into();
+        scoped.account_meta["routing_limits"] = json!({"used_pct": 12});
+        vault.upsert(scoped).await.unwrap();
+
+        let imported_older = kimi_account_from_credentials(
+            subject_token("same-kimi-user"),
+            Some("native-refresh".into()),
+            None,
+            Some(900),
+            None,
+        );
+        let reused = upsert_imported_kimi(&vault, imported_older).await.unwrap();
+        assert_eq!(reused, "kimi-oauth-acct-subject");
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "acct-subject");
+        assert_eq!(accounts[0].refresh_token.as_deref(), Some("scoped-refresh"));
+        assert_eq!(accounts[0].account_meta["routing_limits"]["used_pct"], 12);
+
+        let imported_newer = kimi_account_from_credentials(
+            subject_token("same-kimi-user"),
+            Some("newer-native-refresh".into()),
+            None,
+            Some(3_600),
+            None,
+        );
+        let reused = upsert_imported_kimi(&vault, imported_newer).await.unwrap();
+        assert_eq!(reused, "kimi-oauth-acct-subject");
+        let accounts = vault.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].refresh_token.as_deref(),
+            Some("newer-native-refresh")
+        );
+        assert_eq!(accounts[0].account_meta["routing_limits"]["used_pct"], 12);
+
+        let imported_other = kimi_account_from_credentials(
+            subject_token("other-kimi-user"),
+            Some("other-refresh".into()),
+            None,
+            Some(900),
+            None,
+        );
+        let separate = upsert_imported_kimi(&vault, imported_other).await.unwrap();
+        assert_eq!(separate, "kimi-oauth");
+        assert_eq!(vault.list().await.len(), 2);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
